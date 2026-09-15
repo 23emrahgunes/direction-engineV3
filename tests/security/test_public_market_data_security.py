@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from direction_engine_v3.adapters.public_transport import PublicTransport
+from direction_engine_v3.adapters.public_transport import PublicTransport, _decode_websocket_text
 from direction_engine_v3.market_data import MarketDataSchemaError
 
 
@@ -31,3 +31,13 @@ def test_allowed_url_still_requires_explicit_async_lifecycle() -> None:
             await transport.get_json("https://api.binance.com/api/v3/time")
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("frame", ["PING", "pong", "  Pong\n"])
+def test_websocket_control_frames_are_case_insensitive(frame: str) -> None:
+    assert _decode_websocket_text(frame) is None
+
+
+def test_unknown_non_json_websocket_frame_fails_closed() -> None:
+    with pytest.raises(MarketDataSchemaError, match="non-JSON"):
+        _decode_websocket_text("connected")

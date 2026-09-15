@@ -86,11 +86,12 @@ class PublicTransport:
             try:
                 async for message in websocket:
                     if message.type is aiohttp.WSMsgType.TEXT:
-                        if message.data in {"PING", "PONG"}:
-                            if message.data == "PING":
+                        decoded = _decode_websocket_text(message.data)
+                        if decoded is None:
+                            if message.data.strip().upper() == "PING":
                                 await websocket.send_str("PONG")
                             continue
-                        yield message.json()
+                        yield decoded
                     elif message.type is aiohttp.WSMsgType.ERROR:
                         raise aiohttp.ClientConnectionError("public WebSocket reported an error")
             finally:
@@ -147,3 +148,14 @@ async def _send_text_heartbeats(
     while True:
         await asyncio.sleep(interval_seconds)
         await websocket.send_str("PING")
+
+
+def _decode_websocket_text(value: str) -> object | None:
+    stripped = value.strip()
+    if stripped.upper() in {"PING", "PONG"}:
+        return None
+    try:
+        decoded: object = json.loads(stripped, parse_float=Decimal)
+    except json.JSONDecodeError as exc:
+        raise MarketDataSchemaError("public WebSocket emitted a non-JSON data frame") from exc
+    return decoded
