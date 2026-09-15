@@ -8,6 +8,7 @@ local and VPS gates pass.
 | V3.0 | `00e83abbf2667bcb2d83caa8d1528ce2b4ff9e49` | Accepted | Accepted on Ubuntu 24.04 / Python 3.12.3 (user-provided baseline) | compileall, pytest, ruff, mypy, diff check | None reported | Before 2026-09-15 | Accepted |
 | V3.1 | `8853fc26dc3c9c8c170317c77e2255cfaf0e8ac1` | Accepted: compileall; 68 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 68 pytest passed; ruff and mypy passed; diff check and status clean | 57 focused domain/security tests; 68 full-suite tests | None | 2026-09-15T14:30:55Z | Accepted |
 | V3.2 | `51ae8a26836677528e1d2ce8855d658965799f9c` | Accepted: compileall; 104 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 104 pytest passed; ruff and mypy passed; diff check and status clean; public smoke passed | 35 focused market-data/integration/security tests; 104 full-suite tests | None | 2026-09-15T19:01:19Z | Accepted |
+| V3.3 | `7cc3a6dbea1b766cddefe1186f37451dcb53d4e1` | Accepted: compileall; 109 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 109 pytest passed; ruff and mypy passed; diff check and status clean | 5 focused migration-boundary tests; 109 full-suite tests | None | 2026-09-15T19:08:54Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -44,3 +45,16 @@ local and VPS gates pass.
 - The earlier SSM failures were acceptance-harness issues (checkout ownership, cache
   directory, and unobserved RTDS framing), not product-test failures. No global Git
   safety setting was weakened and the project remains owned and operated by `ubuntu`.
+
+## V3.3 VPS evidence
+
+- Target revision tested: `7cc3a6dbea1b766cddefe1186f37451dcb53d4e1`
+- Python: 3.12.3
+- Focused migration-boundary result: 5 passed locally
+- Full VPS result: 109 passed
+- Ruff: passed
+- mypy: no issues in 39 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `ccf7fab8-2937-45bb-b9b2-a7d59472339a`
+- The ignored audit clones under `runtime/data/` were inspection-only and were neither
+  committed nor deployed. No WhaleSignal runtime module or order path was migrated.
