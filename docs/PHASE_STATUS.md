@@ -14,6 +14,7 @@ local and VPS gates pass.
 | V3.6 | `15391f1cc47a95f67d0f37ab1b728eabcd259adc` | Accepted: compileall; 179 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 179 pytest passed; ruff and mypy passed; diff check and status clean; live read-only paired scan passed | 16 focused structural/replay/regression tests; 179 full-suite tests | None | 2026-09-15T19:32:23Z | Accepted |
 | V3.7 | `71f306cea638a2b30becc7cb672dd60d895b0f6c` | Accepted: compileall; 191 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 191 pytest passed; ruff and mypy passed; diff check and status clean; live-public fail-closed ABSTAIN passed | 13 focused directional/boundary tests; 191 full-suite tests | None | 2026-09-15T19:37:37Z | Accepted |
 | V3.8 | `4c221b20de7deaa348ae83813ebed34acbb7d1dd` | Accepted: compileall; 201 pytest passed; ruff and mypy passed; diff check clean; all 12 buckets unpromoted | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 201 pytest passed; ruff and mypy passed; diff check and status clean; all 12 buckets unpromoted | 10 focused model/security tests; 201 full-suite tests | No historical corpus supplied; no model promoted | 2026-09-15T19:45:02Z | Accepted |
+| V3.9 | `e3e6abf7a327458ca736980e70a9da86aa8e784f` | Accepted: compileall; 211 pytest passed; ruff and mypy passed; diff check clean; deterministic risk smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 211 pytest passed; ruff and mypy passed; diff check and status clean; deterministic risk smoke passed | 10 focused risk/regression tests; 211 full-suite tests | None | 2026-09-15T19:50:09Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -137,3 +138,16 @@ local and VPS gates pass.
 - The earlier command `85de81b0-d9af-40d2-aca5-9eadd68aa46c` used system `python3`,
   which lacks pytest; compileall passed before the invocation stopped. The accepted
   rerun used the repository's existing `.venv/bin/python` and is the canonical result.
+
+## V3.9 VPS evidence
+
+- Target revision tested: `e3e6abf7a327458ca736980e70a9da86aa8e784f`
+- Python: 3.12.3 from the existing project virtual environment
+- Focused unified-risk/regression result: 10 passed locally and on the VPS
+- Full local and VPS result: 211 passed
+- Ruff: passed
+- mypy: no issues in 55 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `b954202f-6b92-464c-89af-9484af9cc25e`
+- Deterministic smoke approved an all-in fixed 5 USDC candidate and denied the identical
+  candidate when the global kill switch was active. No order or network path was used.
