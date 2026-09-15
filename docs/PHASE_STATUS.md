@@ -17,6 +17,7 @@ local and VPS gates pass.
 | V3.9 | `e3e6abf7a327458ca736980e70a9da86aa8e784f` | Accepted: compileall; 211 pytest passed; ruff and mypy passed; diff check clean; deterministic risk smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 211 pytest passed; ruff and mypy passed; diff check and status clean; deterministic risk smoke passed | 10 focused risk/regression tests; 211 full-suite tests | None | 2026-09-15T19:50:09Z | Accepted |
 | V3.10 | `901fd13e56c79fdc78cb7908bfd5b70359176507` | Accepted: compileall; 219 pytest passed; ruff and mypy passed; diff check clean; deterministic router smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 219 pytest passed; ruff and mypy passed; diff check and status clean; deterministic router smoke passed | 8 focused router/regression tests; 219 full-suite tests | None | 2026-09-15T19:53:37Z | Accepted |
 | V3.11 | `934486ed9672016fce77543d4699e070785692dc` | Accepted: compileall; 228 pytest passed; ruff and mypy passed; diff check clean; durable PAPER smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 228 pytest passed; ruff and mypy passed; diff check and status clean; durable PAPER smoke passed | 9 focused execution/security tests; 228 full-suite tests | None | 2026-09-15T19:57:39Z | Accepted |
+| V3.12 | `a11c6456e2e1dc1c21583499ae4e8b79936823f8` | Accepted: compileall; 230 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 230 pytest passed; ruff and mypy passed; diff check and status clean | 12 focused replay/reporting tests; 230 full-suite tests | No historical corpus; no strategy promoted | 2026-09-15T20:00:15Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -181,3 +182,11 @@ local and VPS gates pass.
 - Durable smoke recorded one partial fill and one audit event, then returned the exact
   result as a restart duplicate. LIVE remained interface-only and no network order path
   existed.
+
+## V3.12 VPS evidence
+
+- Target revision tested: `a11c6456e2e1dc1c21583499ae4e8b79936823f8`
+- Python: 3.12.3; focused replay/reporting: 12 passed; full suite: 230 passed
+- Ruff passed; mypy found no issues in 59 source files; compile/diff/status clean
+- AWS Systems Manager acceptance command: `e6aff191-83a9-4774-9f94-e15ea1bbc55a`
+- No historical corpus was supplied, so no model or strategy was promoted.
