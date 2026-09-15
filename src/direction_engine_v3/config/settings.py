@@ -6,9 +6,11 @@ Environment loading and credential handling are intentionally outside this boots
 from dataclasses import dataclass
 from typing import Final
 
-SUPPORTED_ASSETS: Final[tuple[str, ...]] = ("BTC", "ETH", "SOL", "XRP")
-SUPPORTED_HORIZONS: Final[tuple[str, ...]] = ("5m", "15m", "1h")
-APP_MODE: Final[str] = "PAPER"
+from direction_engine_v3.domain import Asset, Horizon, TradingMode
+
+SUPPORTED_ASSETS: Final[tuple[str, ...]] = tuple(asset.value for asset in Asset)
+SUPPORTED_HORIZONS: Final[tuple[str, ...]] = tuple(horizon.value for horizon in Horizon)
+APP_MODE: Final[str] = TradingMode.PAPER.value
 LIVE_TRADING_ENABLED: Final[bool] = False
 LIVE_AUTO_ARM: Final[bool] = False
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "direction-engine-v3"
-version = "3.0.0"
-description = "Fail-safe bootstrap for direction-engineV3"
+version = "3.1.0"
+description = "Fail-safe domain foundation for direction-engineV3"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = []

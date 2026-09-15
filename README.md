@@ -3,9 +3,9 @@
 `direction-engineV3` is a Python 3.12 research and paper-trading system for BTC, ETH,
 SOL, and XRP markets with 5m, 15m, and 1h horizons.
 
-V3.0 contains only the repository skeleton and fail-safe bootstrap configuration. It
-does not contain Directional Edge, Structural Arbitrage, WhaleSignal migrations,
-market-data implementations, or real order submission.
+V3.1 contains the repository skeleton, fail-safe bootstrap configuration, and pure
+immutable domain contracts. It does not contain Directional Edge, Structural Arbitrage,
+WhaleSignal migrations, market-data implementations, or real order submission.
 
 ## Safety defaults
 
@@ -33,7 +33,8 @@ DATA
 
 External protocols belong under `adapters`. Strategy namespaces contain decision logic
 only. Execution plans, gateways, and reconciliation belong under `execution`; ledger
-persistence belongs under `storage`. V3.0 provides package boundaries only.
+persistence belongs under `storage`. V3.1 implements only the shared domain contracts;
+the remaining packages retain ownership boundaries without operational behavior.
 
 ## Development
 
