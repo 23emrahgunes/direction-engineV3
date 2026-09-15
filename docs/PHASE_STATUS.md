@@ -16,6 +16,7 @@ local and VPS gates pass.
 | V3.8 | `4c221b20de7deaa348ae83813ebed34acbb7d1dd` | Accepted: compileall; 201 pytest passed; ruff and mypy passed; diff check clean; all 12 buckets unpromoted | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 201 pytest passed; ruff and mypy passed; diff check and status clean; all 12 buckets unpromoted | 10 focused model/security tests; 201 full-suite tests | No historical corpus supplied; no model promoted | 2026-09-15T19:45:02Z | Accepted |
 | V3.9 | `e3e6abf7a327458ca736980e70a9da86aa8e784f` | Accepted: compileall; 211 pytest passed; ruff and mypy passed; diff check clean; deterministic risk smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 211 pytest passed; ruff and mypy passed; diff check and status clean; deterministic risk smoke passed | 10 focused risk/regression tests; 211 full-suite tests | None | 2026-09-15T19:50:09Z | Accepted |
 | V3.10 | `901fd13e56c79fdc78cb7908bfd5b70359176507` | Accepted: compileall; 219 pytest passed; ruff and mypy passed; diff check clean; deterministic router smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 219 pytest passed; ruff and mypy passed; diff check and status clean; deterministic router smoke passed | 8 focused router/regression tests; 219 full-suite tests | None | 2026-09-15T19:53:37Z | Accepted |
+| V3.11 | `934486ed9672016fce77543d4699e070785692dc` | Accepted: compileall; 228 pytest passed; ruff and mypy passed; diff check clean; durable PAPER smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 228 pytest passed; ruff and mypy passed; diff check and status clean; durable PAPER smoke passed | 9 focused execution/security tests; 228 full-suite tests | None | 2026-09-15T19:57:39Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -166,3 +167,17 @@ local and VPS gates pass.
 - Deterministic smoke proposed one revision-bound claim, rejected the same candidate
   after simulated restart, and reconciled the claim to the next revision. No order or
   network path was used.
+
+## V3.11 VPS evidence
+
+- Target revision tested: `934486ed9672016fce77543d4699e070785692dc`
+- Python: 3.12.3 from the existing project virtual environment
+- Focused PAPER execution/security result: 9 passed locally and on the VPS
+- Full local and VPS result: 228 passed
+- Ruff: passed
+- mypy: no issues in 58 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `59e88946-dea2-4d1c-9c5d-d9ea4da936dc`
+- Durable smoke recorded one partial fill and one audit event, then returned the exact
+  result as a restart duplicate. LIVE remained interface-only and no network order path
+  existed.
