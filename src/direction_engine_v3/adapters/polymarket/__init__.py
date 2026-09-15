@@ -1,1 +1,25 @@
-"""Polymarket adapter namespace; no client is implemented in V3.0."""
+"""Read-only Polymarket discovery and CLOB market-data boundary."""
+
+from direction_engine_v3.adapters.polymarket.market_data import (
+    CLOB_BOOK_URL,
+    CLOB_MARKETS_URL,
+    CLOB_WS_URL,
+    GAMMA_MARKETS_URL,
+    market_subscription,
+    parse_clob_book,
+    parse_fee_schedule,
+    parse_gamma_market,
+    parse_market_resolved,
+)
+
+__all__ = [
+    "CLOB_BOOK_URL",
+    "CLOB_MARKETS_URL",
+    "CLOB_WS_URL",
+    "GAMMA_MARKETS_URL",
+    "market_subscription",
+    "parse_clob_book",
+    "parse_fee_schedule",
+    "parse_gamma_market",
+    "parse_market_resolved",
+]
