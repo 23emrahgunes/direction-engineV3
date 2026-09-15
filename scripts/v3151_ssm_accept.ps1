@@ -15,22 +15,39 @@ param(
     [string]$ProjectDir = "/home/ubuntu/direction-engine-v3",
     [string]$ExpectedMinimumCommit = "7762a0c5f239f54ca44db7b7c4e31ecfb0111dda",
     [int]$PollSeconds = 5,
-    [int]$CommandTimeoutSeconds = 1800
+    [int]$CommandTimeoutSeconds = 1800,
+    [switch]$SelfTest,
+    [string]$AwsExecutable = "aws"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$AcceptanceDir = Join-Path $RepoRoot "runtime\acceptance"
+if ($SelfTest) {
+    $AcceptanceDir = Join-Path ([System.IO.Path]::GetTempPath()) ("v3151_ssm_accept_selftest_" + [Guid]::NewGuid().ToString("N"))
+} else {
+    $AcceptanceDir = Join-Path $RepoRoot "runtime\acceptance"
+}
 $JsonPath = Join-Path $AcceptanceDir "v3151_ssm_acceptance.json"
 $LogPath = Join-Path $AcceptanceDir "v3151_ssm_acceptance.log"
 New-Item -ItemType Directory -Force -Path $AcceptanceDir | Out-Null
+$script:AwsExecutable = $AwsExecutable
 
 function Write-Log {
     param([string]$Message)
     $line = "[{0}] {1}" -f ([DateTimeOffset]::UtcNow.ToString("o")), $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    Write-Host $line
+}
+
+function Write-LogBlock {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return
+    }
+    Add-Content -LiteralPath $LogPath -Value $Text -Encoding UTF8
+    Write-Host $Text
 }
 
 function Save-Result {
@@ -39,16 +56,57 @@ function Save-Result {
     $Result | ConvertTo-Json -Depth 12 | Set-Content -Path $JsonPath -Encoding UTF8
 }
 
+function ConvertTo-ProcessArgument {
+    param([string]$Argument)
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    return '"' + ($Argument -replace '\\', '\\' -replace '"', '\"') + '"'
+}
+
 function Invoke-AwsText {
     param([string[]]$AwsArgs)
     Write-Log ("aws " + ($AwsArgs -join " "))
-    $output = & aws @AwsArgs 2>&1
-    $exit = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
-    if ($exit -ne 0) {
-        throw "AWS command failed ($exit): aws $($AwsArgs -join ' ')`n$text"
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $script:AwsExecutable
+        $processInfo.Arguments = (($AwsArgs | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join " ")
+        $processInfo.UseShellExecute = $false
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.CreateNoWindow = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        [void]$process.Start()
+        $process.StandardOutput.ReadToEnd() | Set-Content -LiteralPath $stdoutPath -Encoding UTF8
+        $process.StandardError.ReadToEnd() | Set-Content -LiteralPath $stderrPath -Encoding UTF8
+        $process.WaitForExit()
+        $exit = $process.ExitCode
+        $stdoutRaw = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+        $stderrRaw = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $stdoutRaw) {
+            $stdout = ""
+        } else {
+            $stdout = ([string]$stdoutRaw).Trim()
+        }
+        if ($null -eq $stderrRaw) {
+            $stderr = ""
+        } else {
+            $stderr = ([string]$stderrRaw).Trim()
+        }
+        if ($exit -ne 0) {
+            $errorText = (($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+            Write-LogBlock $errorText
+            throw "AWS command failed ($exit): aws $($AwsArgs -join ' ')`n$errorText"
+        }
+        return $stdout
     }
-    return $text
+    finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-AwsJson {
@@ -57,7 +115,74 @@ function Invoke-AwsJson {
     if ([string]::IsNullOrWhiteSpace($text)) {
         throw "AWS command returned empty JSON: aws $($AwsArgs -join ' ')"
     }
-    return $text | ConvertFrom-Json
+    return ConvertFrom-Json -InputObject $text
+}
+
+function Assert-SelfTest {
+    param(
+        [bool]$Condition,
+        [string]$Message
+    )
+    if (-not $Condition) {
+        throw "Self-test failed: $Message"
+    }
+}
+
+function Invoke-BridgeSelfTest {
+    $fakeAwsPath = Join-Path $AcceptanceDir "fake-aws.cmd"
+    @'
+@echo off
+if "%1"=="--version" (
+  echo aws-cli/2.selftest Python/3.selftest Windows/selftest
+  exit /b 0
+)
+if "%1"=="json" (
+  echo {"UserId":"selftest-user","Account":"123456789012","Arn":"arn:aws:iam::123456789012:root"}
+  exit /b 0
+)
+if "%1"=="fail" (
+  echo selftest stderr line 1>&2
+  exit /b 7
+)
+echo unknown fake aws args 1>&2
+exit /b 3
+'@ | Set-Content -LiteralPath $fakeAwsPath -Encoding ASCII
+
+    $script:AwsExecutable = $fakeAwsPath
+
+    $captured = @(Write-Log "self-test log line")
+    Assert-SelfTest ($captured.Count -eq 0) "Write-Log emitted success-pipeline output"
+    $logText = Get-Content -LiteralPath $LogPath -Raw
+    Assert-SelfTest ($logText -match "\[\d{4}-\d{2}-\d{2}T") "Write-Log did not write a timestamped log line"
+    Assert-SelfTest ($logText -match "self-test log line") "Write-Log did not write the message to disk"
+
+    $jsonText = Invoke-AwsText -AwsArgs @("json")
+    Assert-SelfTest ($jsonText.Trim().StartsWith("{")) "Invoke-AwsText did not return raw JSON"
+    Assert-SelfTest ($jsonText -notmatch "^\[\d{4}-\d{2}-\d{2}T") "Invoke-AwsText returned a timestamped log line"
+    $parsedText = ConvertFrom-Json -InputObject $jsonText
+    Assert-SelfTest ($parsedText.UserId -eq "selftest-user") "Mocked JSON stdout was contaminated before ConvertFrom-Json"
+
+    $parsed = Invoke-AwsJson -AwsArgs @("json")
+    Assert-SelfTest ($parsed.Account -eq "123456789012") "Invoke-AwsJson did not parse mocked AWS JSON"
+
+    $failed = $false
+    try {
+        Invoke-AwsText -AwsArgs @("fail") | Out-Null
+    } catch {
+        $failed = $true
+        Assert-SelfTest ([string]$_ -match "selftest stderr line") "AWS stderr was not visible in the thrown error"
+    }
+    Assert-SelfTest $failed "Failing AWS command did not fail"
+    $logText = Get-Content -LiteralPath $LogPath -Raw
+    Assert-SelfTest ($logText -match "selftest stderr line") "AWS stderr was not recorded in the log"
+    Assert-SelfTest ($logText -notmatch "AWS_ACCESS_KEY|AWS_SECRET|AWS_SESSION_TOKEN|PRIVATE KEY|BEGIN .*KEY|api_secret|passphrase") "Sensitive credential pattern was logged"
+
+    Write-Host "V3.15.1 SSM bridge self-test PASS"
+}
+
+if ($SelfTest) {
+    Invoke-BridgeSelfTest
+    exit 0
 }
 
 function Assert-OnlineInstance {
@@ -476,7 +601,8 @@ $result = @{
 
 try {
     Write-Log "Starting V3.15.1 user-context SSM acceptance bridge"
-    Invoke-AwsText -AwsArgs @("--version") | Write-Log
+    $awsVersion = Invoke-AwsText -AwsArgs @("--version")
+    Write-Log $awsVersion
     $identity = Invoke-AwsJson -AwsArgs @(
         "sts", "get-caller-identity",
         "--profile", $Profile,
@@ -503,10 +629,10 @@ try {
     $invocation = Wait-RunCommand -CommandId $commandId
     $stdout = [string]$invocation.StandardOutputContent
     $stderr = [string]$invocation.StandardErrorContent
-    $stdout | Tee-Object -FilePath $LogPath -Append
+    Write-LogBlock $stdout
     if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-        "===== STDERR =====" | Tee-Object -FilePath $LogPath -Append
-        $stderr | Tee-Object -FilePath $LogPath -Append
+        Write-LogBlock "===== STDERR ====="
+        Write-LogBlock $stderr
     }
     if ($invocation.Status -ne "Success") {
         throw "SSM command $commandId ended with $($invocation.Status)"
