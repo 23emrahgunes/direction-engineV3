@@ -1,0 +1,28 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime outputs
+runtime/data/*
+!runtime/data/.gitkeep
+runtime/logs/*
+!runtime/logs/.gitkeep
+runtime/reports/*
+!runtime/reports/.gitkeep
+model_artifacts/*
+!model_artifacts/.gitkeep
