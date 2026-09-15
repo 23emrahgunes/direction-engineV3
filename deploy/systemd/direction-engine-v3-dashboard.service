@@ -1,0 +1,28 @@
+[Unit]
+Description=direction-engineV3 read-only dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/direction-engine-v3
+Environment=PYTHONPATH=/home/ubuntu/direction-engine-v3/src
+Environment=APP_MODE=PAPER
+Environment=LIVE_TRADING_ENABLED=false
+Environment=LIVE_AUTO_ARM=false
+Environment=RUNTIME_DATA_DIR=/home/ubuntu/direction-engine-v3/runtime/data
+Environment=RUNTIME_LOG_DIR=/home/ubuntu/direction-engine-v3/runtime/logs
+Environment=RUNTIME_REPORT_DIR=/home/ubuntu/direction-engine-v3/runtime/reports
+ExecStart=/home/ubuntu/direction-engine-v3/.venv/bin/python -m direction_engine_v3.app.server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/direction-engine-v3/runtime
+
+[Install]
+WantedBy=multi-user.target

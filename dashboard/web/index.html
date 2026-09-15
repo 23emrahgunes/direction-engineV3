@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>direction-engineV3 Dashboard</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; color: #172033; }
+      main { max-width: 960px; margin: 0 auto; }
+      pre { background: #f4f6f8; padding: 1rem; overflow: auto; border: 1px solid #d8dee8; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>direction-engineV3 Dashboard</h1>
+      <p>Read-only PRE-LIVE observability surface. LIVE remains disabled and unarmed.</p>
+      <pre id="payload">Loading...</pre>
+    </main>
+    <script>
+      fetch("/api/dashboard")
+        .then((response) => response.json())
+        .then((payload) => {
+          document.getElementById("payload").textContent = JSON.stringify(payload, null, 2);
+        })
+        .catch((error) => {
+          document.getElementById("payload").textContent = String(error);
+        });
+    </script>
+  </body>
+</html>
