@@ -18,6 +18,22 @@ async def ready(_request: web.Request) -> web.Response:
     return web.json_response(readiness.as_dict(), status=status)
 
 
+async def shadow_ready(_request: web.Request) -> web.Response:
+    snapshot = build_dashboard_snapshot()
+    return web.json_response(
+        {
+            "ready": True,
+            "mode": snapshot.as_dict()["mode"],
+            "shadow_collection": "REPORTING_READY",
+        }
+    )
+
+
+async def trading_ready(_request: web.Request) -> web.Response:
+    readiness = build_dashboard_snapshot().readiness
+    return web.json_response(readiness.as_dict(), status=503)
+
+
 async def metrics(_request: web.Request) -> web.Response:
     return web.json_response(build_dashboard_snapshot().metrics.as_dict())
 
@@ -30,6 +46,8 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health/live", live, allow_head=False)
     app.router.add_get("/health/ready", ready, allow_head=False)
+    app.router.add_get("/health/shadow-ready", shadow_ready, allow_head=False)
+    app.router.add_get("/health/trading-ready", trading_ready, allow_head=False)
     app.router.add_get("/metrics", metrics, allow_head=False)
     app.router.add_get("/api/dashboard", dashboard, allow_head=False)
     return app

@@ -26,6 +26,8 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
     assert routes == {
         ("GET", "/health/live"),
         ("GET", "/health/ready"),
+        ("GET", "/health/shadow-ready"),
+        ("GET", "/health/trading-ready"),
         ("GET", "/metrics"),
         ("GET", "/api/dashboard"),
     }

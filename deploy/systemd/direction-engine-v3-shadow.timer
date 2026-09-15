@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh direction-engineV3 V3.15 shadow evidence reports
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=direction-engine-v3-shadow.service
+
+[Install]
+WantedBy=timers.target

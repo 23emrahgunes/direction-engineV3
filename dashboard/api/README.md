@@ -6,6 +6,8 @@ Read-only endpoints:
 
 - `/health/live`
 - `/health/ready`
+- `/health/shadow-ready`
+- `/health/trading-ready`
 - `/metrics`
 - `/api/dashboard`
 
