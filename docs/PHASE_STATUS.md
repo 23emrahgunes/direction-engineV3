@@ -11,6 +11,7 @@ local and VPS gates pass.
 | V3.3 | `7cc3a6dbea1b766cddefe1186f37451dcb53d4e1` | Accepted: compileall; 109 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 109 pytest passed; ruff and mypy passed; diff check and status clean | 5 focused migration-boundary tests; 109 full-suite tests | None | 2026-09-15T19:08:54Z | Accepted |
 | V3.4 | `8763cc3b8277482e96ef0476d06c7a7591291ec9` | Accepted: compileall; 147 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 147 pytest passed; ruff and mypy passed; diff check and status clean; all 12 live public markets validated | 65 focused identity/PTB/reference tests; 147 full-suite tests | None | 2026-09-15T19:20:36Z | Accepted |
 | V3.5 | `af2c89032f0055e8161f8940537c732a68382783` | Accepted: compileall; 163 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 163 pytest passed; ruff and mypy passed; diff check and status clean; live read-only fee/book simulation passed | 16 focused pricing/regression tests; 163 full-suite tests | None | 2026-09-15T19:26:28Z | Accepted |
+| V3.6 | `15391f1cc47a95f67d0f37ab1b728eabcd259adc` | Accepted: compileall; 179 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 179 pytest passed; ruff and mypy passed; diff check and status clean; live read-only paired scan passed | 16 focused structural/replay/regression tests; 179 full-suite tests | None | 2026-09-15T19:32:23Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -89,3 +90,18 @@ local and VPS gates pass.
 - Read-only BTC 5m UP sample: 5 requested/filled shares; 0.43 VWAP and worst
   price; 0.08579 USDC dynamic taker fee; 0.4484459 buffered all-in cost per share.
   Book and fee-metadata request latency were 66.46 ms and 53.50 ms, respectively.
+
+## V3.6 VPS evidence
+
+- Target revision tested: `15391f1cc47a95f67d0f37ab1b728eabcd259adc`
+- Python: 3.12.3
+- Focused structural/replay/regression result: 16 passed locally
+- Full local and VPS result: 179 passed
+- Ruff: passed
+- mypy: no issues in 46 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `83efda3d-bd80-4d1d-8e0e-e8aa71fe0950`
+- The deterministic replay matrix passed at 10/25/50/100/200/500 ms with explicit
+  both-leg, partial, one-leg, unwind, loss, and receive-time no-lookahead coverage.
+- Read-only BTC 5m scan: UP/DOWN best asks 0.64/0.37; source skew 5 ms; both BUY+MERGE
+  and SPLIT+SELL returned `NET_ECONOMICS_BELOW_MINIMUM`. No trade or order was emitted.
