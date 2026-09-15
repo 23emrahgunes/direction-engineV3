@@ -33,7 +33,7 @@ def test_allowed_url_still_requires_explicit_async_lifecycle() -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("frame", ["PING", "pong", "  Pong\n"])
+@pytest.mark.parametrize("frame", ["", "  ", "PING", "pong", "  Pong\n"])
 def test_websocket_control_frames_are_case_insensitive(frame: str) -> None:
     assert _decode_websocket_text(frame) is None
 

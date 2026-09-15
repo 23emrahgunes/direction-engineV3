@@ -152,7 +152,7 @@ async def _send_text_heartbeats(
 
 def _decode_websocket_text(value: str) -> object | None:
     stripped = value.strip()
-    if stripped.upper() in {"PING", "PONG"}:
+    if not stripped or stripped.upper() in {"PING", "PONG"}:
         return None
     try:
         decoded: object = json.loads(stripped, parse_float=Decimal)

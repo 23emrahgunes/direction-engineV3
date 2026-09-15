@@ -71,7 +71,10 @@ async def _chainlink_probe(transport: PublicTransport) -> dict[str, object]:
             text_heartbeat_seconds=RTDS_HEARTBEAT_SECONDS,
         ):
             payload = _object(raw)
-            if payload.get("topic") != "crypto_prices_twap_thirty":
+            if (
+                payload.get("topic") != "crypto_prices_twap_thirty"
+                or payload.get("type") != "update"
+            ):
                 continue
             recv_ts = clock.utc_now()
             twap = parse_twap(
