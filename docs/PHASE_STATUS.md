@@ -19,6 +19,7 @@ local and VPS gates pass.
 | V3.11 | `934486ed9672016fce77543d4699e070785692dc` | Accepted: compileall; 228 pytest passed; ruff and mypy passed; diff check clean; durable PAPER smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 228 pytest passed; ruff and mypy passed; diff check and status clean; durable PAPER smoke passed | 9 focused execution/security tests; 228 full-suite tests | None | 2026-09-15T19:57:39Z | Accepted |
 | V3.12 | `a11c6456e2e1dc1c21583499ae4e8b79936823f8` | Accepted: compileall; 230 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 230 pytest passed; ruff and mypy passed; diff check and status clean | 12 focused replay/reporting tests; 230 full-suite tests | No historical corpus; no strategy promoted | 2026-09-15T20:00:15Z | Accepted |
 | V3.13 | `2344ec97308d493dce8d576bad47a05184fb79af` | Accepted: compileall; 242 pytest passed; ruff and mypy passed; diff check clean; dashboard smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: dashboard service active; nginx config valid; health/live 200; readiness 503 fail-closed; focused 9 passed; full 239 passed; ruff and mypy passed; diff check and status clean | 12 focused observability/dashboard/security tests locally; 9 focused V3.13 tests on VPS; 242 local full-suite tests; 239 VPS full-suite tests | None | 2026-09-15T20:19:52Z | Accepted |
+| V3.14 | `03ff70d78daa5117944b539b667b5439283e1d1b` | Accepted: compileall; 242 pytest passed; ruff and mypy passed; diff check clean; PRE-LIVE security focused tests passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: dashboard service remained active; health/live 200; readiness 503 fail-closed; watchdog confirmed PAPER/live=false/auto_arm=false/real_orders=false; focused 6 passed; full 242 passed; ruff and mypy passed; diff check and status clean | 6 focused PRE-LIVE/security tests; 242 full-suite tests | Hard stop remains before LIVE arming or any real order | 2026-09-15T20:22:13Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -212,3 +213,19 @@ local and VPS gates pass.
 - Earlier V3.13 SSM failures were command-packaging and root/git ownership harness errors,
   not product failures. The accepted run used `ubuntu` for project Git/test operations and
   root only for authorized direction-engineV3 systemd/nginx deployment.
+
+## V3.14 VPS evidence
+
+- Target revision tested: `03ff70d78daa5117944b539b667b5439283e1d1b`
+- Python: 3.12.3 from the existing project virtual environment
+- Dashboard service remained active; `/health/live` returned 200 and `/health/ready`
+  returned 503 fail-closed while LIVE remained disabled and unarmed
+- Watchdog confirmed `APP_MODE=PAPER`, `LIVE_TRADING_ENABLED=false`,
+  `LIVE_AUTO_ARM=false`, and `real_order_submission=false`
+- Focused PRE-LIVE/security result: 6 passed on the VPS
+- Full VPS result: 242 passed
+- Ruff: passed; mypy: no issues in 67 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `e229b281-425f-4856-ac09-d655c49d89ad`
+- V3.14 ended at the PRE-LIVE hard stop. LIVE was not enabled, LIVE was not armed,
+  and no real Polymarket order or signing/submission path was implemented.
