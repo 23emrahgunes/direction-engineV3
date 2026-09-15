@@ -9,11 +9,11 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from direction_engine_v3.adapters.binance import parse_depth_top
 from direction_engine_v3.adapters.polymarket import (
@@ -833,7 +833,10 @@ def _official_from_proxy(
 def _slug(bucket: MarketBucket, start: datetime) -> str:
     if bucket.horizon is not Horizon.ONE_HOUR:
         return epoch_slug(window_containing(bucket, start))
-    eastern = start.astimezone(ZoneInfo("America/New_York"))
+    try:
+        eastern = start.astimezone(ZoneInfo("America/New_York"))
+    except ZoneInfoNotFoundError:
+        eastern = start.astimezone(timezone(timedelta(hours=-4), "America/New_York"))
     hour = eastern.hour % 12 or 12
     meridiem = "am" if eastern.hour < 12 else "pm"
     return (
