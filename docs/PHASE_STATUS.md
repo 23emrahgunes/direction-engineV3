@@ -13,6 +13,7 @@ local and VPS gates pass.
 | V3.5 | `af2c89032f0055e8161f8940537c732a68382783` | Accepted: compileall; 163 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 163 pytest passed; ruff and mypy passed; diff check and status clean; live read-only fee/book simulation passed | 16 focused pricing/regression tests; 163 full-suite tests | None | 2026-09-15T19:26:28Z | Accepted |
 | V3.6 | `15391f1cc47a95f67d0f37ab1b728eabcd259adc` | Accepted: compileall; 179 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 179 pytest passed; ruff and mypy passed; diff check and status clean; live read-only paired scan passed | 16 focused structural/replay/regression tests; 179 full-suite tests | None | 2026-09-15T19:32:23Z | Accepted |
 | V3.7 | `71f306cea638a2b30becc7cb672dd60d895b0f6c` | Accepted: compileall; 191 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 191 pytest passed; ruff and mypy passed; diff check and status clean; live-public fail-closed ABSTAIN passed | 13 focused directional/boundary tests; 191 full-suite tests | None | 2026-09-15T19:37:37Z | Accepted |
+| V3.8 | `4c221b20de7deaa348ae83813ebed34acbb7d1dd` | Accepted: compileall; 201 pytest passed; ruff and mypy passed; diff check clean; all 12 buckets unpromoted | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 201 pytest passed; ruff and mypy passed; diff check and status clean; all 12 buckets unpromoted | 10 focused model/security tests; 201 full-suite tests | No historical corpus supplied; no model promoted | 2026-09-15T19:45:02Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -119,3 +120,20 @@ local and VPS gates pass.
 - AWS Systems Manager acceptance command: `3e8b5aaf-68a4-4123-ae12-6fbeecd7d090`
 - A current public BTC 5m market with no official PTB/model/calibration returned
   `ABSTAIN / OFFICIAL_PTB_UNAVAILABLE` and no candidate. No synthetic forecast was used.
+
+## V3.8 VPS evidence
+
+- Target revision tested: `4c221b20de7deaa348ae83813ebed34acbb7d1dd`
+- Python: 3.12.3 from the existing project virtual environment
+- Focused model/evaluation/security result: 10 passed locally and on the VPS
+- Full local and VPS result: 201 passed
+- Ruff: passed
+- mypy: no issues in 54 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `9a151b89-f309-43c7-84a8-0847a59c72d4`
+- The readiness probe confirmed exactly twelve `UNPROMOTED` asset/horizon buckets,
+  each with zero samples and `ready=false`. No historical corpus was supplied, so no
+  champion or calibration artifact was fabricated or promoted.
+- The earlier command `85de81b0-d9af-40d2-aca5-9eadd68aa46c` used system `python3`,
+  which lacks pytest; compileall passed before the invocation stopped. The accepted
+  rerun used the repository's existing `.venv/bin/python` and is the canonical result.
