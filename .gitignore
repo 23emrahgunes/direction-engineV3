@@ -24,5 +24,7 @@ runtime/logs/*
 !runtime/logs/.gitkeep
 runtime/reports/*
 !runtime/reports/.gitkeep
+runtime/acceptance/*
+!runtime/acceptance/.gitkeep
 model_artifacts/*
 !model_artifacts/.gitkeep
