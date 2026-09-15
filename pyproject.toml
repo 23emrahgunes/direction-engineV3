@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "direction-engine-v3"
-version = "3.5.0"
-description = "Depth-aware executable pricing foundation for direction-engineV3"
+version = "3.6.0"
+description = "Model-free structural arbitrage research for direction-engineV3"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = ["aiohttp>=3.13,<4"]
