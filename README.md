@@ -3,13 +3,14 @@
 `direction-engineV3` is a Python 3.12 research and paper-trading system for BTC, ETH,
 SOL, and XRP markets with 5m, 15m, and 1h horizons.
 
-V3.8 contains the repository skeleton, fail-safe bootstrap configuration, immutable
+V3.9 contains the repository skeleton, fail-safe bootstrap configuration, immutable
 domain contracts, credential-free public market data, an audited WhaleSignal migration
 map, the canonical twelve-bucket market/PTB/reference engine, and depth-aware executable
 pricing simulation, model-free Structural Arbitrage replay, and external-alpha
 Directional Edge with fail-closed calibrated-model gates, and twelve-bucket model
-evaluation/calibration governance. No model is promoted without real historical
-evidence. It contains no real order submission.
+evaluation/calibration governance, and a unified fail-closed portfolio/liquidity risk
+engine. No model is promoted without real historical evidence. It contains no real
+order submission.
 
 ## Safety defaults
 
