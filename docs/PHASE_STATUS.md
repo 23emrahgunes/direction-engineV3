@@ -20,6 +20,7 @@ local and VPS gates pass.
 | V3.12 | `a11c6456e2e1dc1c21583499ae4e8b79936823f8` | Accepted: compileall; 230 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 230 pytest passed; ruff and mypy passed; diff check and status clean | 12 focused replay/reporting tests; 230 full-suite tests | No historical corpus; no strategy promoted | 2026-09-15T20:00:15Z | Accepted |
 | V3.13 | `2344ec97308d493dce8d576bad47a05184fb79af` | Accepted: compileall; 242 pytest passed; ruff and mypy passed; diff check clean; dashboard smoke passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: dashboard service active; nginx config valid; health/live 200; readiness 503 fail-closed; focused 9 passed; full 239 passed; ruff and mypy passed; diff check and status clean | 12 focused observability/dashboard/security tests locally; 9 focused V3.13 tests on VPS; 242 local full-suite tests; 239 VPS full-suite tests | None | 2026-09-15T20:19:52Z | Accepted |
 | V3.14 | `03ff70d78daa5117944b539b667b5439283e1d1b` | Accepted: compileall; 242 pytest passed; ruff and mypy passed; diff check clean; PRE-LIVE security focused tests passed | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: dashboard service remained active; health/live 200; readiness 503 fail-closed; watchdog confirmed PAPER/live=false/auto_arm=false/real_orders=false; focused 6 passed; full 242 passed; ruff and mypy passed; diff check and status clean | 6 focused PRE-LIVE/security tests; 242 full-suite tests | Hard stop remains before LIVE arming or any real order | 2026-09-15T20:22:13Z | Accepted |
+| V3.15 | `17d88547729398e485c0989ed9d3fbc267f0878e` | Infrastructure accepted: compileall; 253 pytest passed; ruff and mypy passed; diff check clean; shadow report generated | Infrastructure accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: shadow timer active; dashboard service active; `/health/shadow-ready` 200; `/health/trading-ready` 503; focused 13 passed; full 253 passed; ruff and mypy passed; diff check and status clean; restart increased append-only shadow event count from 2 to 3 | 13 focused shadow/dashboard/security tests; 253 full-suite tests | Evidence accumulating; `AWS_ROOT_PROFILE_SECURITY_DEBT`; no final `v3.15.0` tag until burn-in/sample gates are evaluated | 2026-09-15T21:51:22Z | V3.15_INFRA_ACCEPTED_EVIDENCE_ACCUMULATING |
 
 ## V3.1 VPS evidence
 
@@ -229,3 +230,35 @@ local and VPS gates pass.
 - AWS Systems Manager acceptance command: `e229b281-425f-4856-ac09-d655c49d89ad`
 - V3.14 ended at the PRE-LIVE hard stop. LIVE was not enabled, LIVE was not armed,
   and no real Polymarket order or signing/submission path was implemented.
+
+## V3.15 infrastructure VPS evidence
+
+- Target revision tested: `17d88547729398e485c0989ed9d3fbc267f0878e`
+- AWS caller identity: `arn:aws:iam::605618941421:root`
+- AWS security debt recorded: `AWS_ROOT_PROFILE_SECURITY_DEBT`
+- Python: 3.12.3 from the existing project virtual environment
+- Services:
+  - `direction-engine-v3-dashboard.service`: active
+  - `direction-engine-v3-shadow.timer`: active and waiting; next refresh scheduled
+  - `direction-engine-v3-shadow.service`: project-owned oneshot report refresh
+- Health:
+  - `/health/live`: 200
+  - `/health/shadow-ready`: 200
+  - `/health/trading-ready`: 503 while LIVE remains disabled/unarmed
+- Reports:
+  - `runtime/reports/shadow_summary.json`: generated
+  - `runtime/reports/shadow_summary.md`: generated
+  - status: `V3.15_INFRA_ACCEPTED_EVIDENCE_ACCUMULATING`
+  - buckets: 12, all currently `INSUFFICIENT_SAMPLE`
+- Restart/recovery: restarting the shadow oneshot increased append-only shadow event
+  count from 2 to 3 without enabling LIVE or exposing real order submission
+- Focused V3.15 result: 13 passed on the VPS
+- Full VPS result: 253 passed
+- Ruff: passed; mypy: no issues in 72 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `5716486b-c214-4301-894c-70ba7278d43c`
+- Earlier V3.15 SSM command `c4d9c52c-ceb0-48fb-ab75-344529420322` passed code/tests
+  but failed the new health endpoint check because the dashboard service had not been
+  restarted after the fast-forward. The accepted rerun restarted only project services.
+- No `v3.15.0` tag was created. V3.15 final acceptance remains blocked on the real
+  burn-in and sample gates.
