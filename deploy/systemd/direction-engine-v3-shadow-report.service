@@ -1,10 +1,10 @@
 [Unit]
-Description=direction-engineV3 persistent real SHADOW/PAPER runtime
+Description=direction-engineV3 deterministic V3.15.1 shadow report refresh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/direction-engine-v3
@@ -13,14 +13,11 @@ Environment=APP_MODE=PAPER
 Environment=LIVE_TRADING_ENABLED=false
 Environment=LIVE_AUTO_ARM=false
 Environment=RUNTIME_DATA_DIR=/home/ubuntu/direction-engine-v3/runtime/data
-Environment=RUNTIME_LOG_DIR=/home/ubuntu/direction-engine-v3/runtime/logs
 Environment=RUNTIME_REPORT_DIR=/home/ubuntu/direction-engine-v3/runtime/reports
 Environment=AWS_USER_ID=605618941421
 Environment=AWS_ACCOUNT=605618941421
 Environment=AWS_ARN=arn:aws:iam::605618941421:root
-ExecStart=/home/ubuntu/direction-engine-v3/.venv/bin/python -m direction_engine_v3.shadow.daemon --aws-user-id ${AWS_USER_ID} --aws-account ${AWS_ACCOUNT} --aws-arn ${AWS_ARN} --poll-seconds 30
-Restart=on-failure
-RestartSec=10
+ExecStart=/home/ubuntu/direction-engine-v3/.venv/bin/python -m direction_engine_v3.shadow.service --aws-user-id ${AWS_USER_ID} --aws-account ${AWS_ACCOUNT} --aws-arn ${AWS_ARN}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=false

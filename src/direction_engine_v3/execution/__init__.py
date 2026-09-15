@@ -14,6 +14,10 @@ from direction_engine_v3.execution.paper import (
     reconcile_order,
     settled_pnl,
 )
+from direction_engine_v3.execution.planning import (
+    build_directional_paper_plan,
+    build_structural_buy_merge_paper_plan,
+)
 
 __all__ = [
     "LiveGateway",
@@ -23,6 +27,8 @@ __all__ = [
     "PaperFillEvidence",
     "PaperGateway",
     "PreLiveSafetyGate",
+    "build_directional_paper_plan",
+    "build_structural_buy_merge_paper_plan",
     "cancel_order",
     "reconcile_order",
     "settled_pnl",

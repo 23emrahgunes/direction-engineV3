@@ -5,7 +5,14 @@ No network sockets are opened during import; callers explicitly run the app.
 
 from aiohttp import web
 
-from direction_engine_v3.app.dashboard import build_dashboard_snapshot
+from direction_engine_v3.app.dashboard import (
+    build_dashboard_snapshot,
+    build_paper_summary,
+    build_shadow_status,
+    get_paper_trade,
+    list_paper_abstains,
+    list_paper_trades,
+)
 
 
 async def live(_request: web.Request) -> web.Response:
@@ -42,6 +49,45 @@ async def dashboard(_request: web.Request) -> web.Response:
     return web.json_response(build_dashboard_snapshot().as_dict())
 
 
+async def paper_summary(_request: web.Request) -> web.Response:
+    return web.json_response(build_paper_summary())
+
+
+async def paper_trades(request: web.Request) -> web.Response:
+    return web.json_response(
+        list_paper_trades(
+            asset=request.query.get("asset"),
+            horizon=request.query.get("horizon"),
+            strategy=request.query.get("strategy"),
+            side=request.query.get("side"),
+            status=request.query.get("status"),
+            win_loss=request.query.get("win_loss"),
+        )
+    )
+
+
+async def paper_trade_detail(request: web.Request) -> web.Response:
+    trade = get_paper_trade(request.match_info["id"])
+    if trade is None:
+        return web.json_response({"error": "paper trade not found"}, status=404)
+    return web.json_response(trade)
+
+
+async def paper_abstains(request: web.Request) -> web.Response:
+    return web.json_response(
+        list_paper_abstains(
+            reason=request.query.get("reason"),
+            strategy=request.query.get("strategy"),
+            asset=request.query.get("asset"),
+            horizon=request.query.get("horizon"),
+        )
+    )
+
+
+async def shadow_status(_request: web.Request) -> web.Response:
+    return web.json_response(build_shadow_status())
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health/live", live, allow_head=False)
@@ -50,6 +96,11 @@ def create_app() -> web.Application:
     app.router.add_get("/health/trading-ready", trading_ready, allow_head=False)
     app.router.add_get("/metrics", metrics, allow_head=False)
     app.router.add_get("/api/dashboard", dashboard, allow_head=False)
+    app.router.add_get("/api/paper/summary", paper_summary, allow_head=False)
+    app.router.add_get("/api/paper/trades", paper_trades, allow_head=False)
+    app.router.add_get("/api/paper/trades/{id}", paper_trade_detail, allow_head=False)
+    app.router.add_get("/api/paper/abstains", paper_abstains, allow_head=False)
+    app.router.add_get("/api/shadow/status", shadow_status, allow_head=False)
     return app
 
 

@@ -7,24 +7,56 @@
     <style>
       body { font-family: system-ui, sans-serif; margin: 2rem; color: #172033; }
       main { max-width: 960px; margin: 0 auto; }
+      section { margin: 1.5rem 0; }
+      h2 { margin-bottom: 0.4rem; }
       pre { background: #f4f6f8; padding: 1rem; overflow: auto; border: 1px solid #d8dee8; }
+      .label { color: #8a4b00; font-weight: 700; }
     </style>
   </head>
   <body>
     <main>
       <h1>direction-engineV3 Dashboard</h1>
       <p>Read-only PRE-LIVE observability surface. LIVE remains disabled and unarmed.</p>
-      <pre id="payload">Loading...</pre>
+      <p class="label">PAPER / SHADOW — NO REAL ORDER</p>
+      <section><h2>OVERVIEW</h2><pre id="overview">Loading...</pre></section>
+      <section><h2>PAPER TRADES</h2><pre id="paper-trades">Loading...</pre></section>
+      <section><h2>ABSTAINS / REJECTIONS</h2><pre id="abstains">Loading...</pre></section>
+      <section><h2>DIRECTIONAL EDGE</h2><pre id="directional">Loading...</pre></section>
+      <section><h2>STRUCTURAL ARB</h2><pre id="structural">Loading...</pre></section>
+      <section><h2>12 BUCKETS</h2><pre id="buckets">Loading...</pre></section>
+      <section><h2>RISK</h2><pre id="risk">Loading...</pre></section>
+      <section><h2>DATA / LATENCY</h2><pre id="data-latency">Loading...</pre></section>
+      <section><h2>SYSTEM HEALTH</h2><pre id="health">Loading...</pre></section>
     </main>
     <script>
-      fetch("/api/dashboard")
-        .then((response) => response.json())
-        .then((payload) => {
-          document.getElementById("payload").textContent = JSON.stringify(payload, null, 2);
-        })
-        .catch((error) => {
-          document.getElementById("payload").textContent = String(error);
-        });
+      async function show(id, url) {
+        try {
+          const response = await fetch(url);
+          const payload = await response.json();
+          document.getElementById(id).textContent = JSON.stringify(payload, null, 2);
+          return payload;
+        } catch (error) {
+          document.getElementById(id).textContent = String(error);
+          return {};
+        }
+      }
+
+      Promise.all([
+        show("overview", "/api/paper/summary"),
+        show("paper-trades", "/api/paper/trades"),
+        show("abstains", "/api/paper/abstains"),
+        show("health", "/api/dashboard"),
+        show("data-latency", "/api/shadow/status")
+      ]).then(([summary, trades, abstains, dashboard, shadow]) => {
+        document.getElementById("directional").textContent =
+          JSON.stringify({strategy: "DIRECTIONAL_EDGE", abstains}, null, 2);
+        document.getElementById("structural").textContent =
+          JSON.stringify({strategy: "STRUCTURAL_ARBITRAGE", trades}, null, 2);
+        document.getElementById("buckets").textContent =
+          JSON.stringify(dashboard.metrics ? dashboard.metrics.markets : [], null, 2);
+        document.getElementById("risk").textContent =
+          JSON.stringify({summary, shadow, label: "PAPER / SHADOW — NO REAL ORDER"}, null, 2);
+      });
     </script>
   </body>
 </html>
