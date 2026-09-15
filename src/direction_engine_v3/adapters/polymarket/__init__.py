@@ -9,6 +9,7 @@ from direction_engine_v3.adapters.polymarket.market_data import (
     parse_clob_book,
     parse_fee_schedule,
     parse_gamma_market,
+    parse_gamma_market_discovery,
     parse_market_resolved,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "parse_clob_book",
     "parse_fee_schedule",
     "parse_gamma_market",
+    "parse_gamma_market_discovery",
     "parse_market_resolved",
 ]

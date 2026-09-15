@@ -1,7 +1,7 @@
 """Pure immutable domain contracts for direction-engineV3."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from direction_engine_v3.domain._validation import (
@@ -78,6 +78,18 @@ class Market:
             self.window_end,
             allow_equal=False,
         )
+        expected_duration = {
+            Horizon.FIVE_MINUTES: timedelta(minutes=5),
+            Horizon.FIFTEEN_MINUTES: timedelta(minutes=15),
+            Horizon.ONE_HOUR: timedelta(hours=1),
+        }[self.horizon]
+        if self.window_end - self.window_start != expected_duration:
+            raise ValueError("market window duration must exactly match horizon")
+        duration_seconds = int(expected_duration.total_seconds())
+        if int(self.window_start.timestamp()) % duration_seconds != 0:
+            raise ValueError("market window start must align to its canonical UTC boundary")
+        if self.window_start.microsecond != 0:
+            raise ValueError("market window start must not contain fractional seconds")
         require_text("settlement_source", self.settlement_source)
 
 

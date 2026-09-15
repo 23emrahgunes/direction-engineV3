@@ -7,6 +7,7 @@ from typing import Final
 
 from direction_engine_v3.adapters._parsing import (
     JsonObject,
+    require_bool,
     require_decimal,
     require_int,
     require_iso8601,
@@ -20,9 +21,12 @@ from direction_engine_v3.market_data import (
     EventLineage,
     FeeSchedule,
     MarketDataSchemaError,
+    MarketDiscovery,
     PolymarketBook,
     PolymarketLevel,
     PolymarketResolutionEvent,
+    SettlementMetadata,
+    SettlementMethod,
     utc_from_milliseconds,
 )
 
@@ -43,9 +47,72 @@ def market_subscription(token_ids: tuple[str, ...]) -> dict[str, object]:
 
 
 def parse_gamma_market(raw: object, *, asset: Asset, horizon: Horizon) -> Market:
-    """Map outcome labels to token IDs explicitly; array position alone is never trusted."""
+    """Parse identity using eventStartTime, never the market-creation startDate."""
 
     payload = require_object(raw)
+    market, _ = _parse_gamma_identity(payload, asset=asset, horizon=horizon)
+    return market
+
+
+def parse_gamma_market_discovery(
+    raw: object,
+    *,
+    event_id: str,
+    asset: Asset,
+    horizon: Horizon,
+    recv_ts: datetime,
+    normalized_ts: datetime,
+    recv_monotonic_ns: int,
+) -> MarketDiscovery:
+    """Parse independently cross-checkable market and settlement metadata."""
+
+    payload = require_object(raw)
+    market, config = _parse_gamma_identity(payload, asset=asset, horizon=horizon)
+    if horizon is Horizon.ONE_HOUR:
+        method = SettlementMethod.BINANCE_CANDLE
+        configuration_id = None
+        reference_period_seconds = 3_600
+    else:
+        if config is None:
+            raise MarketDataSchemaError("short-window market requires cryptoMarketConfig")
+        method = SettlementMethod.CHAINLINK_TWAP
+        configuration_id = require_str(payload, "cryptoMarketConfigId")
+        if not require_bool(config, "twapEnabled"):
+            raise MarketDataSchemaError("short-window market must enable TWAP")
+        reference_period_seconds = require_int(config, "twapLookbackSeconds")
+    metadata = SettlementMetadata(
+        market_id=market.market_id,
+        condition_id=market.condition_id,
+        resolution_source=market.settlement_source,
+        rules=require_str(payload, "description"),
+        method=method,
+        configuration_id=configuration_id,
+        asset=asset,
+        horizon=horizon,
+        reference_period_seconds=reference_period_seconds,
+        version=require_str(payload, "version"),
+        lineage=EventLineage(
+            source=DataSource.POLYMARKET_GAMMA,
+            source_ts=require_iso8601(payload, "updatedAt"),
+            recv_ts=recv_ts,
+            normalized_ts=normalized_ts,
+            recv_monotonic_ns=recv_monotonic_ns,
+        ),
+    )
+    return MarketDiscovery(
+        event_id=event_id,
+        slug=require_str(payload, "slug"),
+        question=require_str(payload, "question"),
+        market=market,
+        settlement=metadata,
+    )
+
+
+def _parse_gamma_identity(
+    payload: JsonObject, *, asset: Asset, horizon: Horizon
+) -> tuple[Market, JsonObject | None]:
+    """Validate duplicated vendor identity fields before constructing a market."""
+
     outcomes = _array_field(payload, "outcomes")
     token_ids = _array_field(payload, "clobTokenIds")
     if len(outcomes) != 2 or len(token_ids) != 2:
@@ -59,16 +126,30 @@ def parse_gamma_market(raw: object, *, asset: Asset, horizon: Horizon) -> Market
         if normalized not in aliases:
             raise MarketDataSchemaError("market outcomes must map explicitly to UP and DOWN")
         tokens.append(MarketToken(token_id=token_id, outcome=aliases[normalized]))
-    return Market(
+    raw_config = payload.get("cryptoMarketConfig")
+    config = None if raw_config is None else require_object(raw_config, "cryptoMarketConfig")
+    if horizon is not Horizon.ONE_HOUR and config is None:
+        raise MarketDataSchemaError("short-window market requires cryptoMarketConfig")
+    if config is not None:
+        if require_str(config, "asset") != asset.value.lower():
+            raise MarketDataSchemaError("cryptoMarketConfig asset does not match requested asset")
+        if require_str(config, "duration") != horizon.value:
+            raise MarketDataSchemaError(
+                "cryptoMarketConfig duration does not match requested horizon"
+            )
+        if require_str(payload, "cryptoMarketConfigId") != require_str(config, "id"):
+            raise MarketDataSchemaError("crypto market configuration IDs do not match")
+    market = Market(
         market_id=require_str(payload, "id"),
         condition_id=require_str(payload, "conditionId"),
         asset=asset,
         horizon=horizon,
         tokens=tuple(tokens),
-        window_start=require_iso8601(payload, "startDate"),
+        window_start=require_iso8601(payload, "eventStartTime"),
         window_end=require_iso8601(payload, "endDate"),
         settlement_source=require_str(payload, "resolutionSource"),
     )
+    return market, config
 
 
 def parse_clob_book(

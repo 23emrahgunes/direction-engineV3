@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from direction_engine_v3.domain import Asset
+from direction_engine_v3.domain import Asset, Horizon, Market
 from direction_engine_v3.domain._validation import (
     require_decimal,
     require_text,
@@ -25,6 +25,13 @@ class DataSource(StrEnum):
     POLYMARKET_CLOB = "POLYMARKET_CLOB"
     POLYMARKET_GAMMA = "POLYMARKET_GAMMA"
     CHAINLINK_RTDS = "CHAINLINK_RTDS"
+
+
+class SettlementMethod(StrEnum):
+    """Rule-defined authoritative comparison method."""
+
+    CHAINLINK_TWAP = "CHAINLINK_TWAP"
+    BINANCE_CANDLE = "BINANCE_CANDLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,3 +224,76 @@ class PolymarketResolutionEvent:
         require_text("winning_outcome", self.winning_outcome)
         if not isinstance(self.lineage, EventLineage):
             raise TypeError("lineage must be EventLineage")
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementMetadata:
+    """Public market rules and canonical crypto-window configuration."""
+
+    market_id: str
+    condition_id: str
+    resolution_source: str
+    rules: str
+    method: SettlementMethod
+    configuration_id: str | None
+    asset: Asset
+    horizon: Horizon
+    reference_period_seconds: int
+    version: str
+    lineage: EventLineage
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("market_id", self.market_id),
+            ("condition_id", self.condition_id),
+            ("resolution_source", self.resolution_source),
+            ("rules", self.rules),
+            ("version", self.version),
+        ):
+            require_text(name, value)
+        if not isinstance(self.asset, Asset):
+            raise TypeError("asset must be an Asset")
+        if not isinstance(self.horizon, Horizon):
+            raise TypeError("horizon must be a Horizon")
+        if not isinstance(self.method, SettlementMethod):
+            raise TypeError("method must be a SettlementMethod")
+        if self.configuration_id is not None:
+            require_text("configuration_id", self.configuration_id)
+        if (
+            isinstance(self.reference_period_seconds, bool)
+            or not isinstance(self.reference_period_seconds, int)
+            or self.reference_period_seconds <= 0
+        ):
+            raise ValueError("reference_period_seconds must be a positive integer")
+        if not isinstance(self.lineage, EventLineage):
+            raise TypeError("lineage must be EventLineage")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDiscovery:
+    """Identity-linked Gamma discovery result with settlement evidence."""
+
+    event_id: str
+    slug: str
+    question: str
+    market: Market
+    settlement: SettlementMetadata
+
+    def __post_init__(self) -> None:
+        require_text("event_id", self.event_id)
+        require_text("slug", self.slug)
+        require_text("question", self.question)
+        if not isinstance(self.market, Market):
+            raise TypeError("market must be a Market")
+        if not isinstance(self.settlement, SettlementMetadata):
+            raise TypeError("settlement must be SettlementMetadata")
+        if self.settlement.market_id != self.market.market_id:
+            raise ValueError("settlement market identity mismatch")
+        if self.settlement.condition_id != self.market.condition_id:
+            raise ValueError("settlement condition identity mismatch")
+        if self.settlement.asset is not self.market.asset:
+            raise ValueError("settlement asset mismatch")
+        if self.settlement.horizon is not self.market.horizon:
+            raise ValueError("settlement horizon mismatch")
+        if self.settlement.resolution_source != self.market.settlement_source:
+            raise ValueError("settlement source mismatch")

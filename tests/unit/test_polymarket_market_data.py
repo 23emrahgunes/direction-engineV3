@@ -8,6 +8,7 @@ from direction_engine_v3.adapters.polymarket import (
     parse_clob_book,
     parse_fee_schedule,
     parse_gamma_market,
+    parse_gamma_market_discovery,
     parse_market_resolved,
 )
 from direction_engine_v3.domain import Asset, Horizon, OutcomeSide
@@ -16,17 +17,35 @@ from direction_engine_v3.market_data import MarketDataSchemaError
 RECV = datetime(2026, 9, 15, 12, 0, 1, tzinfo=UTC)
 
 
+def gamma_payload() -> dict[str, object]:
+    return {
+        "id": "market-1",
+        "conditionId": "condition-1",
+        "question": "Bitcoin Up or Down - September 15, 8:00AM-8:05AM ET",
+        "slug": "btc-updown-5m-1789473600",
+        "outcomes": '["Down", "Up"]',
+        "clobTokenIds": '["down-token", "up-token"]',
+        "startDate": "2026-09-14T12:00:00Z",
+        "eventStartTime": "2026-09-15T12:00:00Z",
+        "endDate": "2026-09-15T12:05:00Z",
+        "resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+        "description": "Resolve from the BTC/USD Chainlink TWAP stream.",
+        "cryptoMarketConfigId": "btc-5m-twap-60",
+        "cryptoMarketConfig": {
+            "id": "btc-5m-twap-60",
+            "asset": "btc",
+            "duration": "5m",
+            "twapEnabled": True,
+            "twapLookbackSeconds": 60,
+        },
+        "version": "v1",
+        "updatedAt": "2026-09-15T11:59:59Z",
+    }
+
+
 def test_gamma_discovery_maps_token_ids_by_outcome_label() -> None:
     market = parse_gamma_market(
-        {
-            "id": "market-1",
-            "conditionId": "condition-1",
-            "outcomes": '["Down", "Up"]',
-            "clobTokenIds": '["down-token", "up-token"]',
-            "startDate": "2026-09-15T12:00:00Z",
-            "endDate": "2026-09-15T12:05:00Z",
-            "resolutionSource": "https://example.invalid/rules",
-        },
+        gamma_payload(),
         asset=Asset.BTC,
         horizon=Horizon.FIVE_MINUTES,
     )
@@ -37,20 +56,74 @@ def test_gamma_discovery_maps_token_ids_by_outcome_label() -> None:
 
 
 def test_gamma_discovery_rejects_ambiguous_outcomes() -> None:
+    payload = gamma_payload()
+    payload["outcomes"] = ["Yes", "No"]
+    payload["clobTokenIds"] = ["yes", "no"]
     with pytest.raises(MarketDataSchemaError, match="UP and DOWN"):
         parse_gamma_market(
-            {
-                "id": "market-1",
-                "conditionId": "condition-1",
-                "outcomes": ["Yes", "No"],
-                "clobTokenIds": ["yes", "no"],
-                "startDate": "2026-09-15T12:00:00Z",
-                "endDate": "2026-09-15T12:05:00Z",
-                "resolutionSource": "rules",
-            },
+            payload,
             asset=Asset.BTC,
             horizon=Horizon.FIVE_MINUTES,
         )
+
+
+def test_gamma_discovery_uses_event_start_not_creation_start() -> None:
+    market = parse_gamma_market(
+        gamma_payload(), asset=Asset.BTC, horizon=Horizon.FIVE_MINUTES
+    )
+    assert market.window_start == datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+
+
+def test_gamma_discovery_rejects_wrong_config_asset_or_duration() -> None:
+    payload = gamma_payload()
+    config = dict(payload["cryptoMarketConfig"])  # type: ignore[arg-type]
+    config["asset"] = "eth"
+    payload["cryptoMarketConfig"] = config
+    with pytest.raises(MarketDataSchemaError, match="asset"):
+        parse_gamma_market(payload, asset=Asset.BTC, horizon=Horizon.FIVE_MINUTES)
+
+
+def test_gamma_discovery_retains_settlement_metadata_lineage() -> None:
+    discovery = parse_gamma_market_discovery(
+        gamma_payload(),
+        event_id="event-1",
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        recv_ts=RECV,
+        normalized_ts=RECV,
+        recv_monotonic_ns=9,
+    )
+    assert discovery.settlement.configuration_id == "btc-5m-twap-60"
+    assert discovery.settlement.reference_period_seconds == 60
+    assert discovery.settlement.lineage.source_ts == datetime(
+        2026, 9, 15, 11, 59, 59, tzinfo=UTC
+    )
+
+
+def test_hourly_discovery_uses_binance_candle_metadata_without_twap_config() -> None:
+    payload = gamma_payload()
+    payload.update(
+        {
+            "question": "Bitcoin Up or Down - September 15, 8AM ET",
+            "slug": "bitcoin-up-or-down-september-15-2026-8am-et",
+            "eventStartTime": "2026-09-15T12:00:00Z",
+            "endDate": "2026-09-15T13:00:00Z",
+            "resolutionSource": "https://www.binance.com/en/trade/BTC_USDT",
+            "cryptoMarketConfigId": None,
+            "cryptoMarketConfig": None,
+        }
+    )
+    discovery = parse_gamma_market_discovery(
+        payload,
+        event_id="hourly-event",
+        asset=Asset.BTC,
+        horizon=Horizon.ONE_HOUR,
+        recv_ts=RECV,
+        normalized_ts=RECV,
+        recv_monotonic_ns=10,
+    )
+    assert discovery.settlement.configuration_id is None
+    assert discovery.settlement.reference_period_seconds == 3_600
 
 
 def test_clob_book_is_decimal_sorted_and_timestamped() -> None:

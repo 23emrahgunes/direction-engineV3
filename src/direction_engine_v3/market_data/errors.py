@@ -23,3 +23,15 @@ class TransportExhaustedError(MarketDataError):
 
 class BufferOverflowError(MarketDataError):
     """A fail-closed bounded consumer buffer overflowed."""
+
+
+class CanonicalMarketError(MarketDataError):
+    """Market identity, timing, or settlement metadata is not canonical."""
+
+
+class DiscoveryMismatchError(CanonicalMarketError):
+    """Discovered vendor metadata does not match the requested market bucket."""
+
+
+class ReferenceUnavailableError(CanonicalMarketError):
+    """An authoritative, identity-matched reference cannot be established."""
