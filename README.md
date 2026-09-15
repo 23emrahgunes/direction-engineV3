@@ -3,10 +3,10 @@
 `direction-engineV3` is a Python 3.12 research and paper-trading system for BTC, ETH,
 SOL, and XRP markets with 5m, 15m, and 1h horizons.
 
-V3.2 contains the repository skeleton, fail-safe bootstrap configuration, immutable
-domain contracts, and a credential-free public market-data foundation for Binance,
-Polymarket, and Chainlink RTDS. It does not contain Directional Edge, Structural
-Arbitrage, WhaleSignal migrations, or real order submission.
+V3.3 contains the repository skeleton, fail-safe bootstrap configuration, immutable
+domain contracts, a credential-free public market-data foundation, and an audited
+WhaleSignal capability-to-owner migration map. It does not yet contain Directional
+Edge, Structural Arbitrage, or real order submission.
 
 ## Safety defaults
 
