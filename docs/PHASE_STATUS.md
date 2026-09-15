@@ -12,6 +12,7 @@ local and VPS gates pass.
 | V3.4 | `8763cc3b8277482e96ef0476d06c7a7591291ec9` | Accepted: compileall; 147 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 147 pytest passed; ruff and mypy passed; diff check and status clean; all 12 live public markets validated | 65 focused identity/PTB/reference tests; 147 full-suite tests | None | 2026-09-15T19:20:36Z | Accepted |
 | V3.5 | `af2c89032f0055e8161f8940537c732a68382783` | Accepted: compileall; 163 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 163 pytest passed; ruff and mypy passed; diff check and status clean; live read-only fee/book simulation passed | 16 focused pricing/regression tests; 163 full-suite tests | None | 2026-09-15T19:26:28Z | Accepted |
 | V3.6 | `15391f1cc47a95f67d0f37ab1b728eabcd259adc` | Accepted: compileall; 179 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 179 pytest passed; ruff and mypy passed; diff check and status clean; live read-only paired scan passed | 16 focused structural/replay/regression tests; 179 full-suite tests | None | 2026-09-15T19:32:23Z | Accepted |
+| V3.7 | `71f306cea638a2b30becc7cb672dd60d895b0f6c` | Accepted: compileall; 191 pytest passed; ruff and mypy passed; diff check clean | Accepted on Ubuntu / Python 3.12.3 through AWS Systems Manager: compileall; 191 pytest passed; ruff and mypy passed; diff check and status clean; live-public fail-closed ABSTAIN passed | 13 focused directional/boundary tests; 191 full-suite tests | None | 2026-09-15T19:37:37Z | Accepted |
 
 ## V3.1 VPS evidence
 
@@ -105,3 +106,16 @@ local and VPS gates pass.
   both-leg, partial, one-leg, unwind, loss, and receive-time no-lookahead coverage.
 - Read-only BTC 5m scan: UP/DOWN best asks 0.64/0.37; source skew 5 ms; both BUY+MERGE
   and SPLIT+SELL returned `NET_ECONOMICS_BELOW_MINIMUM`. No trade or order was emitted.
+
+## V3.7 VPS evidence
+
+- Target revision tested: `71f306cea638a2b30becc7cb672dd60d895b0f6c`
+- Python: 3.12.3
+- Focused Directional Edge/boundary result: 13 passed locally
+- Full local and VPS result: 191 passed
+- Ruff: passed
+- mypy: no issues in 49 source files
+- compileall, `git diff --check`, and `git status --short`: passed/clean
+- AWS Systems Manager acceptance command: `3e8b5aaf-68a4-4123-ae12-6fbeecd7d090`
+- A current public BTC 5m market with no official PTB/model/calibration returned
+  `ABSTAIN / OFFICIAL_PTB_UNAVAILABLE` and no candidate. No synthetic forecast was used.
