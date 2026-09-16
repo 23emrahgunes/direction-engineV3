@@ -153,7 +153,7 @@ async def _assert_ptb_service_rejects_missed_boundary(tmp_path: Path) -> None:
     )
     result = await service.resolve(_discovery(Horizon.FIVE_MINUTES), observed_at=clock.utc_now())
     assert result.ptb_status == "PTB_UNAVAILABLE"
-    assert result.reason == "BOUNDARY_HISTORY_MISSING"
+    assert result.reason == "CHAINLINK_NO_MESSAGES"
 
 
 def test_binance_1h_official_candle_requires_exact_window(tmp_path: Path) -> None:

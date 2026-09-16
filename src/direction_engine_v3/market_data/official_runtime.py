@@ -47,9 +47,14 @@ _BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 @dataclass(frozen=True, slots=True)
 class ChainlinkCollectorStatus:
     connection: str
+    selected_topic: str
+    subscription_status: str
     last_message_at: datetime | None
+    last_source_timestamp: datetime | None
     reconnect_count: int
     message_count: int
+    parse_success_count: int
+    parse_failure_count: int
     history_size_by_asset: Mapping[str, int]
     latest_twap_by_asset: Mapping[str, str]
     last_error: str | None
@@ -57,11 +62,18 @@ class ChainlinkCollectorStatus:
     def as_dict(self) -> dict[str, object]:
         return {
             "connection": self.connection,
+            "selected_topic": self.selected_topic,
+            "subscription_status": self.subscription_status,
             "last_message_at": self.last_message_at.isoformat()
             if self.last_message_at is not None
             else None,
+            "last_source_timestamp": self.last_source_timestamp.isoformat()
+            if self.last_source_timestamp is not None
+            else None,
             "reconnect_count": self.reconnect_count,
             "message_count": self.message_count,
+            "parse_success_count": self.parse_success_count,
+            "parse_failure_count": self.parse_failure_count,
             "history_size_by_asset": dict(self.history_size_by_asset),
             "latest_twap_by_asset": dict(self.latest_twap_by_asset),
             "last_error": self.last_error,
@@ -71,6 +83,9 @@ class ChainlinkCollectorStatus:
 @dataclass(frozen=True, slots=True)
 class BinanceHourlyCollectorStatus:
     last_request_at: datetime | None
+    last_http_status: str | None
+    last_market_window_start: datetime | None
+    last_match_status: str | None
     last_candle_by_asset: Mapping[str, str]
     last_error: str | None
 
@@ -79,6 +94,11 @@ class BinanceHourlyCollectorStatus:
             "last_request_at": self.last_request_at.isoformat()
             if self.last_request_at is not None
             else None,
+            "last_http_status": self.last_http_status,
+            "last_market_window_start": self.last_market_window_start.isoformat()
+            if self.last_market_window_start is not None
+            else None,
+            "last_match_status": self.last_match_status,
             "last_candle_by_asset": dict(self.last_candle_by_asset),
             "last_error": self.last_error,
         }
@@ -122,8 +142,12 @@ class ChainlinkTwapCollector:
         self._connected = False
         self._reconnect_count = 0
         self._message_count = 0
+        self._parse_success_count = 0
+        self._parse_failure_count = 0
         self._last_message_at: datetime | None = None
+        self._last_source_timestamp: datetime | None = None
         self._last_error: str | None = None
+        self._subscription_status = "NOT_STARTED"
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Run until stopped; retry transport errors with bounded backoff."""
@@ -132,6 +156,7 @@ class ChainlinkTwapCollector:
             try:
                 self._connected = True
                 subscription = _combined_twap_subscription(self._assets)
+                self._subscription_status = "SUBSCRIBED"
                 async for raw in self._transport.resilient_websocket_json(
                     RTDS_WS_URL,
                     subscription=subscription,
@@ -145,6 +170,7 @@ class ChainlinkTwapCollector:
                 raise
             except Exception as exc:
                 self._last_error = f"{type(exc).__name__}: {exc}"
+                self._subscription_status = "ERROR"
                 self._reconnect_count += 1
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=5.0)
@@ -170,12 +196,14 @@ class ChainlinkTwapCollector:
                         recv_monotonic_ns=self._clock.monotonic_ns(),
                     )
                 except MarketDataSchemaError:
+                    self._parse_failure_count += 1
                     continue
                 self._record(twap)
                 parsed += 1
                 break
         if parsed:
             self._message_count += parsed
+            self._parse_success_count += parsed
             self._last_message_at = self._clock.utc_now()
             self._last_error = None
         return parsed
@@ -199,9 +227,14 @@ class ChainlinkTwapCollector:
     def status(self) -> ChainlinkCollectorStatus:
         return ChainlinkCollectorStatus(
             connection="connected" if self._connected else "disconnected",
+            selected_topic="crypto_prices_twap_sixty",
+            subscription_status=self._subscription_status,
             last_message_at=self._last_message_at,
+            last_source_timestamp=self._last_source_timestamp,
             reconnect_count=self._reconnect_count,
             message_count=self._message_count,
+            parse_success_count=self._parse_success_count,
+            parse_failure_count=self._parse_failure_count,
             history_size_by_asset={
                 asset.value: len(self._history.get(asset, ())) for asset in self._assets
             },
@@ -215,6 +248,7 @@ class ChainlinkTwapCollector:
         latest = self._latest.get(twap.asset)
         if latest is None or twap.publisher_ts >= latest.publisher_ts:
             self._latest[twap.asset] = twap
+            self._last_source_timestamp = twap.publisher_ts
         history = self._history.setdefault(twap.asset, deque(maxlen=4096))
         if not history or (
             history[-1].publisher_ts != twap.publisher_ts or history[-1].value != twap.value
@@ -231,12 +265,16 @@ class BinanceHourlyOfficialCollector:
         self._last_request_at: datetime | None = None
         self._last_candle_by_asset: dict[Asset, BinanceHourlyCandle] = {}
         self._last_error: str | None = None
+        self._last_http_status: str | None = None
+        self._last_market_window_start: datetime | None = None
+        self._last_match_status: str | None = None
 
     async def fetch_candle(self, discovery: MarketDiscovery) -> BinanceHourlyCandle:
         market = discovery.market
         if market.horizon is not Horizon.ONE_HOUR:
             raise ReferenceUnavailableError("Binance hourly official source is 1h-only")
         self._last_request_at = self._clock.utc_now()
+        self._last_market_window_start = market.window_start
         params = {
             "symbol": f"{market.asset.value}USDT",
             "interval": "1h",
@@ -246,17 +284,27 @@ class BinanceHourlyOfficialCollector:
         }
         try:
             raw = await self._transport.get_json(_BINANCE_KLINES_URL, params=params)
+            self._last_http_status = "OK"
             candle = _parse_binance_hourly_candle(raw, asset=market.asset, clock=self._clock)
             self._last_candle_by_asset[market.asset] = candle
+            self._last_match_status = (
+                "MATCH"
+                if candle.open_time == market.window_start
+                else "BINANCE_HOURLY_WINDOW_MISMATCH"
+            )
             self._last_error = None
             return candle
         except Exception as exc:
+            self._last_http_status = "ERROR"
             self._last_error = f"{type(exc).__name__}: {exc}"
             raise
 
     def status(self) -> BinanceHourlyCollectorStatus:
         return BinanceHourlyCollectorStatus(
             last_request_at=self._last_request_at,
+            last_http_status=self._last_http_status,
+            last_market_window_start=self._last_market_window_start,
+            last_match_status=self._last_match_status,
             last_candle_by_asset={
                 asset.value: candle.open_time.isoformat()
                 for asset, candle in self._last_candle_by_asset.items()
@@ -335,7 +383,12 @@ class OfficialPriceToBeatService:
             tolerance=self._policy.boundary_tolerance,
         )
         if twap is None:
-            return PriceToBeatResolution(None, None, "PTB_UNAVAILABLE", "BOUNDARY_HISTORY_MISSING")
+            return PriceToBeatResolution(
+                None,
+                None,
+                "PTB_UNAVAILABLE",
+                self._short_unavailable_reason(market.asset),
+            )
         reference = official_reference_from_chainlink_twap(
             market,
             twap,
@@ -358,13 +411,30 @@ class OfficialPriceToBeatService:
                 is_price_to_beat=True,
             )
         except Exception as exc:
+            reason = (
+                "BINANCE_HOURLY_WINDOW_MISMATCH"
+                if isinstance(exc, ReferenceUnavailableError)
+                else "BINANCE_HOURLY_HTTP_FAILED"
+            )
             return PriceToBeatResolution(
                 None,
                 None,
                 "PTB_UNAVAILABLE",
-                f"BINANCE_HOURLY_UNAVAILABLE:{type(exc).__name__}",
+                f"{reason}:{type(exc).__name__}",
             )
         return self._establish(discovery, identity, reference)
+
+    def _short_unavailable_reason(self, asset: Asset) -> str:
+        status = self._chainlink.status()
+        if status.message_count == 0:
+            if status.last_error:
+                return "CHAINLINK_SOCKET_UNAVAILABLE"
+            return "CHAINLINK_NO_MESSAGES"
+        if status.parse_success_count == 0 and status.parse_failure_count > 0:
+            return "CHAINLINK_PARSE_FAILED"
+        if status.history_size_by_asset.get(asset.value, 0) == 0:
+            return "BOUNDARY_HISTORY_MISSING"
+        return "BOUNDARY_SAMPLE_OUTSIDE_TOLERANCE"
 
     def _establish(
         self,
@@ -383,11 +453,15 @@ class OfficialPriceToBeatService:
             saved = self._repository.save_once(identity, record)
             return PriceToBeatResolution(saved, saved.reference, "PTB_READY", "PTB_ESTABLISHED")
         except ReferenceUnavailableError as exc:
+            if discovery.market.horizon is Horizon.ONE_HOUR and "Binance candle" in str(exc):
+                reason = "BINANCE_HOURLY_WINDOW_MISMATCH"
+            else:
+                reason = "PTB_ESTABLISH_REJECTED"
             return PriceToBeatResolution(
                 None,
                 reference,
                 "PTB_UNAVAILABLE",
-                f"PTB_ESTABLISH_REJECTED:{type(exc).__name__}",
+                f"{reason}:{type(exc).__name__}",
             )
 
 

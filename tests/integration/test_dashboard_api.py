@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from aiohttp.test_utils import TestClient, TestServer
 
 from direction_engine_v3.app import build_dashboard_snapshot, create_app
+from direction_engine_v3.shadow.storage import SQLiteShadowRepository
 
 
 def test_dashboard_snapshot_preserves_scope_and_live_defaults() -> None:
@@ -93,3 +94,64 @@ async def _assert_directional_status_api_is_read_only_and_paper_labeled() -> Non
     assert payload["real_order_submission"] is False
     assert len(payload["buckets"]) == 12
     assert {item["asset"] for item in payload["buckets"]} == {"BTC", "ETH", "SOL", "XRP"}
+
+
+def test_directional_status_api_exposes_official_proxy_ptb_health(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    repository.append_event(
+        event_id="event",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "official_status": "OFFICIAL_REFERENCE_READY",
+            "proxy_status": "PROXY_READY",
+            "ptb_status": "PTB_READY",
+            "ptb_reason": "PTB_ESTABLISHED",
+            "chainlink": {
+                "selected_topic": "crypto_prices_twap_sixty",
+                "subscription_status": "SUBSCRIBED",
+                "message_count": 3,
+                "parse_success_count": 3,
+                "parse_failure_count": 0,
+            },
+            "binance_hourly": {
+                "last_http_status": "OK",
+                "last_match_status": "MATCH",
+            },
+            "action": "ABSTAIN",
+            "reason": "MODEL_UNAVAILABLE",
+            "corpus_sample_count": 0,
+        },
+        observed_at=observed_at,
+    )
+
+    asyncio.run(_assert_directional_status_contains_feed_health())
+
+
+async def _assert_directional_status_contains_feed_health() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["official_status"] == "OFFICIAL_REFERENCE_READY"
+    assert bucket["proxy_status"] == "PROXY_READY"
+    assert bucket["ptb_status"] == "PTB_READY"
+    assert bucket["chainlink"]["selected_topic"] == "crypto_prices_twap_sixty"
+    assert bucket["chainlink"]["parse_success_count"] == 3
+    assert bucket["binance_hourly"]["last_match_status"] == "MATCH"
+    assert bucket["label"] == "PAPER / SHADOW — NO REAL ORDER"

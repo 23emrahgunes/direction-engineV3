@@ -72,6 +72,7 @@ from direction_engine_v3.pricing import (
     DepthSimulation,
     LiquidityRole,
     PricingPolicy,
+    PricingUnavailableError,
     simulate_depth,
 )
 from direction_engine_v3.risk import (
@@ -150,6 +151,8 @@ class ShadowMarketState:
     ptb_status: str = "PTB_UNAVAILABLE"
     ptb_reason: str = "OFFICIAL_PTB_UNAVAILABLE"
     feature_status: str = "FEATURES_UNAVAILABLE"
+    chainlink_status: Mapping[str, object] | None = None
+    binance_hourly_status: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +242,11 @@ class PublicShadowDataClient:
             )
             observed_at = self._clock.utc_now()
             ptb_resolution = await self._resolve_ptb(discovery, observed_at=observed_at)
+            chainlink_status = None
+            binance_hourly_status = None
+            if self._official_ptb is not None:
+                chainlink_status = self._official_ptb.chainlink_status().as_dict()
+                binance_hourly_status = self._official_ptb.binance_hourly_status().as_dict()
             features, feature_status = self._build_directional_features(
                 discovery,
                 proxy,
@@ -259,6 +267,8 @@ class PublicShadowDataClient:
                 ptb_status=ptb_resolution.ptb_status,
                 ptb_reason=ptb_resolution.reason,
                 feature_status=feature_status,
+                chainlink_status=chainlink_status,
+                binance_hourly_status=binance_hourly_status,
             )
         except Exception as exc:
             return ShadowMarketState(
@@ -549,6 +559,8 @@ class ShadowDaemon:
                 "model_reason": model_status.reason,
                 "calibration_state": "CALIBRATION_NOT_READY",
                 "pricing_status": pricing_status,
+                "chainlink": dict(state.chainlink_status or {}),
+                "binance_hourly": dict(state.binance_hourly_status or {}),
                 "corpus_sample_count": corpus_count,
                 "real_order_submission": False,
             },
@@ -710,19 +722,55 @@ class ShadowDaemon:
                 fee_buffer_bps=Decimal("500"),
             ),
         )
-        scans = tuple(
-            scan_complete_set(
-                state.discovery.market,
-                state.up_book,
-                state.down_book,
-                state.fee_schedule,
-                state.fee_schedule,
-                action=action,
-                observed_at=state.observed_at,
-                policy=policy,
-            )
-            for action in (StructuralAction.BUY_MERGE, StructuralAction.SPLIT_SELL)
-        )
+        scans_list = []
+        for action in (StructuralAction.BUY_MERGE, StructuralAction.SPLIT_SELL):
+            try:
+                scans_list.append(
+                    scan_complete_set(
+                        state.discovery.market,
+                        state.up_book,
+                        state.down_book,
+                        state.fee_schedule,
+                        state.fee_schedule,
+                        action=action,
+                        observed_at=state.observed_at,
+                        policy=policy,
+                    )
+                )
+            except Exception as exc:
+                reason = _structural_market_quality_reason(exc)
+                if reason is None:
+                    raise
+                self._record_abstain(
+                    state,
+                    cycle_id=cycle_id,
+                    strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                    reason=reason,
+                    payload={
+                        "label": _PAPER_LABEL,
+                        "stage": "STRUCTURAL_RUNTIME",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                self._shadow_repository.append_event(
+                    event_id=(
+                        f"{cycle_id}:{state.discovery.market.condition_id}:"
+                        f"structural:{action.value}:{reason}"
+                    ),
+                    window_id=self._evidence_window.window_id,
+                    event_type="STRUCTURAL_EVALUATION",
+                    bucket_key=f"{state.bucket.asset.value}-{state.bucket.horizon.value}",
+                    payload={
+                        "strategy": StrategyKind.STRUCTURAL_ARBITRAGE.value,
+                        "action": action.value,
+                        "reason": reason,
+                        "stage": "STRUCTURAL_RUNTIME",
+                        "label": _PAPER_LABEL,
+                    },
+                    observed_at=state.observed_at,
+                )
+                return False
+        scans = tuple(scans_list)
         executable = next((scan for scan in scans if scan.opportunity is not None), None)
         self._shadow_repository.append_event(
             event_id=f"{cycle_id}:{state.discovery.market.condition_id}:structural",
@@ -898,6 +946,28 @@ class ShadowDaemon:
             observed_at=state.observed_at,
         )
         return 1
+
+
+def _structural_market_quality_reason(exc: Exception) -> str | None:
+    """Map expected structural data-quality failures to fail-closed ABSTAIN reasons."""
+
+    message = str(exc).lower()
+    if isinstance(exc, PricingUnavailableError):
+        if "fee" in message and "stale" in message:
+            return "FEE_STALE"
+        if "book" in message and "source timestamp is stale" in message:
+            return "BOOK_STALE"
+        if "depth" in message or "liquidity" in message:
+            return "INSUFFICIENT_PAIRED_DEPTH"
+        return "PRICING_UNAVAILABLE"
+    if isinstance(exc, ValueError):
+        if "paired books exceed maximum source-time skew" in message:
+            return "PAIRED_BOOK_SOURCE_SKEW"
+        if "paired books exceed maximum receive-time skew" in message:
+            return "PAIRED_BOOK_RECEIVE_SKEW"
+        if "paired books require source timestamps" in message:
+            return "PAIRED_BOOK_SOURCE_TIMESTAMP_MISSING"
+    return None
 
 
 def new_evidence_window(

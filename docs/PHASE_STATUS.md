@@ -304,3 +304,33 @@ local and VPS gates pass.
 - VPS acceptance must be performed through `scripts/v3153_ssm_accept.ps1` and must prove
   real boundary `PTB_READY` evidence before final status can become
   `V3.15.3_OFFICIAL_PTB_RUNTIME_ACTIVE`.
+
+## V3.15.3.1 local evidence
+
+- Status before user-context VPS proof: `V3.15.3.1_BLOCKED`.
+- V3.15.3.1 is a narrow root-cause hotfix and source-probe phase. It keeps
+  expected Structural Arb market-quality failures inside the strategy ABSTAIN
+  boundary while preserving economics, freshness thresholds, and model-free
+  structural behavior.
+- Added read-only diagnostics for current Gamma official-source audit, RTDS topic
+  probing, and Binance 1h official candle validation. Diagnostics are import-safe,
+  credential-free, and write only sanitized public evidence when executed.
+- Directional dashboard status now surfaces Chainlink and Binance official-source
+  health from persisted shadow evidence; proxy data remains separately typed and
+  cannot satisfy official reference or PTB.
+- Local focused V3.15.3.1 tests: 18 passed.
+- Local full suite: 286 passed.
+- Local `python -m compileall src tests` using the project virtual environment:
+  passed.
+- Local Ruff: passed.
+- Local mypy: no issues in 84 source files.
+- Local `git diff --check`: passed.
+- Bridge self-test: `powershell -NoProfile -ExecutionPolicy Bypass -File
+  .\scripts\v31531_ssm_accept.ps1 -SelfTest` passed.
+- Source scans found no new secret, LIVE enablement, signing/order mutation,
+  proxy-to-official shortcut, scope expansion, fake PTB/model/settlement, or
+  Structural Arb weakening in the V3.15.3.1 implementation.
+- VPS acceptance must be performed through `scripts/v31531_ssm_accept.ps1` and
+  must prove daemon cycle advancement, RTDS source evidence, Binance 1h source
+  evidence, and at least one bounded real 5m `PTB_READY` before final status can
+  become `V3.15.3.1_OFFICIAL_PTB_ACTIVE`.

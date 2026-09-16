@@ -1,0 +1,76 @@
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from direction_engine_v3.diagnostics.rtds_probe import (
+    sanitize_message_shape,
+    subscription_for,
+)
+from direction_engine_v3.domain import Asset
+from direction_engine_v3.market_data.official_runtime import ChainlinkTwapCollector
+
+NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+
+
+class FakeClock:
+    def utc_now(self) -> datetime:
+        return NOW
+
+    def monotonic_ns(self) -> int:
+        return 123
+
+
+class FakeTransport:
+    pass
+
+
+def test_rtds_probe_subscribes_to_topics_independently() -> None:
+    chainlink = subscription_for("crypto_prices_chainlink", Asset.BTC)
+    twap = subscription_for("crypto_prices_twap_sixty", Asset.BTC)
+
+    assert chainlink["subscriptions"] != twap["subscriptions"]
+    assert chainlink["subscriptions"][0]["topic"] == "crypto_prices_chainlink"
+    assert twap["subscriptions"][0]["topic"] == "crypto_prices_twap_sixty"
+    assert chainlink["subscriptions"][0]["filters"] == '{"symbol":"btc/usd"}'
+
+
+def test_rtds_probe_sanitizes_message_shape_and_redacts_sensitive_keys() -> None:
+    shape = sanitize_message_shape(
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "payload": {
+                "symbol": "btc/usd",
+                "full_accuracy_value": Decimal("60000000000000000000000"),
+                "api_secret": "must-not-leak",
+            },
+        }
+    )
+
+    assert shape == {
+        "payload": {"full_accuracy_value": "decimal", "symbol": "str"},
+        "topic": "str",
+    }
+
+
+def test_chainlink_status_records_parse_counts_and_source_timestamp() -> None:
+    collector = ChainlinkTwapCollector(FakeTransport(), FakeClock())
+    collector.handle_message({"topic": "wrong", "type": "update", "payload": {}})
+    collector.handle_message(
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "update",
+            "timestamp": int(NOW.timestamp() * 1000),
+            "payload": {
+                "symbol": "btc/usd",
+                "full_accuracy_value": "60000000000000000000000",
+                "timestamp": int(NOW.timestamp() * 1000),
+            },
+        }
+    )
+
+    status = collector.status().as_dict()
+    assert status["selected_topic"] == "crypto_prices_twap_sixty"
+    assert status["parse_success_count"] == 1
+    assert status["parse_failure_count"] == 4
+    assert status["message_count"] == 1
+    assert status["last_source_timestamp"] == NOW.isoformat()
+    assert status["latest_twap_by_asset"] == {"BTC": "60000"}

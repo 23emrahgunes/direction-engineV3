@@ -269,6 +269,8 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "model_state": payload.get("model_state", "TRAINING_CORPUS_REQUIRED"),
                 "calibration_state": payload.get("calibration_state", "CALIBRATION_NOT_READY"),
                 "pricing_status": payload.get("pricing_status", "UNKNOWN"),
+                "chainlink": payload.get("chainlink", {}),
+                "binance_hourly": payload.get("binance_hourly", {}),
                 "last_decision": payload.get("action", "ABSTAIN"),
                 "last_abstain_reason": payload.get("reason", "NO_RUNTIME_EVIDENCE"),
                 "last_observed_at": latest["observed_at"] if latest is not None else None,
