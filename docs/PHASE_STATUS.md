@@ -262,3 +262,30 @@ local and VPS gates pass.
   restarted after the fast-forward. The accepted rerun restarted only project services.
 - No `v3.15.0` tag was created. V3.15 final acceptance remains blocked on the real
   burn-in and sample gates.
+
+## V3.15.2 local evidence
+
+- Status: `V3.15.2_CORPUS_ACCUMULATING` pending user-context VPS acceptance through
+  `scripts/v3152_ssm_accept.ps1`.
+- Directional runtime completion is PAPER/SHADOW-only. LIVE remains disabled and
+  unarmed, and real Polymarket order submission remains absent.
+- Official/proxy separation was tightened: the shadow daemon no longer constructs
+  `OfficialReference` from `ProxyReference`; official references are owned by
+  `market_data.official`.
+- Durable PTB persistence, directional corpus records, per-bucket shadow model state,
+  external temporal feature state, and read-only dashboard/API visibility were added.
+- Model readiness remains evidence-gated. No bucket is promoted without validated
+  walk-forward/corpus evidence; missing corpus reports `TRAINING_CORPUS_REQUIRED`.
+- Local focused V3.15.2 tests: 14 passed.
+- Local full suite: 268 passed.
+- Local `python -m compileall src tests`: passed.
+- Local Ruff: passed.
+- Local mypy: no issues in 79 source files.
+- Local `git diff --check`: passed.
+- Bridge self-test: `powershell -NoProfile -ExecutionPolicy Bypass -File
+  .\scripts\v3152_ssm_accept.ps1 -SelfTest` passed.
+- Source scans found no new secret, LIVE enablement, real-order, proxy-to-official
+  shortcut, scope-expansion, fake PTB/model/settlement, or Structural Arb weakening
+  in the V3.15.2 implementation.
+- VPS acceptance still requires the user-context SSM bridge because the Codex sandbox
+  does not hold the Windows user's AWS profile/session.
