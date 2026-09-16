@@ -15,6 +15,7 @@ from direction_engine_v3.models.registry import (
     TwelveBucketRegistry,
     empty_registry,
 )
+from direction_engine_v3.models.shadow_state import ShadowBucketModelStatus, ShadowModelState
 
 __all__ = [
     "BucketModelState",
@@ -24,6 +25,8 @@ __all__ = [
     "LogisticArtifact",
     "ModelNotReadyError",
     "ReliabilityCalibrator",
+    "ShadowBucketModelStatus",
+    "ShadowModelState",
     "TwelveBucketRegistry",
     "calibrated_forecast",
     "empty_registry",

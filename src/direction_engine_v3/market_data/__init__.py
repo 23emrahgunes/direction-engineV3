@@ -49,6 +49,16 @@ from direction_engine_v3.market_data.freshness import (
     FreshnessPolicy,
     SourceHealth,
 )
+from direction_engine_v3.market_data.official import (
+    BinanceHourlyCandle,
+    official_reference_from_binance_hourly_candle,
+    official_reference_from_chainlink_twap,
+    reject_proxy_as_official,
+)
+from direction_engine_v3.market_data.ptb_repository import (
+    PriceToBeatIdentity,
+    SQLitePriceToBeatRepository,
+)
 from direction_engine_v3.market_data.retry import RetryPolicy
 from direction_engine_v3.market_data.sequence import SequenceTracker
 
@@ -57,6 +67,7 @@ __all__ = [
     "OFFICIAL_REFERENCE_SOURCES",
     "OFFICIAL_TWAP_SOURCES",
     "SUPPORTED_MARKET_BUCKETS",
+    "BinanceHourlyCandle",
     "BufferOverflowError",
     "CanonicalMarketError",
     "CanonicalWindow",
@@ -80,10 +91,12 @@ __all__ = [
     "PolymarketBook",
     "PolymarketLevel",
     "PolymarketResolutionEvent",
+    "PriceToBeatIdentity",
     "PriceToBeatRecord",
     "ReferenceFreshnessPolicy",
     "ReferenceUnavailableError",
     "RetryPolicy",
+    "SQLitePriceToBeatRepository",
     "SequenceGapError",
     "SequenceTracker",
     "SettlementMetadata",
@@ -93,6 +106,9 @@ __all__ = [
     "TransportExhaustedError",
     "epoch_slug",
     "establish_price_to_beat",
+    "official_reference_from_binance_hourly_candle",
+    "official_reference_from_chainlink_twap",
+    "reject_proxy_as_official",
     "require_canonical_discovery",
     "require_fresh_official_reference",
     "require_fresh_proxy_reference",

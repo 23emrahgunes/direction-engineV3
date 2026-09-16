@@ -30,7 +30,6 @@ from direction_engine_v3.domain import (
     DecisionAction,
     Horizon,
     Market,
-    OfficialReference,
     OutcomeSide,
     ProxyReference,
     RiskDecision,
@@ -44,7 +43,6 @@ from direction_engine_v3.execution import (
     build_structural_buy_merge_paper_plan,
 )
 from direction_engine_v3.market_data import (
-    OFFICIAL_REFERENCE_SOURCES,
     SUPPORTED_MARKET_BUCKETS,
     FeeSchedule,
     MarketBucket,
@@ -54,7 +52,7 @@ from direction_engine_v3.market_data import (
     epoch_slug,
     window_containing,
 )
-from direction_engine_v3.models import empty_registry
+from direction_engine_v3.models import ShadowBucketModelStatus, ShadowModelState, empty_registry
 from direction_engine_v3.pricing import PricingPolicy
 from direction_engine_v3.risk import (
     LiquidityEvidence,
@@ -75,7 +73,7 @@ from direction_engine_v3.shadow.evidence import (
 )
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
 from direction_engine_v3.shadow.storage import SQLiteShadowRepository
-from direction_engine_v3.storage import SQLitePaperRepository
+from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 from direction_engine_v3.strategies.directional import DirectionalPolicy, assess_directional_edge
 from direction_engine_v3.strategies.structural_arb import (
     StructuralAction,
@@ -123,7 +121,7 @@ class ShadowMarketState:
     down_book: PolymarketBook | None
     fee_schedule: FeeSchedule | None
     proxy_reference: ProxyReference | None
-    official_reference: OfficialReference | None
+    official_reference: object | None
     observed_at: datetime
     unavailable_reason: str | None = None
 
@@ -198,7 +196,6 @@ class PublicShadowDataClient:
                 normalized_ts=self._clock.utc_now(),
                 recv_monotonic_ns=self._clock.monotonic_ns(),
             )
-            official = _official_from_proxy(discovery.market, proxy, recv_ts=fee_recv)
             return ShadowMarketState(
                 bucket,
                 discovery,
@@ -206,7 +203,7 @@ class PublicShadowDataClient:
                 down_book,
                 fee,
                 proxy,
-                official,
+                None,
                 self._clock.utc_now(),
             )
         except Exception as exc:
@@ -279,6 +276,7 @@ class ShadowDaemon:
         shadow_repository: SQLiteShadowRepository,
         evidence_window: EvidenceWindow,
         report_dir: Path,
+        directional_corpus_repository: SQLiteDirectionalCorpusRepository | None = None,
         clock: SystemClock | None = None,
         poll_seconds: float = 30.0,
     ) -> None:
@@ -289,6 +287,7 @@ class ShadowDaemon:
         self._shadow_repository = shadow_repository
         self._evidence_window = evidence_window
         self._report_dir = report_dir
+        self._directional_corpus_repository = directional_corpus_repository
         self._clock = clock or SystemClock()
         self._poll_seconds = poll_seconds
         self._registry = empty_registry()
@@ -378,6 +377,23 @@ class ShadowDaemon:
 
     def _evaluate_directional(self, state: ShadowMarketState, *, cycle_id: str) -> int:
         assert state.discovery is not None
+        model_status = self._shadow_model_status(state)
+        corpus_count = 0
+        if self._directional_corpus_repository is not None:
+            corpus_count = self._directional_corpus_repository.count(
+                asset=state.bucket.asset, horizon=state.bucket.horizon
+            )
+        ptb_status = "PTB_UNAVAILABLE"
+        feature_status = (
+            "FEATURES_UNAVAILABLE"
+            if state.proxy_reference is not None
+            else "EXTERNAL_REFERENCE_UNAVAILABLE"
+        )
+        pricing_status = (
+            "BOOKS_READY"
+            if state.up_book is not None and state.down_book is not None
+            else "EXECUTABLE_PRICE_UNAVAILABLE"
+        )
         assessment = assess_directional_edge(
             state.discovery.market,
             None,
@@ -404,9 +420,30 @@ class ShadowDaemon:
                 "strategy": StrategyKind.DIRECTIONAL_EDGE.value,
                 "action": assessment.action.value,
                 "reason": assessment.reason,
+                "stage": "DIRECTIONAL_RUNTIME",
+                "bucket": f"{state.bucket.asset.value}-{state.bucket.horizon.value}",
+                "official_status": "OFFICIAL_REFERENCE_UNAVAILABLE"
+                if state.official_reference is None
+                else "OFFICIAL_REFERENCE_READY",
+                "proxy_status": (
+                    "PROXY_READY" if state.proxy_reference is not None else "PROXY_UNAVAILABLE"
+                ),
+                "ptb_status": ptb_status,
+                "feature_status": feature_status,
+                "model_state": model_status.state.value,
+                "model_reason": model_status.reason,
+                "calibration_state": "CALIBRATION_NOT_READY",
+                "pricing_status": pricing_status,
+                "corpus_sample_count": corpus_count,
                 "real_order_submission": False,
             },
             observed_at=state.observed_at,
+        )
+        self._save_directional_corpus_placeholder(
+            state,
+            cycle_id=cycle_id,
+            reason=assessment.reason,
+            model_status=model_status,
         )
         if assessment.action is DecisionAction.ABSTAIN:
             return self._record_abstain(
@@ -414,9 +451,78 @@ class ShadowDaemon:
                 cycle_id=cycle_id,
                 strategy=StrategyKind.DIRECTIONAL_EDGE,
                 reason=assessment.reason,
-                payload={"market_id": assessment.market_id, "label": _PAPER_LABEL},
+                payload={
+                    "market_id": assessment.market_id,
+                    "label": _PAPER_LABEL,
+                    "ptb_status": ptb_status,
+                    "feature_status": feature_status,
+                    "model_state": model_status.state.value,
+                    "pricing_status": pricing_status,
+                    "corpus_sample_count": corpus_count,
+                },
             )
         return 0
+
+    def _shadow_model_status(self, state: ShadowMarketState) -> ShadowBucketModelStatus:
+        readiness = self._registry.state_for(state.bucket).readiness
+        corpus_count = 0
+        if self._directional_corpus_repository is not None:
+            corpus_count = self._directional_corpus_repository.count(
+                asset=state.bucket.asset, horizon=state.bucket.horizon
+            )
+        if readiness.ready:
+            return ShadowBucketModelStatus(
+                state.bucket.asset,
+                state.bucket.horizon,
+                ShadowModelState.SHADOW_CANDIDATE,
+                readiness,
+                "SHADOW_MODEL_READY",
+                calibration_version=readiness.calibration_version,
+                corpus_sample_count=corpus_count,
+            )
+        return ShadowBucketModelStatus(
+            state.bucket.asset,
+            state.bucket.horizon,
+            ShadowModelState.TRAINING_CORPUS_REQUIRED
+            if corpus_count == 0
+            else ShadowModelState.INSUFFICIENT_SAMPLE,
+            readiness,
+            "TRAINING_CORPUS_REQUIRED" if corpus_count == 0 else "INSUFFICIENT_TRAINING_SAMPLE",
+            corpus_sample_count=corpus_count,
+        )
+
+    def _save_directional_corpus_placeholder(
+        self,
+        state: ShadowMarketState,
+        *,
+        cycle_id: str,
+        reason: str,
+        model_status: ShadowBucketModelStatus,
+    ) -> None:
+        if self._directional_corpus_repository is None or state.discovery is None:
+            return
+        market = state.discovery.market
+        self._directional_corpus_repository.save_pre_outcome(
+            record_id=(
+                f"{cycle_id}:directional-corpus:{state.bucket.asset.value}:"
+                f"{state.bucket.horizon.value}:{market.condition_id}"
+            ),
+            asset=state.bucket.asset,
+            horizon=state.bucket.horizon,
+            condition_id=market.condition_id,
+            observed_at=state.observed_at,
+            payload={
+                "market_id": market.market_id,
+                "window_start": market.window_start,
+                "window_end": market.window_end,
+                "official_reference_ready": state.official_reference is not None,
+                "proxy_reference_ready": state.proxy_reference is not None,
+                "book_ready": state.up_book is not None and state.down_book is not None,
+                "directional_reason": reason,
+                "model_state": model_status.state.value,
+                "label": _PAPER_LABEL,
+            },
+        )
 
     def _evaluate_structural(self, state: ShadowMarketState, *, cycle_id: str) -> bool:
         if (
@@ -691,8 +797,10 @@ async def run_daemon(
     )
     paper = SQLitePaperRepository(data_dir / "paper.sqlite3")
     shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
+    directional_corpus = SQLiteDirectionalCorpusRepository(data_dir / "directional_corpus.sqlite3")
     paper.initialize()
     shadow.initialize()
+    directional_corpus.initialize()
     shadow.save_window_once(
         window_id=evidence_window.window_id,
         payload=evidence_window.as_dict()
@@ -706,6 +814,7 @@ async def run_daemon(
             shadow_repository=shadow,
             evidence_window=evidence_window,
             report_dir=report_dir,
+            directional_corpus_repository=directional_corpus,
             clock=clock,
             poll_seconds=poll_seconds,
         )
@@ -809,24 +918,6 @@ def _risk_decision(
         ),
         assessed_at=state.observed_at,
         risk_decision_id=approved_id,
-    )
-
-
-def _official_from_proxy(
-    market: Market, proxy: ProxyReference, *, recv_ts: datetime
-) -> OfficialReference | None:
-    if market.horizon is not Horizon.ONE_HOUR:
-        return None
-    return OfficialReference(
-        f"official:{market.condition_id}:{int(recv_ts.timestamp())}",
-        market.market_id,
-        market.asset,
-        proxy.value,
-        OFFICIAL_REFERENCE_SOURCES[MarketBucket(market.asset, market.horizon)],
-        proxy.source_ts,
-        proxy.recv_ts,
-        proxy.effective_ts,
-        False,
     )
 
 

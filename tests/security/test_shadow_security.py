@@ -34,3 +34,10 @@ def test_shadow_report_timer_is_separate_from_persistent_runtime() -> None:
 
 def test_shadow_summary_api_refuses_live_enabled_state() -> None:
     assert callable(build_shadow_summary)
+
+
+def test_shadow_runtime_does_not_convert_proxy_to_official_reference() -> None:
+    source = inspect.getsource(shadow_daemon)
+
+    assert "_official_from_proxy" not in source
+    assert "OfficialReference(" not in source

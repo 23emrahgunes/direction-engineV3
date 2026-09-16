@@ -99,6 +99,51 @@ class SQLiteShadowRepository:
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def latest_events(
+        self,
+        *,
+        event_type: str | None = None,
+        bucket_key: str | None = None,
+        limit: int = 250,
+    ) -> tuple[dict[str, object], ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        clauses: list[str] = []
+        params: list[object] = []
+        if event_type is not None:
+            require_text("event_type", event_type)
+            clauses.append("event_type=?")
+            params.append(event_type)
+        if bucket_key is not None:
+            require_text("bucket_key", bucket_key)
+            clauses.append("bucket_key=?")
+            params.append(bucket_key)
+        query = (
+            "SELECT event_id,event_type,bucket_key,payload_json,observed_at "
+            "FROM shadow_events"
+        )
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY observed_at DESC LIMIT ?"
+        params.append(limit)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        events: list[dict[str, object]] = []
+        for row in rows:
+            payload = json.loads(str(row[3]))
+            if not isinstance(payload, dict):
+                raise RuntimeError("stored shadow event payload is not an object")
+            events.append(
+                {
+                    "event_id": str(row[0]),
+                    "event_type": str(row[1]),
+                    "bucket_key": str(row[2]) if row[2] is not None else None,
+                    "payload": payload,
+                    "observed_at": str(row[4]),
+                }
+            )
+        return tuple(events)
+
 
 def _encode(payload: Mapping[str, object]) -> str:
     return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), default=str)

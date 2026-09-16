@@ -260,9 +260,12 @@ class SQLitePaperRepository:
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 250,
+        offset: int = 0,
     ) -> tuple[PaperTradeSnapshot, ...]:
         if limit < 1:
             raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         clauses: list[str] = []
         params: list[object] = []
         for column, value in (
@@ -294,8 +297,8 @@ class SQLitePaperRepository:
         )
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY observed_at DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY observed_at DESC LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         return tuple(_trade_from_row(row) for row in rows)
@@ -318,9 +321,12 @@ class SQLitePaperRepository:
         asset: str | None = None,
         horizon: str | None = None,
         limit: int = 250,
+        offset: int = 0,
     ) -> tuple[PaperAbstainRecord, ...]:
         if limit < 1:
             raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         clauses: list[str] = []
         params: list[object] = []
         for column, value in (
@@ -339,8 +345,8 @@ class SQLitePaperRepository:
         )
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY observed_at DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY observed_at DESC LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         return tuple(_abstain_from_row(row) for row in rows)
