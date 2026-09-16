@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from direction_engine_v3.adapters.binance import parse_depth_top
+from direction_engine_v3.adapters.binance import parse_aggregate_trade, parse_depth_top
 from direction_engine_v3.adapters.polymarket import (
     CLOB_BOOK_URL,
     CLOB_MARKETS_URL,
@@ -28,8 +28,11 @@ from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENA
 from direction_engine_v3.domain import (
     Asset,
     DecisionAction,
+    FeatureVector,
     Horizon,
     Market,
+    OfficialReference,
+    OrderSide,
     OutcomeSide,
     ProxyReference,
     RiskDecision,
@@ -42,18 +45,35 @@ from direction_engine_v3.execution import (
     PaperGateway,
     build_structural_buy_merge_paper_plan,
 )
+from direction_engine_v3.features import ExternalTemporalState, build_directional_features
 from direction_engine_v3.market_data import (
     SUPPORTED_MARKET_BUCKETS,
+    CryptoTopOfBook,
+    CryptoTrade,
     FeeSchedule,
     MarketBucket,
     MarketDiscovery,
     PolymarketBook,
+    PriceToBeatRecord,
+    ReferenceFreshnessPolicy,
+    SQLitePriceToBeatRepository,
     SystemClock,
     epoch_slug,
     window_containing,
 )
+from direction_engine_v3.market_data.official_runtime import (
+    BinanceHourlyOfficialCollector,
+    ChainlinkTwapCollector,
+    OfficialPriceToBeatService,
+    PriceToBeatResolution,
+)
 from direction_engine_v3.models import ShadowBucketModelStatus, ShadowModelState, empty_registry
-from direction_engine_v3.pricing import PricingPolicy
+from direction_engine_v3.pricing import (
+    DepthSimulation,
+    LiquidityRole,
+    PricingPolicy,
+    simulate_depth,
+)
 from direction_engine_v3.risk import (
     LiquidityEvidence,
     PortfolioState,
@@ -84,6 +104,7 @@ from direction_engine_v3.strategies.structural_arb import (
 
 _EVENT_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 _BINANCE_DEPTH_URL = "https://api.binance.com/api/v3/depth"
+_BINANCE_TRADES_URL = "https://api.binance.com/api/v3/aggTrades"
 _PAPER_LABEL = "PAPER / SHADOW — NO REAL ORDER"
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
@@ -121,9 +142,14 @@ class ShadowMarketState:
     down_book: PolymarketBook | None
     fee_schedule: FeeSchedule | None
     proxy_reference: ProxyReference | None
-    official_reference: object | None
+    official_reference: OfficialReference | None
     observed_at: datetime
     unavailable_reason: str | None = None
+    price_to_beat: PriceToBeatRecord | None = None
+    directional_features: FeatureVector | None = None
+    ptb_status: str = "PTB_UNAVAILABLE"
+    ptb_reason: str = "OFFICIAL_PTB_UNAVAILABLE"
+    feature_status: str = "FEATURES_UNAVAILABLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +182,18 @@ class ShadowCycleResult:
 class PublicShadowDataClient:
     """Credential-free public polling client used by the persistent VPS daemon."""
 
-    def __init__(self, transport: PublicTransport, clock: SystemClock) -> None:
+    def __init__(
+        self,
+        transport: PublicTransport,
+        clock: SystemClock,
+        *,
+        official_ptb: OfficialPriceToBeatService | None = None,
+        feature_state: ExternalTemporalState | None = None,
+    ) -> None:
         self._transport = transport
         self._clock = clock
+        self._official_ptb = official_ptb
+        self._feature_state = feature_state
 
     async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
         window = window_containing(bucket, now)
@@ -182,12 +217,18 @@ class PublicShadowDataClient:
                 recv_monotonic_ns=self._clock.monotonic_ns(),
             )
             token_ids = {token.outcome: token.token_id for token in discovery.market.tokens}
-            up_book, down_book, raw_fee, proxy = await asyncio.gather(
+            up_book, down_book, raw_fee, proxy_observation = await asyncio.gather(
                 self._fetch_book(token_ids[OutcomeSide.UP]),
                 self._fetch_book(token_ids[OutcomeSide.DOWN]),
                 self._transport.get_json(f"{CLOB_MARKETS_URL}/{discovery.market.condition_id}"),
-                self._fetch_proxy_reference(discovery.market),
+                self._fetch_proxy_observation(discovery.market),
             )
+            proxy, external_book, external_trade = proxy_observation
+            if self._feature_state is not None:
+                self._feature_state.add_reference(proxy)
+                self._feature_state.add_book(external_book)
+                if external_trade is not None:
+                    self._feature_state.add_trade(external_trade)
             fee_recv = self._clock.utc_now()
             fee = parse_fee_schedule(
                 raw_fee,
@@ -196,27 +237,43 @@ class PublicShadowDataClient:
                 normalized_ts=self._clock.utc_now(),
                 recv_monotonic_ns=self._clock.monotonic_ns(),
             )
-            return ShadowMarketState(
-                bucket,
+            observed_at = self._clock.utc_now()
+            ptb_resolution = await self._resolve_ptb(discovery, observed_at=observed_at)
+            features, feature_status = self._build_directional_features(
                 discovery,
-                up_book,
-                down_book,
-                fee,
                 proxy,
-                None,
-                self._clock.utc_now(),
+                ptb_resolution.price_to_beat,
+                observed_at=observed_at,
+            )
+            return ShadowMarketState(
+                bucket=bucket,
+                discovery=discovery,
+                up_book=up_book,
+                down_book=down_book,
+                fee_schedule=fee,
+                proxy_reference=proxy,
+                official_reference=ptb_resolution.official_reference,
+                observed_at=observed_at,
+                price_to_beat=ptb_resolution.price_to_beat,
+                directional_features=features,
+                ptb_status=ptb_resolution.ptb_status,
+                ptb_reason=ptb_resolution.reason,
+                feature_status=feature_status,
             )
         except Exception as exc:
             return ShadowMarketState(
-                bucket,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                self._clock.utc_now(),
-                type(exc).__name__,
+                bucket=bucket,
+                discovery=None,
+                up_book=None,
+                down_book=None,
+                fee_schedule=None,
+                proxy_reference=None,
+                official_reference=None,
+                observed_at=self._clock.utc_now(),
+                unavailable_reason=type(exc).__name__,
+                ptb_status="PTB_UNAVAILABLE",
+                ptb_reason=type(exc).__name__,
+                feature_status="FEATURES_UNAVAILABLE",
             )
 
     async def _fetch_book(self, token_id: str) -> PolymarketBook:
@@ -229,7 +286,9 @@ class PublicShadowDataClient:
             recv_monotonic_ns=self._clock.monotonic_ns(),
         )
 
-    async def _fetch_proxy_reference(self, market: Market) -> ProxyReference:
+    async def _fetch_proxy_observation(
+        self, market: Market
+    ) -> tuple[ProxyReference, CryptoTopOfBook, CryptoTrade | None]:
         raw = await self._transport.get_json(
             _BINANCE_DEPTH_URL,
             params={"symbol": f"{market.asset.value}USDT", "limit": "5"},
@@ -253,7 +312,7 @@ class PublicShadowDataClient:
             recv_monotonic_ns=self._clock.monotonic_ns(),
         )
         mid = (top.bid_price + top.ask_price) / Decimal("2")
-        return ProxyReference(
+        proxy = ProxyReference(
             f"proxy:{market.condition_id}:{int(now.timestamp())}",
             market.market_id,
             market.asset,
@@ -262,6 +321,64 @@ class PublicShadowDataClient:
             top.lineage.source_ts or now,
             top.lineage.recv_ts,
             top.lineage.normalized_ts,
+        )
+        return proxy, top, await self._fetch_latest_trade(market)
+
+    async def _fetch_latest_trade(self, market: Market) -> CryptoTrade | None:
+        raw = await self._transport.get_json(
+            _BINANCE_TRADES_URL,
+            params={"symbol": f"{market.asset.value}USDT", "limit": "1"},
+        )
+        rows = _sequence(raw, "Binance aggregate trades")
+        if not rows:
+            return None
+        row = _object(rows[-1], "Binance aggregate trade")
+        return parse_aggregate_trade(
+            row,
+            asset=market.asset,
+            recv_ts=self._clock.utc_now(),
+            normalized_ts=self._clock.utc_now(),
+            recv_monotonic_ns=self._clock.monotonic_ns(),
+        )
+
+    async def _resolve_ptb(
+        self,
+        discovery: MarketDiscovery,
+        *,
+        observed_at: datetime,
+    ) -> PriceToBeatResolution:
+        if self._official_ptb is None:
+            return PriceToBeatResolution(None, None, "PTB_UNAVAILABLE", "OFFICIAL_SERVICE_ABSENT")
+        return await self._official_ptb.resolve(discovery, observed_at=observed_at)
+
+    def _build_directional_features(
+        self,
+        discovery: MarketDiscovery,
+        proxy: ProxyReference,
+        price_to_beat: PriceToBeatRecord | None,
+        *,
+        observed_at: datetime,
+    ) -> tuple[FeatureVector | None, str]:
+        if price_to_beat is None:
+            return None, "OFFICIAL_PTB_UNAVAILABLE"
+        if self._feature_state is None:
+            return None, "FEATURE_STATE_UNAVAILABLE"
+        result = self._feature_state.build_snapshot(
+            asset=discovery.market.asset,
+            current_reference=proxy,
+            observed_at=observed_at,
+        )
+        if result.snapshot is None:
+            return None, result.reason
+        return (
+            build_directional_features(
+                discovery.market,
+                price_to_beat,
+                result.snapshot,
+                generated_at=observed_at,
+                feature_set_version="v3.15.3-directional-official-ptb",
+            ),
+            result.reason,
         )
 
 
@@ -383,25 +500,16 @@ class ShadowDaemon:
             corpus_count = self._directional_corpus_repository.count(
                 asset=state.bucket.asset, horizon=state.bucket.horizon
             )
-        ptb_status = "PTB_UNAVAILABLE"
-        feature_status = (
-            "FEATURES_UNAVAILABLE"
-            if state.proxy_reference is not None
-            else "EXTERNAL_REFERENCE_UNAVAILABLE"
-        )
-        pricing_status = (
-            "BOOKS_READY"
-            if state.up_book is not None and state.down_book is not None
-            else "EXECUTABLE_PRICE_UNAVAILABLE"
-        )
+        ptb_status = state.ptb_status
+        up_pricing, down_pricing, pricing_status = self._directional_pricing(state)
         assessment = assess_directional_edge(
             state.discovery.market,
-            None,
-            None,
+            state.price_to_beat,
+            state.directional_features,
             None,
             self._registry.state_for(state.bucket).readiness,
-            None,
-            None,
+            up_pricing,
+            down_pricing,
             observed_at=state.observed_at,
             policy=DirectionalPolicy(
                 minimum_net_edge=Decimal("0.03"),
@@ -429,7 +537,14 @@ class ShadowDaemon:
                     "PROXY_READY" if state.proxy_reference is not None else "PROXY_UNAVAILABLE"
                 ),
                 "ptb_status": ptb_status,
-                "feature_status": feature_status,
+                "ptb_reason": state.ptb_reason,
+                "ptb_value": str(state.price_to_beat.value)
+                if state.price_to_beat is not None
+                else None,
+                "ptb_effective_time": state.price_to_beat.reference.effective_ts.isoformat()
+                if state.price_to_beat is not None
+                else None,
+                "feature_status": state.feature_status,
                 "model_state": model_status.state.value,
                 "model_reason": model_status.reason,
                 "calibration_state": "CALIBRATION_NOT_READY",
@@ -455,13 +570,57 @@ class ShadowDaemon:
                     "market_id": assessment.market_id,
                     "label": _PAPER_LABEL,
                     "ptb_status": ptb_status,
-                    "feature_status": feature_status,
+                    "ptb_reason": state.ptb_reason,
+                    "feature_status": state.feature_status,
                     "model_state": model_status.state.value,
                     "pricing_status": pricing_status,
                     "corpus_sample_count": corpus_count,
                 },
             )
         return 0
+
+    def _directional_pricing(
+        self, state: ShadowMarketState
+    ) -> tuple[DepthSimulation | None, DepthSimulation | None, str]:
+        if state.discovery is None or state.up_book is None or state.down_book is None:
+            return None, None, "EXECUTABLE_PRICE_UNAVAILABLE"
+        if state.fee_schedule is None:
+            return None, None, "FEE_SCHEDULE_UNAVAILABLE"
+        try:
+            requested_quantity = max(
+                state.up_book.minimum_order_size,
+                state.down_book.minimum_order_size,
+                Decimal("1"),
+            )
+            policy = PricingPolicy(
+                max_book_age=timedelta(seconds=30),
+                max_fee_age=timedelta(seconds=30),
+                slippage_buffer_bps=Decimal("10"),
+                fee_buffer_bps=Decimal("500"),
+            )
+            up = simulate_depth(
+                state.up_book,
+                state.fee_schedule,
+                side=OrderSide.BUY,
+                requested_quantity=requested_quantity,
+                limit_price=Decimal("1"),
+                role=LiquidityRole.TAKER,
+                observed_at=state.observed_at,
+                policy=policy,
+            )
+            down = simulate_depth(
+                state.down_book,
+                state.fee_schedule,
+                side=OrderSide.BUY,
+                requested_quantity=requested_quantity,
+                limit_price=Decimal("1"),
+                role=LiquidityRole.TAKER,
+                observed_at=state.observed_at,
+                policy=policy,
+            )
+            return up, down, "EXECUTABLE_PRICE_READY"
+        except Exception as exc:
+            return None, None, f"EXECUTABLE_PRICE_UNAVAILABLE:{type(exc).__name__}"
 
     def _shadow_model_status(self, state: ShadowMarketState) -> ShadowBucketModelStatus:
         readiness = self._registry.state_for(state.bucket).readiness
@@ -798,9 +957,11 @@ async def run_daemon(
     paper = SQLitePaperRepository(data_dir / "paper.sqlite3")
     shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
     directional_corpus = SQLiteDirectionalCorpusRepository(data_dir / "directional_corpus.sqlite3")
+    ptb_repository = SQLitePriceToBeatRepository(data_dir / "price_to_beat.sqlite3")
     paper.initialize()
     shadow.initialize()
     directional_corpus.initialize()
+    ptb_repository.initialize()
     shadow.save_window_once(
         window_id=evidence_window.window_id,
         payload=evidence_window.as_dict()
@@ -808,8 +969,26 @@ async def run_daemon(
         started_at=evidence_window.started_at,
     )
     async with PublicTransport(timeout_seconds=15) as transport:
+        chainlink = ChainlinkTwapCollector(transport, clock)
+        binance_hourly = BinanceHourlyOfficialCollector(transport, clock)
+        official_ptb = OfficialPriceToBeatService(
+            repository=ptb_repository,
+            chainlink=chainlink,
+            binance_hourly=binance_hourly,
+            policy=ReferenceFreshnessPolicy(
+                max_source_age=timedelta(seconds=120),
+                max_receive_latency=timedelta(seconds=120),
+                boundary_tolerance=timedelta(seconds=90),
+            ),
+        )
+        feature_state = ExternalTemporalState(max_age=timedelta(seconds=120), minimum_points=3)
         daemon = ShadowDaemon(
-            data_client=PublicShadowDataClient(transport, clock),
+            data_client=PublicShadowDataClient(
+                transport,
+                clock,
+                official_ptb=official_ptb,
+                feature_state=feature_state,
+            ),
             paper_repository=paper,
             shadow_repository=shadow,
             evidence_window=evidence_window,
@@ -818,14 +997,28 @@ async def run_daemon(
             clock=clock,
             poll_seconds=poll_seconds,
         )
+        collector_stop = asyncio.Event()
+        collector_task = asyncio.create_task(chainlink.run(collector_stop))
         if once:
-            return await daemon.run_once()
+            try:
+                return await daemon.run_once()
+            finally:
+                collector_stop.set()
+                collector_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await collector_task
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for item in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(item, stop.set)
-        await daemon.run_forever(stop)
+        try:
+            await daemon.run_forever(stop)
+        finally:
+            collector_stop.set()
+            collector_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await collector_task
     return None
 
 
