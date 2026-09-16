@@ -3,6 +3,8 @@
 No network sockets are opened during import; callers explicitly run the app.
 """
 
+from pathlib import Path
+
 from aiohttp import web
 
 from direction_engine_v3.app.dashboard import (
@@ -13,6 +15,18 @@ from direction_engine_v3.app.dashboard import (
     list_paper_abstains,
     list_paper_trades,
 )
+
+
+def dashboard_index_path() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "dashboard" / "web" / "index.html"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError("dashboard/web/index.html was not found")
+
+
+async def dashboard_index(_request: web.Request) -> web.FileResponse:
+    return web.FileResponse(dashboard_index_path())
 
 
 async def live(_request: web.Request) -> web.Response:
@@ -90,6 +104,7 @@ async def shadow_status(_request: web.Request) -> web.Response:
 
 def create_app() -> web.Application:
     app = web.Application()
+    app.router.add_get("/", dashboard_index, allow_head=False)
     app.router.add_get("/health/live", live, allow_head=False)
     app.router.add_get("/health/ready", ready, allow_head=False)
     app.router.add_get("/health/shadow-ready", shadow_ready, allow_head=False)
