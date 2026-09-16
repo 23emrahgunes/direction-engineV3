@@ -56,6 +56,28 @@ function Save-Result {
     $Result | ConvertTo-Json -Depth 12 | Set-Content -Path $JsonPath -Encoding UTF8
 }
 
+function Write-AwsCliJsonPayload {
+    param(
+        [hashtable]$Payload,
+        [string]$Path
+    )
+    $json = $Payload | ConvertTo-Json -Depth 8
+    [void](ConvertFrom-Json -InputObject $json)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)
+
+    [byte[]]$firstBytes = [System.IO.File]::ReadAllBytes($Path) | Select-Object -First 3
+    if (
+        $firstBytes.Length -ge 3 -and
+        $firstBytes[0] -eq 0xEF -and
+        $firstBytes[1] -eq 0xBB -and
+        $firstBytes[2] -eq 0xBF
+    ) {
+        throw "AWS CLI JSON payload was written with a UTF-8 BOM"
+    }
+    [void](ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($Path, $utf8NoBom)))
+}
+
 function ConvertTo-ProcessArgument {
     param([string]$Argument)
     if ($Argument -notmatch '[\s"]') {
@@ -176,6 +198,24 @@ exit /b 3
     $logText = Get-Content -LiteralPath $LogPath -Raw
     Assert-SelfTest ($logText -match "selftest stderr line") "AWS stderr was not recorded in the log"
     Assert-SelfTest ($logText -notmatch "AWS_ACCESS_KEY|AWS_SECRET|AWS_SESSION_TOKEN|PRIVATE KEY|BEGIN .*KEY|api_secret|passphrase") "Sensitive credential pattern was logged"
+
+    $payloadPath = Join-Path $AcceptanceDir "payload.json"
+    Write-AwsCliJsonPayload -Payload @{
+        DocumentName = "AWS-RunShellScript"
+        InstanceIds = @("i-selftest")
+        Parameters = @{ commands = @("echo selftest") }
+    } -Path $payloadPath
+    $payloadBytes = [System.IO.File]::ReadAllBytes($payloadPath)
+    Assert-SelfTest ($payloadBytes.Length -gt 3) "Self-test payload was not written"
+    $hasBom = (
+        $payloadBytes[0] -eq 0xEF -and
+        $payloadBytes[1] -eq 0xBB -and
+        $payloadBytes[2] -eq 0xBF
+    )
+    Assert-SelfTest (-not $hasBom) "AWS CLI payload contained a UTF-8 BOM"
+    $payloadJson = [System.IO.File]::ReadAllText($payloadPath, (New-Object System.Text.UTF8Encoding($false)))
+    $payloadParsed = ConvertFrom-Json -InputObject $payloadJson
+    Assert-SelfTest ($payloadParsed.DocumentName -eq "AWS-RunShellScript") "AWS CLI payload JSON did not parse after NO BOM write"
 
     Write-Host "V3.15.1 SSM bridge self-test PASS"
 }
@@ -558,7 +598,7 @@ function Send-RunCommand {
         Parameters = @{ commands = $commands; executionTimeout = @([string]$CommandTimeoutSeconds) }
     }
     $payloadPath = [System.IO.Path]::GetTempFileName()
-    $payload | ConvertTo-Json -Depth 8 | Set-Content -Path $payloadPath -Encoding UTF8
+    Write-AwsCliJsonPayload -Payload $payload -Path $payloadPath
     try {
         $response = Invoke-AwsJson -AwsArgs @(
             "ssm", "send-command",

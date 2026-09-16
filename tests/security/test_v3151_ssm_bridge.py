@@ -55,3 +55,13 @@ def test_v3151_ssm_bridge_does_not_use_tee_object_for_logging() -> None:
 
     assert "Tee-Object" not in source
     assert 'Invoke-AwsText -AwsArgs @("--version") | Write-Log' not in source
+
+
+def test_v3151_ssm_bridge_writes_aws_payload_as_utf8_no_bom() -> None:
+    source = BRIDGE.read_text(encoding="utf-8")
+
+    assert "New-Object System.Text.UTF8Encoding($false)" in source
+    assert "[System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)" in source
+    assert "ConvertFrom-Json -InputObject $json" in source
+    assert 'throw "AWS CLI JSON payload was written with a UTF-8 BOM"' in source
+    assert "$payload | ConvertTo-Json -Depth 8 | Set-Content" not in source
