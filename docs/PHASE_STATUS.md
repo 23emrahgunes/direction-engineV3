@@ -289,3 +289,18 @@ local and VPS gates pass.
   in the V3.15.2 implementation.
 - VPS acceptance still requires the user-context SSM bridge because the Codex sandbox
   does not hold the Windows user's AWS profile/session.
+
+## V3.15.3 local evidence
+
+- Status before VPS boundary proof: `V3.15.3_PTB_RUNTIME_BLOCKED`.
+- V3.15.3 adds persistent official-reference runtime ownership for Chainlink 60s TWAP
+  and Binance 1h official candles without bulk-copying WhaleSignal architecture.
+- The shadow daemon now carries typed official reference, persisted/restored PTB,
+  feature status, executable-pricing status, PTB value, and PTB effective time in
+  Directional evidence.
+- Proxy data remains separately typed and cannot satisfy official reference or PTB.
+- Historical model/corpus readiness remains unpromoted; no bucket is marked
+  `SHADOW_CANDIDATE` by this phase.
+- VPS acceptance must be performed through `scripts/v3153_ssm_accept.ps1` and must prove
+  real boundary `PTB_READY` evidence before final status can become
+  `V3.15.3_OFFICIAL_PTB_RUNTIME_ACTIVE`.
