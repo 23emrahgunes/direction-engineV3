@@ -9,6 +9,7 @@ from aiohttp import web
 
 from direction_engine_v3.app.dashboard import (
     build_dashboard_snapshot,
+    build_directional_runtime_status,
     build_paper_summary,
     build_shadow_status,
     get_paper_trade,
@@ -76,6 +77,8 @@ async def paper_trades(request: web.Request) -> web.Response:
             side=request.query.get("side"),
             status=request.query.get("status"),
             win_loss=request.query.get("win_loss"),
+            limit=request.query.get("limit"),
+            offset=request.query.get("offset"),
         )
     )
 
@@ -94,12 +97,18 @@ async def paper_abstains(request: web.Request) -> web.Response:
             strategy=request.query.get("strategy"),
             asset=request.query.get("asset"),
             horizon=request.query.get("horizon"),
+            limit=request.query.get("limit"),
+            offset=request.query.get("offset"),
         )
     )
 
 
 async def shadow_status(_request: web.Request) -> web.Response:
     return web.json_response(build_shadow_status())
+
+
+async def directional_status(_request: web.Request) -> web.Response:
+    return web.json_response(build_directional_runtime_status())
 
 
 def create_app() -> web.Application:
@@ -116,6 +125,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/paper/trades/{id}", paper_trade_detail, allow_head=False)
     app.router.add_get("/api/paper/abstains", paper_abstains, allow_head=False)
     app.router.add_get("/api/shadow/status", shadow_status, allow_head=False)
+    app.router.add_get("/api/directional/status", directional_status, allow_head=False)
     return app
 
 

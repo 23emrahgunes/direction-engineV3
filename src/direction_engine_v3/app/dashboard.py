@@ -12,6 +12,7 @@ from direction_engine_v3.config import (
     SUPPORTED_HORIZONS,
 )
 from direction_engine_v3.domain import Asset, Horizon
+from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS
 from direction_engine_v3.observability import (
     ComponentHealth,
     HealthStatus,
@@ -128,6 +129,8 @@ def list_paper_trades(
     side: str | None = None,
     status: str | None = None,
     win_loss: str | None = None,
+    limit: str | None = None,
+    offset: str | None = None,
 ) -> dict[str, object]:
     repository = _paper_repository()
     trades = repository.trades(
@@ -137,6 +140,8 @@ def list_paper_trades(
         side=side,
         status=status,
         win_loss=win_loss,
+        limit=_safe_limit(limit),
+        offset=_safe_offset(offset),
     )
     return {
         "label": "PAPER / SHADOW — NO REAL ORDER",
@@ -157,9 +162,18 @@ def list_paper_abstains(
     strategy: str | None = None,
     asset: str | None = None,
     horizon: str | None = None,
+    limit: str | None = None,
+    offset: str | None = None,
 ) -> dict[str, object]:
     repository = _paper_repository()
-    abstains = repository.abstains(reason=reason, strategy=strategy, asset=asset, horizon=horizon)
+    abstains = repository.abstains(
+        reason=reason,
+        strategy=strategy,
+        asset=asset,
+        horizon=horizon,
+        limit=_safe_limit(limit),
+        offset=_safe_offset(offset),
+    )
     return {
         "label": "PAPER / SHADOW — NO REAL ORDER",
         "abstains": [
@@ -205,10 +219,116 @@ def build_shadow_status() -> dict[str, object]:
     }
 
 
+def build_directional_runtime_status() -> dict[str, object]:
+    data_dir = runtime_data_dir()
+    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
+    paper = _paper_repository()
+    try:
+        shadow.initialize()
+        directional_events = shadow.latest_events(event_type="STRATEGY_EVALUATION", limit=500)
+    except Exception as exc:
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "status": "DIRECTIONAL_STATUS_UNAVAILABLE",
+            "reason": type(exc).__name__,
+            "real_order_submission": False,
+            "buckets": [],
+        }
+    by_bucket: dict[str, dict[str, object]] = {}
+    for event in directional_events:
+        payload_obj = event.get("payload")
+        if event["bucket_key"] is None or not isinstance(payload_obj, dict):
+            continue
+        payload = dict(payload_obj)
+        if payload.get("strategy") == "DIRECTIONAL_EDGE":
+            by_bucket[str(event["bucket_key"])] = event
+    buckets = []
+    for bucket in SUPPORTED_MARKET_BUCKETS:
+        bucket_key = f"{bucket.asset.value}-{bucket.horizon.value}"
+        latest = by_bucket.get(bucket_key)
+        latest_payload = latest["payload"] if latest is not None else {}
+        payload = dict(latest_payload) if isinstance(latest_payload, dict) else {}
+        trades = paper.trades(
+            asset=bucket.asset.value,
+            horizon=bucket.horizon.value,
+            strategy="DIRECTIONAL_EDGE",
+            limit=1,
+        )
+        buckets.append(
+            {
+                "asset": bucket.asset.value,
+                "horizon": bucket.horizon.value,
+                "state": _directional_bucket_state(payload),
+                "official_status": payload.get("official_status", "UNKNOWN"),
+                "proxy_status": payload.get("proxy_status", "UNKNOWN"),
+                "ptb_status": payload.get("ptb_status", "UNKNOWN"),
+                "feature_status": payload.get("feature_status", "UNKNOWN"),
+                "model_state": payload.get("model_state", "TRAINING_CORPUS_REQUIRED"),
+                "calibration_state": payload.get("calibration_state", "CALIBRATION_NOT_READY"),
+                "pricing_status": payload.get("pricing_status", "UNKNOWN"),
+                "last_decision": payload.get("action", "ABSTAIN"),
+                "last_abstain_reason": payload.get("reason", "NO_RUNTIME_EVIDENCE"),
+                "last_observed_at": latest["observed_at"] if latest is not None else None,
+                "last_paper_trade": _trade_as_dict(trades[0]) if trades else None,
+                "evidence_sample_count": payload.get("corpus_sample_count", 0),
+                "p_up": None,
+                "p_down": None,
+                "executable_up_cost": None,
+                "executable_down_cost": None,
+                "label": "PAPER / SHADOW — NO REAL ORDER",
+            }
+        )
+    return {
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "status": "V3.15.2_DIRECTIONAL_RUNTIME_OBSERVABLE",
+        "real_order_submission": False,
+        "buckets": buckets,
+    }
+
+
 def _paper_repository() -> SQLitePaperRepository:
     repository = SQLitePaperRepository(runtime_data_dir() / "paper.sqlite3")
     repository.initialize()
     return repository
+
+
+def _safe_limit(raw: str | None, *, default: int = 250, maximum: int = 500) -> int:
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("limit must be an integer") from exc
+    if value < 1:
+        raise ValueError("limit must be positive")
+    return min(value, maximum)
+
+
+def _safe_offset(raw: str | None) -> int:
+    if raw is None:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("offset must be an integer") from exc
+    if value < 0:
+        raise ValueError("offset must be non-negative")
+    return value
+
+
+def _directional_bucket_state(payload: dict[str, object]) -> str:
+    reason = str(payload.get("reason", "NO_RUNTIME_EVIDENCE"))
+    if reason == "OFFICIAL_PTB_UNAVAILABLE":
+        return "PTB_UNAVAILABLE"
+    if reason in {"FEATURES_UNAVAILABLE", "FEATURE_HISTORY_WARMING"}:
+        return "FEATURE_HISTORY_WARMING"
+    if reason in {"MODEL_UNAVAILABLE", "CALIBRATION_NOT_READY"}:
+        return str(payload.get("model_state", "TRAINING_CORPUS_REQUIRED"))
+    if payload.get("action") == "TRADE":
+        return "PAPER_POSITION_OPEN"
+    if payload:
+        return "ABSTAIN"
+    return "WAITING_FOR_BOUNDARY"
 
 
 def _trade_as_dict(item: object) -> dict[str, object]:

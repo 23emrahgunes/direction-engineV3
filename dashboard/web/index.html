@@ -46,10 +46,11 @@
         show("paper-trades", "/api/paper/trades"),
         show("abstains", "/api/paper/abstains"),
         show("health", "/api/dashboard"),
-        show("data-latency", "/api/shadow/status")
-      ]).then(([summary, trades, abstains, dashboard, shadow]) => {
+        show("data-latency", "/api/shadow/status"),
+        show("directional", "/api/directional/status")
+      ]).then(([summary, trades, abstains, dashboard, shadow, directional]) => {
         document.getElementById("directional").textContent =
-          JSON.stringify({strategy: "DIRECTIONAL_EDGE", abstains}, null, 2);
+          JSON.stringify(directional, null, 2);
         document.getElementById("structural").textContent =
           JSON.stringify({strategy: "STRUCTURAL_ARBITRAGE", trades}, null, 2);
         document.getElementById("buckets").textContent =

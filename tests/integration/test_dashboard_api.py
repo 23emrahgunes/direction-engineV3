@@ -39,6 +39,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/paper/trades/{id}"),
         ("GET", "/api/paper/abstains"),
         ("GET", "/api/shadow/status"),
+        ("GET", "/api/directional/status"),
     }
     assert all(method == "GET" for method, _path in routes)
 
@@ -71,3 +72,24 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
         "live_auto_arm": False,
     }
     assert snapshot["execution"]["real_order_submission"] is False
+
+
+def test_directional_status_api_is_read_only_and_paper_labeled() -> None:
+    asyncio.run(_assert_directional_status_api_is_read_only_and_paper_labeled())
+
+
+async def _assert_directional_status_api_is_read_only_and_paper_labeled() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    assert payload["label"] == "PAPER / SHADOW — NO REAL ORDER"
+    assert payload["real_order_submission"] is False
+    assert len(payload["buckets"]) == 12
+    assert {item["asset"] for item in payload["buckets"]} == {"BTC", "ETH", "SOL", "XRP"}
