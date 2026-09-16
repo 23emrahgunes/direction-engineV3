@@ -65,3 +65,16 @@ def test_v3151_ssm_bridge_writes_aws_payload_as_utf8_no_bom() -> None:
     assert "ConvertFrom-Json -InputObject $json" in source
     assert 'throw "AWS CLI JSON payload was written with a UTF-8 BOM"' in source
     assert "$payload | ConvertTo-Json -Depth 8 | Set-Content" not in source
+
+
+def test_v3151_ssm_bridge_executes_remote_script_with_bash_and_lf() -> None:
+    source = BRIDGE.read_text(encoding="utf-8")
+
+    assert "#!/usr/bin/env bash\nset -euo pipefail" in source
+    assert '"/usr/bin/env bash /tmp/v3151_ssm_accept.sh"' in source
+    assert "$remoteScriptLf = ConvertTo-LfText -Text $RemoteScript" in source
+    assert '$lfText = $Text -replace "`r`n", "`n"' in source
+    assert '$lfText = $lfText -replace "`r", "`n"' in source
+    assert '"cat > /tmp/v3151_ssm_accept.sh <<' in source
+    assert "$RemoteScript," not in source
+    assert '"/tmp/v3151_ssm_accept.sh"' not in source

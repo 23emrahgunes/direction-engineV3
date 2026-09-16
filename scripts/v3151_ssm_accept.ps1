@@ -78,6 +78,13 @@ function Write-AwsCliJsonPayload {
     [void](ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($Path, $utf8NoBom)))
 }
 
+function ConvertTo-LfText {
+    param([string]$Text)
+    $lfText = $Text -replace "`r`n", "`n"
+    $lfText = $lfText -replace "`r", "`n"
+    return $lfText
+}
+
 function ConvertTo-ProcessArgument {
     param([string]$Argument)
     if ($Argument -notmatch '[\s"]') {
@@ -217,12 +224,47 @@ exit /b 3
     $payloadParsed = ConvertFrom-Json -InputObject $payloadJson
     Assert-SelfTest ($payloadParsed.DocumentName -eq "AWS-RunShellScript") "AWS CLI payload JSON did not parse after NO BOM write"
 
-    Write-Host "V3.15.1 SSM bridge self-test PASS"
-}
+    $remoteScript = New-RemoteAcceptanceScript
+    $remoteLines = $remoteScript -split "`n"
+    Assert-SelfTest ($remoteLines[0] -eq "#!/usr/bin/env bash") "Remote acceptance script first line is not a Bash shebang"
+    Assert-SelfTest ($remoteScript -match "set -euo pipefail") "Remote acceptance script lost fail-closed Bash pipefail behavior"
 
-if ($SelfTest) {
-    Invoke-BridgeSelfTest
-    exit 0
+    $crlfText = "one`r`ntwo`rthree`n"
+    $lfText = ConvertTo-LfText -Text $crlfText
+    Assert-SelfTest ($lfText -notmatch "`r") "LF normalization left CR bytes in text"
+    Assert-SelfTest ($lfText -eq "one`ntwo`nthree`n") "LF normalization did not preserve expected line structure"
+
+    $remoteScriptLf = ConvertTo-LfText -Text $remoteScript
+    Assert-SelfTest ($remoteScriptLf -notmatch "`r") "Remote acceptance script retained CR bytes after normalization"
+    $ssmCommands = @(
+        "cat > /tmp/v3151_ssm_accept.sh <<'V3151_BASH'",
+        $remoteScriptLf,
+        "V3151_BASH",
+        "chmod 700 /tmp/v3151_ssm_accept.sh",
+        "/usr/bin/env bash /tmp/v3151_ssm_accept.sh"
+    )
+    Assert-SelfTest ($ssmCommands[-1] -eq "/usr/bin/env bash /tmp/v3151_ssm_accept.sh") "SSM command does not explicitly invoke Bash"
+    Assert-SelfTest (($ssmCommands -join "`n") -notmatch "`r") "SSM command payload retained CR bytes"
+    $ssmPayloadPath = Join-Path $AcceptanceDir "ssm-payload.json"
+    Write-AwsCliJsonPayload -Payload @{
+        DocumentName = "AWS-RunShellScript"
+        InstanceIds = @("i-selftest")
+        Parameters = @{ commands = $ssmCommands; executionTimeout = @("1800") }
+    } -Path $ssmPayloadPath
+    $ssmPayloadBytes = [System.IO.File]::ReadAllBytes($ssmPayloadPath)
+    $ssmPayloadHasBom = (
+        $ssmPayloadBytes[0] -eq 0xEF -and
+        $ssmPayloadBytes[1] -eq 0xBB -and
+        $ssmPayloadBytes[2] -eq 0xBF
+    )
+    Assert-SelfTest (-not $ssmPayloadHasBom) "SSM payload JSON contained a UTF-8 BOM"
+    $ssmPayloadParsed = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($ssmPayloadPath, (New-Object System.Text.UTF8Encoding($false))))
+    $sentRemoteScript = [string]$ssmPayloadParsed.Parameters.commands[1]
+    Assert-SelfTest ($sentRemoteScript.StartsWith("#!/usr/bin/env bash`nset -euo pipefail")) "Serialized remote script did not preserve Bash shebang and pipefail"
+    Assert-SelfTest ($sentRemoteScript -notmatch "`r") "Serialized remote script contains CR bytes"
+    Assert-SelfTest ($ssmPayloadParsed.Parameters.commands[4] -eq "/usr/bin/env bash /tmp/v3151_ssm_accept.sh") "Serialized SSM payload does not explicitly invoke Bash"
+
+    Write-Host "V3.15.1 SSM bridge self-test PASS"
 }
 
 function Assert-OnlineInstance {
@@ -239,6 +281,7 @@ function Assert-OnlineInstance {
 
 function New-RemoteAcceptanceScript {
     @'
+#!/usr/bin/env bash
 set -euo pipefail
 
 PROJECT_DIR="/home/ubuntu/direction-engine-v3"
@@ -584,12 +627,13 @@ PY
 function Send-RunCommand {
     param([string]$RemoteScript)
 
+    $remoteScriptLf = ConvertTo-LfText -Text $RemoteScript
     $commands = @(
         "cat > /tmp/v3151_ssm_accept.sh <<'V3151_BASH'",
-        $RemoteScript,
+        $remoteScriptLf,
         "V3151_BASH",
         "chmod 700 /tmp/v3151_ssm_accept.sh",
-        "/tmp/v3151_ssm_accept.sh"
+        "/usr/bin/env bash /tmp/v3151_ssm_accept.sh"
     )
     $payload = @{
         DocumentName = "AWS-RunShellScript"
@@ -630,6 +674,11 @@ function Wait-RunCommand {
             return $invocation
         }
     }
+}
+
+if ($SelfTest) {
+    Invoke-BridgeSelfTest
+    exit 0
 }
 
 $result = @{
