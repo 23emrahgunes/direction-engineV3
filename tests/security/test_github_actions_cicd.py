@@ -78,7 +78,7 @@ def test_iam_trust_policy_restricts_repo_branch_and_audience() -> None:
     assert condition["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
     assert (
         condition["token.actions.githubusercontent.com:sub"]
-        == "repo:23emrahgunes/direction-engineV3:ref:refs/heads/main"
+        == "repo:23emrahgunes@168855296/direction-engineV3@1371242858:ref:refs/heads/main"
     )
 
 

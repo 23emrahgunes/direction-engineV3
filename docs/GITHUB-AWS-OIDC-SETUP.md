@@ -32,8 +32,9 @@ permission.
    - `deploy/aws/github-oidc-trust-policy.json`
 6. Create and attach an inline or customer-managed permissions policy from:
    - `deploy/aws/github-deploy-permissions.json`
-7. Confirm the trust policy restricts `sub` exactly to:
-   - `repo:23emrahgunes/direction-engineV3:ref:refs/heads/main`
+7. Confirm the trust policy restricts `sub` exactly to the immutable GitHub
+   owner/repository identity plus `main`:
+   - `repo:23emrahgunes@168855296/direction-engineV3@1371242858:ref:refs/heads/main`
 
 ## AWS CLI setup alternative
 
