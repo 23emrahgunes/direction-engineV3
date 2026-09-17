@@ -23,6 +23,10 @@ run_ubuntu() {
   sudo -H -u ubuntu bash -lc "cd '$PROJECT_DIR' && $*"
 }
 
+run_ubuntu_python() {
+  sudo -H -u ubuntu bash -lc "cd '$PROJECT_DIR' && '$PY' -"
+}
+
 dump_failure_context() {
   local exit_code="$1"
   log "DEPLOY_FAILED stage=$STAGE exit_code=$exit_code expected_sha=$EXPECTED_SHA"
@@ -88,11 +92,11 @@ install_dependencies_if_needed() {
 validate_on_vps() {
   STAGE="vps-validation"
   run_ubuntu "$PY --version"
-  run_ubuntu "$PY - <<'PY'
+  run_ubuntu_python <<'PY'
 import sys
 if sys.version_info[:2] != (3, 12):
     raise SystemExit(f'Python must be 3.12.x, got {sys.version}')
-PY"
+PY
   run_ubuntu "$PY -m compileall src tests"
   run_ubuntu "$PY -m pytest tests/unit/test_v31531_structural_runtime.py tests/unit/test_v31531_diagnostics.py tests/security/test_shadow_security.py tests/security/test_github_actions_cicd.py -q"
   run_ubuntu "$PY -m ruff check ."
@@ -116,7 +120,7 @@ install_project_units() {
 }
 
 cycle_count() {
-  run_ubuntu "$PY - <<'PY'
+  run_ubuntu_python <<'PY'
 from pathlib import Path
 import sqlite3
 path = Path('runtime/data/shadow_evidence.sqlite3')
@@ -126,11 +130,11 @@ else:
     with sqlite3.connect(path) as connection:
         row = connection.execute("SELECT COUNT(*) FROM shadow_events WHERE event_type='REAL_SHADOW_CYCLE'").fetchone()
     print(int(row[0] or 0))
-PY"
+PY
 }
 
 latest_cycle_ts() {
-  run_ubuntu "$PY - <<'PY'
+  run_ubuntu_python <<'PY'
 from pathlib import Path
 import sqlite3
 path = Path('runtime/data/shadow_evidence.sqlite3')
@@ -140,7 +144,7 @@ else:
     with sqlite3.connect(path) as connection:
         row = connection.execute("SELECT observed_at FROM shadow_events WHERE event_type='REAL_SHADOW_CYCLE' ORDER BY observed_at DESC LIMIT 1").fetchone()
     print('' if row is None else row[0])
-PY"
+PY
 }
 
 smoke_check() {
@@ -169,11 +173,11 @@ smoke_check() {
   curl -fsS http://127.0.0.1:8130/api/dashboard >/tmp/direction-engine-v3-dashboard.json
   curl -fsS http://127.0.0.1:8130/api/directional/status >/tmp/direction-engine-v3-directional.json
   grep -q "PAPER / SHADOW" /tmp/direction-engine-v3-dashboard.html
-  run_ubuntu "$PY - <<'PY'
+  run_ubuntu_python <<'PY'
 from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENABLED
 if APP_MODE != 'PAPER' or LIVE_TRADING_ENABLED or LIVE_AUTO_ARM:
     raise SystemExit('PAPER/LIVE safety defaults violated')
-PY"
+PY
   write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after"
 }
 

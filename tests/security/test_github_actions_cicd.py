@@ -29,7 +29,9 @@ def test_ci_workflow_runs_required_python_acceptance_commands() -> None:
     assert "python -m ruff check ." in source
     assert "python -m mypy src" in source
     assert "git diff --check" in source
-    assert "aws" not in source.lower()
+    assert "bash -n deploy/aws/paper_deploy.sh" in source
+    assert "aws-actions/configure-aws-credentials" not in source
+    assert "aws ssm" not in source
 
 
 def test_deploy_workflow_uses_oidc_ssm_exact_sha_and_concurrency() -> None:
@@ -47,6 +49,7 @@ def test_deploy_workflow_uses_oidc_ssm_exact_sha_and_concurrency() -> None:
     assert "github.sha" in source
     assert "direction-engine-v3-paper-deploy" in source
     assert "cancel-in-progress: false" in source
+    assert "bash -n deploy/aws/paper_deploy.sh" in source
     assert "ssh " not in source.lower()
 
 
@@ -58,6 +61,8 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "BOUNDARY" not in source
     assert "24h" not in source.lower()
     assert "workflow_dispatch" not in source
+    assert "run_ubuntu_python()" in source
+    assert "run_ubuntu \"$PY - <<'PY'" not in source
     assert "LIVE_TRADING_ENABLED=true" not in source
     assert "LIVE_AUTO_ARM=true" not in source
     assert "real_order_submission=true" not in source
@@ -76,10 +81,12 @@ def test_iam_trust_policy_restricts_repo_branch_and_audience() -> None:
 
     assert statement["Action"] == "sts:AssumeRoleWithWebIdentity"
     assert condition["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
-    assert (
-        condition["token.actions.githubusercontent.com:sub"]
-        == "repo:23emrahgunes@168855296/direction-engineV3@1371242858:ref:refs/heads/main"
+    subject = condition["token.actions.githubusercontent.com:sub"]
+    assert subject == (
+        "repo:23emrahgunes@168855296/direction-engineV3@1371242858:"
+        "ref:refs/heads/main"
     )
+    assert subject.endswith(":ref:refs/heads/main")
 
 
 def test_iam_permission_policy_is_ssm_only_and_excludes_dangerous_actions() -> None:
