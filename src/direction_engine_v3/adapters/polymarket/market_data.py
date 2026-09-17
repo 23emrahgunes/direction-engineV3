@@ -32,6 +32,7 @@ from direction_engine_v3.market_data import (
 
 GAMMA_MARKETS_URL: Final = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL: Final = "https://clob.polymarket.com/book"
+CLOB_FEE_RATE_URL: Final = "https://clob.polymarket.com/fee-rate"
 CLOB_MARKETS_URL: Final = "https://clob.polymarket.com/clob-markets"
 CLOB_WS_URL: Final = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -206,6 +207,48 @@ def parse_fee_schedule(
     )
 
 
+def parse_fee_rate(
+    raw: object,
+    *,
+    condition_id: str,
+    token_id: str,
+    expected_token_id: str,
+    recv_ts: datetime,
+    normalized_ts: datetime,
+    recv_monotonic_ns: int,
+) -> FeeSchedule:
+    """Parse the current public CLOB token fee-rate payload.
+
+    The documented endpoint returns a token-scoped ``base_fee`` integer in basis
+    points.  The response does not echo the token ID, so the caller must pass
+    the requested and expected token IDs to keep lineage explicit.
+    """
+
+    if not token_id or token_id != token_id.strip():
+        raise MarketDataSchemaError("token_id must be a non-empty trimmed string")
+    if token_id != expected_token_id:
+        raise MarketDataSchemaError("fee-rate token identity mismatch")
+    payload = require_object(raw)
+    base_fee = payload.get("base_fee")
+    if base_fee is None:
+        raise MarketDataSchemaError("fee-rate payload requires base_fee")
+    return FeeSchedule(
+        condition_id=condition_id,
+        maker_base_bps=Decimal("0"),
+        taker_base_bps=_fee_rate_bps(base_fee),
+        rate=None,
+        exponent=None,
+        lineage=EventLineage(
+            source=DataSource.POLYMARKET_CLOB,
+            source_ts=None,
+            recv_ts=recv_ts,
+            normalized_ts=normalized_ts,
+            recv_monotonic_ns=recv_monotonic_ns,
+        ),
+        taker_fee_mode="bps",
+    )
+
+
 def parse_market_resolved(
     raw: object,
     *,
@@ -267,4 +310,20 @@ def _optional_decimal(payload: JsonObject, key: str) -> Decimal | None:
         raise MarketDataSchemaError(f"fee.{key} must be decimal-compatible") from exc
     if not parsed.is_finite():
         raise MarketDataSchemaError(f"fee.{key} must be finite")
+    return parsed
+
+
+def _fee_rate_bps(value: object) -> Decimal:
+    if isinstance(value, bool):
+        raise MarketDataSchemaError("fee-rate base_fee must be an integer")
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise MarketDataSchemaError("fee-rate base_fee must be decimal-compatible") from exc
+    if not parsed.is_finite():
+        raise MarketDataSchemaError("fee-rate base_fee must be finite")
+    if parsed < Decimal("0"):
+        raise MarketDataSchemaError("fee-rate base_fee must be non-negative")
+    if parsed != parsed.to_integral_value():
+        raise MarketDataSchemaError("fee-rate base_fee must be an integer")
     return parsed

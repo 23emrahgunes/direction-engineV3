@@ -136,6 +136,61 @@ def test_directional_status_api_exposes_official_proxy_ptb_health(
     asyncio.run(_assert_directional_status_contains_feed_health())
 
 
+def test_directional_status_prefers_fresh_pipeline_failure_over_old_strategy_row(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    repository.append_event(
+        event_id="strategy-old",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "MODEL_UNAVAILABLE",
+        },
+        observed_at=observed_at,
+    )
+    repository.append_event(
+        event_id="pipeline-new",
+        window_id="window",
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        payload={
+            "latest_observed_at": "2026-09-15T12:01:00+00:00",
+            "discovery_status": "READY",
+            "fee_status": "FAILED",
+            "fee_error": "MARKET_DATA_SCHEMA_ERROR:FEE_PARSE",
+            "ptb_status": "PTB_READY",
+            "ptb_reason": "PTB_ESTABLISHED",
+            "pipeline_stages": [{"stage": "FEE_PARSE", "status": "FAIL"}],
+        },
+        observed_at=datetime(2026, 9, 15, 12, 1, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_pipeline_failure_is_visible())
+
+
+async def _assert_pipeline_failure_is_visible() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["latest_observed_at"] == "2026-09-15T12:01:00+00:00"
+    assert bucket["fee_status"] == "FAILED"
+    assert bucket["fee_error"] == "MARKET_DATA_SCHEMA_ERROR:FEE_PARSE"
+    assert bucket["ptb_status"] == "PTB_READY"
+
+
 async def _assert_directional_status_contains_feed_health() -> None:
     app = create_app()
     client = TestClient(TestServer(app))

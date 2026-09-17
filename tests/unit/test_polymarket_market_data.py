@@ -6,6 +6,7 @@ import pytest
 from direction_engine_v3.adapters.polymarket import (
     market_subscription,
     parse_clob_book,
+    parse_fee_rate,
     parse_fee_schedule,
     parse_gamma_market,
     parse_gamma_market_discovery,
@@ -161,6 +162,30 @@ def test_dynamic_fee_schedule_retains_current_lineage() -> None:
     assert fee.rate == Decimal("0.25")
     assert fee.exponent == Decimal("2")
     assert fee.lineage.source_ts is None
+
+
+def test_token_fee_rate_parses_base_fee_without_dynamic_formula() -> None:
+    fee = parse_fee_rate(
+        {"base_fee": 1000},
+        condition_id="condition-1",
+        token_id="up-token",
+        expected_token_id="up-token",
+        recv_ts=RECV,
+        normalized_ts=RECV,
+        recv_monotonic_ns=12,
+    )
+    assert fee.taker_base_bps == Decimal("1000")
+    assert fee.taker_fee_mode == "bps"
+    with pytest.raises(MarketDataSchemaError, match="base_fee"):
+        parse_fee_rate(
+            {},
+            condition_id="condition-1",
+            token_id="up-token",
+            expected_token_id="up-token",
+            recv_ts=RECV,
+            normalized_ts=RECV,
+            recv_monotonic_ns=13,
+        )
 
 
 def test_market_subscription_rejects_duplicates() -> None:

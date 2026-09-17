@@ -59,12 +59,15 @@ def quote_fee(
             raise PricingUnavailableError("non-zero maker fee formula is unsupported")
         fee = _ZERO
     else:
-        if schedule.rate is None or schedule.exponent is None:
-            raise PricingUnavailableError("dynamic taker fee parameters are missing")
-        if schedule.exponent != schedule.exponent.to_integral_value():
-            raise PricingUnavailableError("fee exponent must be an integer")
-        exponent = int(schedule.exponent)
-        raw_fee = quantity * schedule.rate * (price * (_ONE - price)) ** exponent
+        if schedule.taker_fee_mode == "bps":
+            raw_fee = quantity * price * schedule.taker_base_bps / Decimal("10000")
+        else:
+            if schedule.rate is None or schedule.exponent is None:
+                raise PricingUnavailableError("dynamic fee parameters are incomplete")
+            if schedule.exponent != schedule.exponent.to_integral_value():
+                raise PricingUnavailableError("fee exponent must be an integer")
+            exponent = int(schedule.exponent)
+            raw_fee = quantity * schedule.rate * (price * (_ONE - price)) ** exponent
         fee = raw_fee.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_UP)
     return FeeQuote(
         condition_id=schedule.condition_id,

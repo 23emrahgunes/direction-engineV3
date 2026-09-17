@@ -226,6 +226,7 @@ def build_directional_runtime_status() -> dict[str, object]:
     try:
         shadow.initialize()
         directional_events = shadow.latest_events(event_type="STRATEGY_EVALUATION", limit=500)
+        pipeline_events = shadow.latest_events(event_type="MARKET_DATA_PIPELINE", limit=500)
     except Exception as exc:
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",
@@ -242,12 +243,23 @@ def build_directional_runtime_status() -> dict[str, object]:
         payload = dict(payload_obj)
         if payload.get("strategy") == "DIRECTIONAL_EDGE":
             by_bucket[str(event["bucket_key"])] = event
+    pipeline_by_bucket: dict[str, dict[str, object]] = {}
+    for event in pipeline_events:
+        payload_obj = event.get("payload")
+        if event["bucket_key"] is None or not isinstance(payload_obj, dict):
+            continue
+        pipeline_by_bucket[str(event["bucket_key"])] = event
     buckets = []
     for bucket in SUPPORTED_MARKET_BUCKETS:
         bucket_key = f"{bucket.asset.value}-{bucket.horizon.value}"
         latest = by_bucket.get(bucket_key)
+        latest_pipeline = pipeline_by_bucket.get(bucket_key)
         latest_payload = latest["payload"] if latest is not None else {}
         payload = dict(latest_payload) if isinstance(latest_payload, dict) else {}
+        pipeline_payload_obj = latest_pipeline["payload"] if latest_pipeline is not None else {}
+        pipeline_payload = (
+            dict(pipeline_payload_obj) if isinstance(pipeline_payload_obj, dict) else {}
+        )
         trades = paper.trades(
             asset=bucket.asset.value,
             horizon=bucket.horizon.value,
@@ -258,22 +270,49 @@ def build_directional_runtime_status() -> dict[str, object]:
             {
                 "asset": bucket.asset.value,
                 "horizon": bucket.horizon.value,
-                "state": _directional_bucket_state(payload),
-                "official_status": payload.get("official_status", "UNKNOWN"),
-                "proxy_status": payload.get("proxy_status", "UNKNOWN"),
-                "ptb_status": payload.get("ptb_status", "UNKNOWN"),
-                "ptb_reason": payload.get("ptb_reason", "UNKNOWN"),
-                "ptb_value": payload.get("ptb_value"),
-                "ptb_effective_time": payload.get("ptb_effective_time"),
-                "feature_status": payload.get("feature_status", "UNKNOWN"),
+                "state": _directional_bucket_state(payload | pipeline_payload),
+                "latest_observed_at": pipeline_payload.get("latest_observed_at"),
+                "discovery_status": pipeline_payload.get("discovery_status", "UNKNOWN"),
+                "discovery_error": pipeline_payload.get("discovery_error"),
+                "book_status": pipeline_payload.get("book_status", "UNKNOWN"),
+                "book_error": pipeline_payload.get("book_error"),
+                "fee_status": pipeline_payload.get("fee_status", "UNKNOWN"),
+                "fee_error": pipeline_payload.get("fee_error"),
+                "proxy_status": pipeline_payload.get(
+                    "proxy_status", payload.get("proxy_status", "UNKNOWN")
+                ),
+                "proxy_error": pipeline_payload.get("proxy_error"),
+                "official_status": pipeline_payload.get(
+                    "official_status", payload.get("official_status", "UNKNOWN")
+                ),
+                "ptb_status": pipeline_payload.get(
+                    "ptb_status", payload.get("ptb_status", "UNKNOWN")
+                ),
+                "ptb_reason": pipeline_payload.get(
+                    "ptb_reason", payload.get("ptb_reason", "UNKNOWN")
+                ),
+                "ptb_value": pipeline_payload.get("ptb_value", payload.get("ptb_value")),
+                "ptb_effective_time": pipeline_payload.get(
+                    "ptb_effective_time", payload.get("ptb_effective_time")
+                ),
+                "feature_status": pipeline_payload.get(
+                    "feature_status", payload.get("feature_status", "UNKNOWN")
+                ),
+                "feature_error": pipeline_payload.get("feature_error"),
                 "model_state": payload.get("model_state", "TRAINING_CORPUS_REQUIRED"),
                 "calibration_state": payload.get("calibration_state", "CALIBRATION_NOT_READY"),
                 "pricing_status": payload.get("pricing_status", "UNKNOWN"),
-                "chainlink": payload.get("chainlink", {}),
-                "binance_hourly": payload.get("binance_hourly", {}),
+                "chainlink": pipeline_payload.get("chainlink", payload.get("chainlink", {})),
+                "binance_hourly": pipeline_payload.get(
+                    "binance_hourly", payload.get("binance_hourly", {})
+                ),
+                "pipeline_stages": pipeline_payload.get("pipeline_stages", ()),
                 "last_decision": payload.get("action", "ABSTAIN"),
                 "last_abstain_reason": payload.get("reason", "NO_RUNTIME_EVIDENCE"),
-                "last_observed_at": latest["observed_at"] if latest is not None else None,
+                "last_observed_at": pipeline_payload.get(
+                    "latest_observed_at",
+                    latest["observed_at"] if latest is not None else None,
+                ),
                 "last_paper_trade": _trade_as_dict(trades[0]) if trades else None,
                 "evidence_sample_count": payload.get("corpus_sample_count", 0),
                 "p_up": None,

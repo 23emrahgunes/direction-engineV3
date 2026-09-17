@@ -352,3 +352,24 @@ local and VPS gates pass.
 - Runtime evidence remains asynchronous and observable through dashboard/API.
 - Codex must not create the AWS IAM/OIDC role. A human AWS administrator must
   complete the one-time setup for `direction-engine-v3-github-deploy-role`.
+
+## V3.15.3.2 local evidence
+
+- Status: `V3.15.3.2_IMPLEMENTED_LOCAL_PENDING_CI`.
+- Shadow collection now records explicit Gamma, CLOB book, token fee-rate,
+  Binance proxy, official/PTB, and feature stages. Gamma identity is retained
+  when later vendor data fails; official/PTB resolution runs before auxiliary
+  CLOB/proxy stages and never uses proxy data as an official fallback.
+- Runtime fee collection uses the public token-scoped `/fee-rate?token_id=`
+  endpoint and accepts only the documented `base_fee` field. Token-specific
+  schedules are preserved through directional and structural pricing.
+- RTDS connection/control acknowledgements are separated from unknown non-JSON
+  data frames; unknown frames remain fail-closed schema errors.
+- Dashboard directional status prefers the freshest pipeline event, including
+  exact stage failure and sanitized reason, even when no strategy evaluation exists.
+- Added read-only `python -m direction_engine_v3.diagnostics.bucket_pipeline_probe`.
+- Local full suite: 297 passed. Local Ruff and mypy passed; `git diff --check`
+  passed. Bash syntax validation remains CI-owned on Ubuntu because this Windows
+  environment denies access to `bash.exe`.
+- VPS/GitHub deployment evidence is still pending; no LIVE, signing, or real
+  order path was introduced.

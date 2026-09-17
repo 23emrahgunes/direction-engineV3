@@ -154,6 +154,8 @@ def _decode_websocket_text(value: str) -> object | None:
     stripped = value.strip()
     if not stripped or stripped.upper() in {"PING", "PONG"}:
         return None
+    if stripped.lower() in {"connected", "subscribed", "subscription_success", "ack", "ok"}:
+        return None
     try:
         decoded: object = json.loads(stripped, parse_float=Decimal)
     except json.JSONDecodeError as exc:

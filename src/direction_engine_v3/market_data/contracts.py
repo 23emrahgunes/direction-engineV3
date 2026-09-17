@@ -147,6 +147,7 @@ class FeeSchedule:
     rate: Decimal | None
     exponent: Decimal | None
     lineage: EventLineage
+    taker_fee_mode: str = "dynamic"
 
     def __post_init__(self) -> None:
         require_text("condition_id", self.condition_id)
@@ -156,6 +157,8 @@ class FeeSchedule:
             require_decimal("rate", self.rate, minimum=_ZERO)
         if self.exponent is not None:
             require_decimal("exponent", self.exponent, minimum=_ZERO)
+        if self.taker_fee_mode not in {"dynamic", "bps"}:
+            raise ValueError("taker_fee_mode must be dynamic or bps")
         if not isinstance(self.lineage, EventLineage):
             raise TypeError("lineage must be EventLineage")
 

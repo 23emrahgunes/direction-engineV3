@@ -6,21 +6,23 @@ import json
 import os
 import signal
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import aiohttp
 
 from direction_engine_v3.adapters.binance import parse_aggregate_trade, parse_depth_top
 from direction_engine_v3.adapters.polymarket import (
     CLOB_BOOK_URL,
-    CLOB_MARKETS_URL,
+    CLOB_FEE_RATE_URL,
     parse_clob_book,
-    parse_fee_schedule,
+    parse_fee_rate,
     parse_gamma_market_discovery,
 )
 from direction_engine_v3.adapters.public_transport import PublicTransport
@@ -52,6 +54,8 @@ from direction_engine_v3.market_data import (
     CryptoTrade,
     FeeSchedule,
     MarketBucket,
+    MarketDataError,
+    MarketDataSchemaError,
     MarketDiscovery,
     PolymarketBook,
     PriceToBeatRecord,
@@ -136,6 +140,24 @@ class ShadowDataClient(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class BucketPipelineStage:
+    stage: str
+    status: str
+    observed_at: datetime
+    error_type: str | None = None
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "status": self.status,
+            "observed_at": self.observed_at.isoformat(),
+            "error_type": self.error_type,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ShadowMarketState:
     bucket: MarketBucket
     discovery: MarketDiscovery | None
@@ -153,6 +175,9 @@ class ShadowMarketState:
     feature_status: str = "FEATURES_UNAVAILABLE"
     chainlink_status: Mapping[str, object] | None = None
     binance_hourly_status: Mapping[str, object] | None = None
+    pipeline_stages: tuple[BucketPipelineStage, ...] = ()
+    up_fee_schedule: FeeSchedule | None = None
+    down_fee_schedule: FeeSchedule | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,93 +226,322 @@ class PublicShadowDataClient:
     async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
         window = window_containing(bucket, now)
         slug = _slug(bucket, window.start)
-        try:
-            raw_event = _object(
-                await self._transport.get_json(_EVENT_URL.format(slug=slug)),
-                "Gamma event",
-            )
-            markets = _sequence(raw_event.get("markets"), "Gamma event markets")
-            if len(markets) != 1:
-                raise RuntimeError("canonical Gamma event must contain exactly one market")
-            recv_ts = self._clock.utc_now()
-            discovery = parse_gamma_market_discovery(
-                markets[0],
-                event_id=_text(raw_event.get("id"), "Gamma event ID"),
-                asset=bucket.asset,
-                horizon=bucket.horizon,
-                recv_ts=recv_ts,
-                normalized_ts=self._clock.utc_now(),
-                recv_monotonic_ns=self._clock.monotonic_ns(),
-            )
-            token_ids = {token.outcome: token.token_id for token in discovery.market.tokens}
-            up_book, down_book, raw_fee, proxy_observation = await asyncio.gather(
-                self._fetch_book(token_ids[OutcomeSide.UP]),
-                self._fetch_book(token_ids[OutcomeSide.DOWN]),
-                self._transport.get_json(f"{CLOB_MARKETS_URL}/{discovery.market.condition_id}"),
-                self._fetch_proxy_observation(discovery.market),
-            )
-            proxy, external_book, external_trade = proxy_observation
-            if self._feature_state is not None:
-                self._feature_state.add_reference(proxy)
-                self._feature_state.add_book(external_book)
-                if external_trade is not None:
-                    self._feature_state.add_trade(external_trade)
-            fee_recv = self._clock.utc_now()
-            fee = parse_fee_schedule(
-                raw_fee,
-                condition_id=discovery.market.condition_id,
-                recv_ts=fee_recv,
-                normalized_ts=self._clock.utc_now(),
-                recv_monotonic_ns=self._clock.monotonic_ns(),
-            )
-            observed_at = self._clock.utc_now()
-            ptb_resolution = await self._resolve_ptb(discovery, observed_at=observed_at)
-            chainlink_status = None
-            binance_hourly_status = None
-            if self._official_ptb is not None:
-                chainlink_status = self._official_ptb.chainlink_status().as_dict()
-                binance_hourly_status = self._official_ptb.binance_hourly_status().as_dict()
-            features, feature_status = self._build_directional_features(
-                discovery,
-                proxy,
-                ptb_resolution.price_to_beat,
-                observed_at=observed_at,
-            )
-            return ShadowMarketState(
-                bucket=bucket,
-                discovery=discovery,
-                up_book=up_book,
-                down_book=down_book,
-                fee_schedule=fee,
-                proxy_reference=proxy,
-                official_reference=ptb_resolution.official_reference,
-                observed_at=observed_at,
-                price_to_beat=ptb_resolution.price_to_beat,
-                directional_features=features,
-                ptb_status=ptb_resolution.ptb_status,
-                ptb_reason=ptb_resolution.reason,
-                feature_status=feature_status,
-                chainlink_status=chainlink_status,
-                binance_hourly_status=binance_hourly_status,
-            )
-        except Exception as exc:
-            return ShadowMarketState(
-                bucket=bucket,
-                discovery=None,
-                up_book=None,
-                down_book=None,
-                fee_schedule=None,
-                proxy_reference=None,
-                official_reference=None,
-                observed_at=self._clock.utc_now(),
-                unavailable_reason=type(exc).__name__,
-                ptb_status="PTB_UNAVAILABLE",
-                ptb_reason=type(exc).__name__,
-                feature_status="FEATURES_UNAVAILABLE",
-            )
+        stages: list[BucketPipelineStage] = []
+        raw_event = await self._stage(
+            stages,
+            "GAMMA_FETCH",
+            bucket,
+            slug=slug,
+            operation=lambda: self._transport.get_json(_EVENT_URL.format(slug=slug)),
+        )
+        if raw_event is None:
+            return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
+        raw_event_obj = self._stage_sync(
+            stages,
+            "GAMMA_PARSE",
+            bucket,
+            slug=slug,
+            operation=lambda: _object(raw_event, "Gamma event"),
+        )
+        if raw_event_obj is None:
+            return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
+        discovery = self._stage_sync(
+            stages,
+            "GAMMA_PARSE",
+            bucket,
+            slug=slug,
+            operation=lambda: self._parse_discovery(raw_event_obj, bucket),
+        )
+        if discovery is None:
+            return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
 
-    async def _fetch_book(self, token_id: str) -> PolymarketBook:
-        raw = await self._transport.get_json(CLOB_BOOK_URL, params={"token_id": token_id})
+        token_ids = {token.outcome: token.token_id for token in discovery.market.tokens}
+        observed_at = self._clock.utc_now()
+        ptb_resolution = await self._stage(
+            stages,
+            "OFFICIAL_PTB_RESOLVE",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._resolve_ptb(discovery, observed_at=observed_at),
+        )
+        if ptb_resolution is None:
+            ptb_resolution = PriceToBeatResolution(
+                None,
+                None,
+                "PTB_UNAVAILABLE",
+                _latest_stage_reason(stages, "OFFICIAL_PTB_RESOLVE") or "OFFICIAL_PTB_UNAVAILABLE",
+            )
+        chainlink_status = None
+        binance_hourly_status = None
+        if self._official_ptb is not None:
+            chainlink_status = self._official_ptb.chainlink_status().as_dict()
+            binance_hourly_status = self._official_ptb.binance_hourly_status().as_dict()
+
+        raw_up_book = await self._stage(
+            stages,
+            "CLOB_UP_BOOK_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                CLOB_BOOK_URL, params={"token_id": token_ids[OutcomeSide.UP]}
+            ),
+        )
+        up_book = None
+        if raw_up_book is not None:
+            up_book = self._stage_sync(
+                stages,
+                "CLOB_UP_BOOK_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_book(raw_up_book),
+            )
+        raw_down_book = await self._stage(
+            stages,
+            "CLOB_DOWN_BOOK_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                CLOB_BOOK_URL, params={"token_id": token_ids[OutcomeSide.DOWN]}
+            ),
+        )
+        down_book = None
+        if raw_down_book is not None:
+            down_book = self._stage_sync(
+                stages,
+                "CLOB_DOWN_BOOK_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_book(raw_down_book),
+            )
+        raw_up_fee = await self._stage(
+            stages,
+            "FEE_UP_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                CLOB_FEE_RATE_URL, params={"token_id": token_ids[OutcomeSide.UP]}
+            ),
+        )
+        up_fee = None
+        if raw_up_fee is not None:
+            up_fee = self._stage_sync(
+                stages,
+                "FEE_UP_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_fee_rate(
+                    raw_up_fee, discovery, OutcomeSide.UP
+                ),
+            )
+        raw_down_fee = await self._stage(
+            stages,
+            "FEE_DOWN_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                CLOB_FEE_RATE_URL, params={"token_id": token_ids[OutcomeSide.DOWN]}
+            ),
+        )
+        down_fee = None
+        if raw_down_fee is not None:
+            down_fee = self._stage_sync(
+                stages,
+                "FEE_DOWN_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_fee_rate(
+                    raw_down_fee, discovery, OutcomeSide.DOWN
+                ),
+            )
+        raw_depth = await self._stage(
+            stages,
+            "BINANCE_DEPTH_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                _BINANCE_DEPTH_URL,
+                params={"symbol": f"{discovery.market.asset.value}USDT", "limit": "5"},
+            ),
+        )
+        external_book = None
+        proxy = None
+        if raw_depth is not None:
+            depth_observation = self._stage_sync(
+                stages,
+                "BINANCE_DEPTH_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_proxy_depth(discovery.market, raw_depth),
+            )
+            if depth_observation is not None:
+                proxy, external_book = depth_observation
+        raw_trade = await self._stage(
+            stages,
+            "BINANCE_TRADE_FETCH",
+            bucket,
+            slug=slug,
+            discovery=discovery,
+            operation=lambda: self._transport.get_json(
+                _BINANCE_TRADES_URL,
+                params={"symbol": f"{discovery.market.asset.value}USDT", "limit": "1"},
+            ),
+        )
+        external_trade = None
+        if raw_trade is not None:
+            external_trade = self._stage_sync(
+                stages,
+                "BINANCE_TRADE_PARSE",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._parse_latest_trade(discovery.market, raw_trade),
+            )
+        if proxy is not None and external_book is not None and self._feature_state is not None:
+            self._feature_state.add_reference(proxy)
+            self._feature_state.add_book(external_book)
+            if external_trade is not None:
+                self._feature_state.add_trade(external_trade)
+        features = None
+        feature_status = "FEATURES_UNAVAILABLE"
+        if proxy is not None:
+            feature_result = self._stage_sync(
+                stages,
+                "FEATURE_BUILD",
+                bucket,
+                slug=slug,
+                discovery=discovery,
+                operation=lambda: self._build_directional_features(
+                    discovery,
+                    proxy,
+                    ptb_resolution.price_to_beat,
+                    observed_at=observed_at,
+                ),
+            )
+            if feature_result is not None:
+                features, feature_status = feature_result
+        else:
+            stages.append(
+                _stage_record(
+                    "FEATURE_BUILD",
+                    "SKIPPED",
+                    self._clock.utc_now(),
+                    reason="PROXY_UNAVAILABLE",
+                )
+            )
+        fee = _shared_fee_schedule(up_fee, down_fee)
+        return ShadowMarketState(
+            bucket=bucket,
+            discovery=discovery,
+            up_book=up_book,
+            down_book=down_book,
+            fee_schedule=fee,
+            proxy_reference=proxy,
+            official_reference=ptb_resolution.official_reference,
+            observed_at=observed_at,
+            unavailable_reason=_first_failure_reason(stages),
+            price_to_beat=ptb_resolution.price_to_beat,
+            directional_features=features,
+            ptb_status=ptb_resolution.ptb_status,
+            ptb_reason=ptb_resolution.reason,
+            feature_status=feature_status,
+            chainlink_status=chainlink_status,
+            binance_hourly_status=binance_hourly_status,
+            pipeline_stages=tuple(stages),
+            up_fee_schedule=up_fee,
+            down_fee_schedule=down_fee,
+        )
+
+    async def _stage(
+        self,
+        stages: list[BucketPipelineStage],
+        stage: str,
+        bucket: MarketBucket,
+        *,
+        slug: str,
+        operation: Callable[[], Awaitable[Any]],
+        discovery: MarketDiscovery | None = None,
+    ) -> Any:
+        del bucket, slug, discovery
+        try:
+            result = await operation()
+        except Exception as exc:
+            if not _is_expected_market_data_failure(exc):
+                raise
+            stages.append(_stage_record(stage, "FAIL", self._clock.utc_now(), error=exc))
+            return None
+        stages.append(_stage_record(stage, "PASS", self._clock.utc_now()))
+        return result
+
+    def _stage_sync(
+        self,
+        stages: list[BucketPipelineStage],
+        stage: str,
+        bucket: MarketBucket,
+        *,
+        slug: str,
+        operation: Callable[[], Any],
+        discovery: MarketDiscovery | None = None,
+    ) -> Any:
+        del bucket, slug, discovery
+        try:
+            result = operation()
+        except Exception as exc:
+            if not _is_expected_market_data_failure(exc):
+                raise
+            stages.append(_stage_record(stage, "FAIL", self._clock.utc_now(), error=exc))
+            return None
+        stages.append(_stage_record(stage, "PASS", self._clock.utc_now()))
+        return result
+
+    def _parse_discovery(
+        self, raw_event: Mapping[str, object], bucket: MarketBucket
+    ) -> MarketDiscovery:
+        markets = _sequence(raw_event.get("markets"), "Gamma event markets")
+        if len(markets) != 1:
+            raise MarketDataSchemaError("canonical Gamma event must contain exactly one market")
+        recv_ts = self._clock.utc_now()
+        return parse_gamma_market_discovery(
+            markets[0],
+            event_id=_text(raw_event.get("id"), "Gamma event ID"),
+            asset=bucket.asset,
+            horizon=bucket.horizon,
+            recv_ts=recv_ts,
+            normalized_ts=self._clock.utc_now(),
+            recv_monotonic_ns=self._clock.monotonic_ns(),
+        )
+
+    def _unavailable_state(
+        self, bucket: MarketBucket, stages: Sequence[BucketPipelineStage], reason: str
+    ) -> ShadowMarketState:
+        failure = _first_failure_reason(stages) or reason
+        return ShadowMarketState(
+            bucket=bucket,
+            discovery=None,
+            up_book=None,
+            down_book=None,
+            fee_schedule=None,
+            proxy_reference=None,
+            official_reference=None,
+            observed_at=self._clock.utc_now(),
+            unavailable_reason=failure,
+            ptb_status="PTB_UNAVAILABLE",
+            ptb_reason=failure,
+            feature_status="FEATURES_UNAVAILABLE",
+            pipeline_stages=tuple(stages),
+        )
+
+    def _parse_book(self, raw: object) -> PolymarketBook:
         received = self._clock.utc_now()
         return parse_clob_book(
             raw,
@@ -296,13 +550,23 @@ class PublicShadowDataClient:
             recv_monotonic_ns=self._clock.monotonic_ns(),
         )
 
-    async def _fetch_proxy_observation(
-        self, market: Market
-    ) -> tuple[ProxyReference, CryptoTopOfBook, CryptoTrade | None]:
-        raw = await self._transport.get_json(
-            _BINANCE_DEPTH_URL,
-            params={"symbol": f"{market.asset.value}USDT", "limit": "5"},
+    def _parse_fee_rate(
+        self, raw: object, discovery: MarketDiscovery, side: OutcomeSide
+    ) -> FeeSchedule:
+        token_id = {token.outcome: token.token_id for token in discovery.market.tokens}[side]
+        return parse_fee_rate(
+            raw,
+            condition_id=discovery.market.condition_id,
+            token_id=token_id,
+            expected_token_id=token_id,
+            recv_ts=self._clock.utc_now(),
+            normalized_ts=self._clock.utc_now(),
+            recv_monotonic_ns=self._clock.monotonic_ns(),
         )
+
+    def _parse_proxy_depth(
+        self, market: Market, raw: object
+    ) -> tuple[ProxyReference, CryptoTopOfBook]:
         payload = _object(raw, "Binance depth")
         now = self._clock.utc_now()
         depth_event = {
@@ -311,8 +575,8 @@ class PublicShadowDataClient:
             "s": f"{market.asset.value}USDT",
             "U": _integer(payload.get("lastUpdateId"), "lastUpdateId"),
             "u": _integer(payload.get("lastUpdateId"), "lastUpdateId"),
-            "b": payload["bids"],
-            "a": payload["asks"],
+            "b": _sequence(payload.get("bids"), "Binance bids"),
+            "a": _sequence(payload.get("asks"), "Binance asks"),
         }
         top, _first_update = parse_depth_top(
             depth_event,
@@ -332,13 +596,9 @@ class PublicShadowDataClient:
             top.lineage.recv_ts,
             top.lineage.normalized_ts,
         )
-        return proxy, top, await self._fetch_latest_trade(market)
+        return proxy, top
 
-    async def _fetch_latest_trade(self, market: Market) -> CryptoTrade | None:
-        raw = await self._transport.get_json(
-            _BINANCE_TRADES_URL,
-            params={"symbol": f"{market.asset.value}USDT", "limit": "1"},
-        )
+    def _parse_latest_trade(self, market: Market, raw: object) -> CryptoTrade | None:
         rows = _sequence(raw, "Binance aggregate trades")
         if not rows:
             return None
@@ -466,6 +726,7 @@ class ShadowDaemon:
         paper_trades = 0
         for state in states:
             bucket_key = f"{state.bucket.asset.value}-{state.bucket.horizon.value}"
+            self._record_pipeline_state(state, cycle_id=cycle_id)
             if state.discovery is None:
                 abstain_records += self._record_abstain(
                     state,
@@ -500,6 +761,22 @@ class ShadowDaemon:
             strategy_evaluations,
             abstain_records,
             paper_trades,
+        )
+
+    def _record_pipeline_state(self, state: ShadowMarketState, *, cycle_id: str) -> None:
+        market = state.discovery.market if state.discovery is not None else None
+        payload = _pipeline_payload(state)
+        condition_id = market.condition_id if market is not None else "UNAVAILABLE"
+        self._shadow_repository.append_event(
+            event_id=(
+                f"{cycle_id}:{state.bucket.asset.value}:{state.bucket.horizon.value}:"
+                f"{condition_id}:pipeline"
+            ),
+            window_id=self._evidence_window.window_id,
+            event_type="MARKET_DATA_PIPELINE",
+            bucket_key=f"{state.bucket.asset.value}-{state.bucket.horizon.value}",
+            payload=payload,
+            observed_at=state.observed_at,
         )
 
     def _evaluate_directional(self, state: ShadowMarketState, *, cycle_id: str) -> int:
@@ -596,7 +873,9 @@ class ShadowDaemon:
     ) -> tuple[DepthSimulation | None, DepthSimulation | None, str]:
         if state.discovery is None or state.up_book is None or state.down_book is None:
             return None, None, "EXECUTABLE_PRICE_UNAVAILABLE"
-        if state.fee_schedule is None:
+        up_fee = state.up_fee_schedule or state.fee_schedule
+        down_fee = state.down_fee_schedule or state.fee_schedule
+        if up_fee is None or down_fee is None:
             return None, None, "FEE_SCHEDULE_UNAVAILABLE"
         try:
             requested_quantity = max(
@@ -612,7 +891,7 @@ class ShadowDaemon:
             )
             up = simulate_depth(
                 state.up_book,
-                state.fee_schedule,
+                up_fee,
                 side=OrderSide.BUY,
                 requested_quantity=requested_quantity,
                 limit_price=Decimal("1"),
@@ -622,7 +901,7 @@ class ShadowDaemon:
             )
             down = simulate_depth(
                 state.down_book,
-                state.fee_schedule,
+                down_fee,
                 side=OrderSide.BUY,
                 requested_quantity=requested_quantity,
                 limit_price=Decimal("1"),
@@ -700,7 +979,8 @@ class ShadowDaemon:
             state.discovery is None
             or state.up_book is None
             or state.down_book is None
-            or state.fee_schedule is None
+            or (state.fee_schedule is None and state.up_fee_schedule is None)
+            or (state.fee_schedule is None and state.down_fee_schedule is None)
         ):
             self._record_abstain(
                 state,
@@ -722,6 +1002,10 @@ class ShadowDaemon:
                 fee_buffer_bps=Decimal("500"),
             ),
         )
+        up_fee = state.up_fee_schedule or state.fee_schedule
+        down_fee = state.down_fee_schedule or state.fee_schedule
+        if up_fee is None or down_fee is None:
+            raise RuntimeError("structural fee schedules disappeared after validation")
         scans_list = []
         for action in (StructuralAction.BUY_MERGE, StructuralAction.SPLIT_SELL):
             try:
@@ -730,8 +1014,8 @@ class ShadowDaemon:
                         state.discovery.market,
                         state.up_book,
                         state.down_book,
-                        state.fee_schedule,
-                        state.fee_schedule,
+                        up_fee,
+                        down_fee,
                         action=action,
                         observed_at=state.observed_at,
                         policy=policy,
@@ -970,6 +1254,176 @@ def _structural_market_quality_reason(exc: Exception) -> str | None:
     return None
 
 
+def _stage_record(
+    stage: str,
+    status: str,
+    observed_at: datetime,
+    *,
+    error: Exception | None = None,
+    reason: str | None = None,
+) -> BucketPipelineStage:
+    if error is not None:
+        reason = _stage_failure_reason(stage, error)
+    return BucketPipelineStage(
+        stage=stage,
+        status=status,
+        observed_at=observed_at,
+        error_type=type(error).__name__ if error is not None else None,
+        reason=reason,
+    )
+
+
+def _stage_failure_reason(stage: str, exc: Exception) -> str:
+    reason_stage = {
+        "FEE_UP_FETCH": "FEE_FETCH",
+        "FEE_DOWN_FETCH": "FEE_FETCH",
+        "FEE_UP_PARSE": "FEE_PARSE",
+        "FEE_DOWN_PARSE": "FEE_PARSE",
+    }.get(stage, stage)
+    if isinstance(exc, MarketDataSchemaError):
+        return f"MARKET_DATA_SCHEMA_ERROR:{reason_stage}"
+    if isinstance(exc, MarketDataError):
+        return f"MARKET_DATA_ERROR:{reason_stage}"
+    if isinstance(exc, PricingUnavailableError):
+        return f"PRICING_UNAVAILABLE:{reason_stage}"
+    if isinstance(exc, TimeoutError):
+        return f"TRANSPORT_TIMEOUT:{reason_stage}"
+    return f"PUBLIC_DATA_UNAVAILABLE:{reason_stage}"
+
+
+def _is_expected_market_data_failure(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            MarketDataError,
+            PricingUnavailableError,
+            TimeoutError,
+            aiohttp.ClientError,
+        ),
+    )
+
+
+def _first_failure_reason(stages: Sequence[BucketPipelineStage]) -> str | None:
+    for stage in stages:
+        if stage.status == "FAIL":
+            return stage.reason or f"STAGE_FAILED:{stage.stage}"
+    return None
+
+
+def _latest_stage_reason(stages: Sequence[BucketPipelineStage], stage_name: str) -> str | None:
+    for stage in reversed(stages):
+        if stage.stage == stage_name and stage.status == "FAIL":
+            return stage.reason
+    return None
+
+
+def _shared_fee_schedule(
+    up_fee: FeeSchedule | None, down_fee: FeeSchedule | None
+) -> FeeSchedule | None:
+    if up_fee is None or down_fee is None:
+        return None
+    if up_fee.taker_base_bps != down_fee.taker_base_bps:
+        return None
+    return up_fee
+
+
+def _pipeline_payload(state: ShadowMarketState) -> dict[str, object]:
+    market = state.discovery.market if state.discovery is not None else None
+    by_stage = {stage.stage: stage for stage in state.pipeline_stages}
+    return {
+        "label": _PAPER_LABEL,
+        "asset": state.bucket.asset.value,
+        "horizon": state.bucket.horizon.value,
+        "latest_observed_at": state.observed_at.isoformat(),
+        "market_id": market.market_id if market is not None else None,
+        "condition_id": market.condition_id if market is not None else None,
+        "discovery_status": _combined_status(by_stage, ("GAMMA_FETCH", "GAMMA_PARSE")),
+        "discovery_error": _combined_error(by_stage, ("GAMMA_FETCH", "GAMMA_PARSE")),
+        "book_status": _combined_status(
+            by_stage,
+            (
+                "CLOB_UP_BOOK_FETCH",
+                "CLOB_UP_BOOK_PARSE",
+                "CLOB_DOWN_BOOK_FETCH",
+                "CLOB_DOWN_BOOK_PARSE",
+            ),
+        ),
+        "book_error": _combined_error(
+            by_stage,
+            (
+                "CLOB_UP_BOOK_FETCH",
+                "CLOB_UP_BOOK_PARSE",
+                "CLOB_DOWN_BOOK_FETCH",
+                "CLOB_DOWN_BOOK_PARSE",
+            ),
+        ),
+        "fee_status": _combined_status(
+            by_stage,
+            ("FEE_UP_FETCH", "FEE_UP_PARSE", "FEE_DOWN_FETCH", "FEE_DOWN_PARSE"),
+        ),
+        "fee_error": _combined_error(
+            by_stage,
+            ("FEE_UP_FETCH", "FEE_UP_PARSE", "FEE_DOWN_FETCH", "FEE_DOWN_PARSE"),
+        ),
+        "proxy_status": _combined_status(
+            by_stage,
+            (
+                "BINANCE_DEPTH_FETCH",
+                "BINANCE_DEPTH_PARSE",
+                "BINANCE_TRADE_FETCH",
+                "BINANCE_TRADE_PARSE",
+            ),
+        ),
+        "proxy_error": _combined_error(
+            by_stage,
+            (
+                "BINANCE_DEPTH_FETCH",
+                "BINANCE_DEPTH_PARSE",
+                "BINANCE_TRADE_FETCH",
+                "BINANCE_TRADE_PARSE",
+            ),
+        ),
+        "official_status": "OFFICIAL_REFERENCE_READY"
+        if state.official_reference is not None
+        else "OFFICIAL_REFERENCE_UNAVAILABLE",
+        "ptb_status": state.ptb_status,
+        "ptb_reason": state.ptb_reason,
+        "ptb_value": str(state.price_to_beat.value) if state.price_to_beat is not None else None,
+        "ptb_effective_time": state.price_to_beat.reference.effective_ts.isoformat()
+        if state.price_to_beat is not None
+        else None,
+        "feature_status": state.feature_status,
+        "feature_error": _combined_error(by_stage, ("FEATURE_BUILD",)),
+        "chainlink": dict(state.chainlink_status or {}),
+        "binance_hourly": dict(state.binance_hourly_status or {}),
+        "pipeline_stages": [stage.as_dict() for stage in state.pipeline_stages],
+        "real_order_submission": False,
+    }
+
+
+def _combined_status(
+    by_stage: Mapping[str, BucketPipelineStage], stage_names: Sequence[str]
+) -> str:
+    selected = [by_stage[name] for name in stage_names if name in by_stage]
+    if not selected:
+        return "NOT_RUN"
+    if any(stage.status == "FAIL" for stage in selected):
+        return "FAILED"
+    if any(stage.status == "SKIPPED" for stage in selected):
+        return "SKIPPED"
+    return "READY"
+
+
+def _combined_error(
+    by_stage: Mapping[str, BucketPipelineStage], stage_names: Sequence[str]
+) -> str | None:
+    for name in stage_names:
+        stage = by_stage.get(name)
+        if stage is not None and stage.status == "FAIL":
+            return stage.reason
+    return None
+
+
 def new_evidence_window(
     *,
     aws_user_id: str,
@@ -1129,7 +1583,11 @@ def _risk_decision(
     approved_id: str,
 ) -> RiskDecision:
     liquidity = None
-    if state.up_book is not None and state.down_book is not None and state.fee_schedule is not None:
+    if (
+        state.up_book is not None
+        and state.down_book is not None
+        and (state.fee_schedule is not None or state.up_fee_schedule is not None)
+    ):
         book = state.up_book
         if book.asks and book.bids:
             liquidity = LiquidityEvidence(
@@ -1201,29 +1659,29 @@ def _slug(bucket: MarketBucket, start: datetime) -> str:
 
 def _object(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
-        raise RuntimeError(f"{name} was not an object")
+        raise MarketDataSchemaError(f"{name} was not an object")
     return value
 
 
 def _sequence(value: object, name: str) -> Sequence[object]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise RuntimeError(f"{name} was not an array")
+        raise MarketDataSchemaError(f"{name} was not an array")
     return value
 
 
 def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
-        raise RuntimeError(f"{name} was not a non-empty string")
+        raise MarketDataSchemaError(f"{name} was not a non-empty string")
     return value
 
 
 def _integer(value: object, name: str) -> int:
     if isinstance(value, bool):
-        raise RuntimeError(f"{name} was not an integer")
+        raise MarketDataSchemaError(f"{name} was not an integer")
     try:
         return int(str(value))
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{name} was not an integer") from exc
+        raise MarketDataSchemaError(f"{name} was not an integer") from exc
 
 
 def _git_commit() -> str:

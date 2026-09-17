@@ -38,6 +38,10 @@ def test_websocket_control_frames_are_case_insensitive(frame: str) -> None:
     assert _decode_websocket_text(frame) is None
 
 
+def test_known_connection_frame_is_ignored() -> None:
+    assert _decode_websocket_text("connected") is None
+
+
 def test_unknown_non_json_websocket_frame_fails_closed() -> None:
     with pytest.raises(MarketDataSchemaError, match="non-JSON"):
-        _decode_websocket_text("connected")
+        _decode_websocket_text("not-json")
