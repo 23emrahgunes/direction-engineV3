@@ -64,6 +64,45 @@ def parse_aggregate_trade(
     )
 
 
+def parse_rest_aggregate_trade(
+    raw: object,
+    *,
+    asset: Asset,
+    recv_ts: datetime,
+    normalized_ts: datetime,
+    recv_monotonic_ns: int,
+) -> CryptoTrade:
+    """Parse the REST ``/api/v3/aggTrades`` contract.
+
+    REST aggregate trades intentionally use a separate parser from the
+    WebSocket ``aggTrade`` envelope.  The endpoint is symbol-scoped, so the
+    requested ``asset`` is the canonical identity; an optional REST symbol is
+    still checked when present.
+    """
+
+    payload = require_object(raw)
+    symbol = payload.get("s")
+    if symbol is not None and (
+        not isinstance(symbol, str) or symbol != _SYMBOLS[asset].upper()
+    ):
+        raise MarketDataSchemaError("unexpected Binance REST symbol")
+    source_ts = utc_from_milliseconds(require_int(payload, "T"))
+    return CryptoTrade(
+        asset=asset,
+        price=require_decimal(payload, "p"),
+        quantity=require_decimal(payload, "q"),
+        trade_id=require_int(payload, "a"),
+        buyer_is_maker=require_bool(payload, "m"),
+        lineage=EventLineage(
+            source=DataSource.BINANCE_SPOT,
+            source_ts=source_ts,
+            recv_ts=recv_ts,
+            normalized_ts=normalized_ts,
+            recv_monotonic_ns=recv_monotonic_ns,
+        ),
+    )
+
+
 def parse_depth_top(
     raw: object,
     *,

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
-from direction_engine_v3.adapters.binance import parse_aggregate_trade, parse_depth_top
+from direction_engine_v3.adapters.binance import parse_depth_top, parse_rest_aggregate_trade
 from direction_engine_v3.adapters.polymarket import (
     CLOB_BOOK_URL,
     CLOB_FEE_RATE_URL,
@@ -603,7 +603,7 @@ class PublicShadowDataClient:
         if not rows:
             return None
         row = _object(rows[-1], "Binance aggregate trade")
-        return parse_aggregate_trade(
+        return parse_rest_aggregate_trade(
             row,
             asset=market.asset,
             recv_ts=self._clock.utc_now(),

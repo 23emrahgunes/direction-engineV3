@@ -10,6 +10,18 @@ from direction_engine_v3.market_data import MarketBucket, SystemClock
 from direction_engine_v3.shadow.daemon import PublicShadowDataClient
 
 
+def _ptb_diagnostic_fields(*, status: str, reason: str) -> dict[str, object]:
+    if reason == "OFFICIAL_SERVICE_ABSENT":
+        return {
+            "official_service_wired": False,
+            "ptb_diagnostic_status": "OFFICIAL_SERVICE_NOT_WIRED",
+        }
+    return {
+        "official_service_wired": True,
+        "ptb_diagnostic_status": status,
+    }
+
+
 async def probe(*, asset: Asset, horizon: Horizon) -> dict[str, object]:
     clock = SystemClock()
     bucket = MarketBucket(asset, horizon)
@@ -17,7 +29,7 @@ async def probe(*, asset: Asset, horizon: Horizon) -> dict[str, object]:
         state = await PublicShadowDataClient(transport, clock).collect_bucket(
             bucket, now=clock.utc_now()
         )
-    return {
+    result: dict[str, object] = {
         "asset": asset.value,
         "horizon": horizon.value,
         "observed_at": state.observed_at.isoformat(),
@@ -29,6 +41,8 @@ async def probe(*, asset: Asset, horizon: Horizon) -> dict[str, object]:
         "real_order_submission": False,
         "label": "PAPER / SHADOW — NO REAL ORDER",
     }
+    result.update(_ptb_diagnostic_fields(status=state.ptb_status, reason=state.ptb_reason))
+    return result
 
 
 def main() -> None:

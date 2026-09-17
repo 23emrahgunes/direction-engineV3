@@ -373,3 +373,17 @@ local and VPS gates pass.
   environment denies access to `bash.exe`.
 - VPS/GitHub deployment evidence is still pending; no LIVE, signing, or real
   order path was introduced.
+
+## V3.15.3.3 local evidence
+
+- Status before VPS revalidation: `V3.15.3.3_IMPLEMENTED_LOCAL_PENDING_CI`.
+- Binance REST `/api/v3/aggTrades` now uses a dedicated strict parser; the
+  WebSocket `aggTrade` parser remains unchanged and requires its own envelope.
+- Chainlink RTDS now normalizes the verified TWAP60 `payload.symbol`,
+  `window_s`, and single-record `data` envelope with strict topic, symbol,
+  window, timestamp, Decimal E18, and malformed-data validation.
+- `bucket_pipeline_probe` distinguishes `OFFICIAL_SERVICE_NOT_WIRED` from a
+  live PTB source failure when the diagnostic client has no official service.
+- Local full suite: 307 passed. Ruff, mypy, compileall, and diff checks passed.
+- VPS acceptance must confirm non-zero Chainlink message/parse/history counters
+  and next natural-boundary PTB capability through GitHub OIDC/SSM.

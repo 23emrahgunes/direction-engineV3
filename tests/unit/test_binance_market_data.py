@@ -6,6 +6,7 @@ import pytest
 from direction_engine_v3.adapters.binance import (
     parse_aggregate_trade,
     parse_depth_top,
+    parse_rest_aggregate_trade,
     stream_url,
 )
 from direction_engine_v3.domain import Asset
@@ -77,4 +78,49 @@ def test_binance_symbol_mismatch_fails_closed() -> None:
             recv_ts=RECV,
             normalized_ts=NORMALIZED,
             recv_monotonic_ns=1,
+        )
+
+
+def test_rest_aggregate_trade_fixture_uses_rest_timestamp_contract() -> None:
+    trade = parse_rest_aggregate_trade(
+        {
+            "a": 123456,
+            "p": "60123.45000000",
+            "q": "0.00120000",
+            "f": 123450,
+            "l": 123456,
+            "T": 1789473600123,
+            "m": True,
+            "M": True,
+        },
+        asset=Asset.BTC,
+        recv_ts=RECV,
+        normalized_ts=NORMALIZED,
+        recv_monotonic_ns=125,
+    )
+    assert trade.asset is Asset.BTC
+    assert trade.trade_id == 123456
+    assert trade.price == Decimal("60123.45000000")
+    assert trade.quantity == Decimal("0.00120000")
+    assert trade.buyer_is_maker is True
+    assert trade.lineage.source_ts is not None
+    assert trade.lineage.source_ts.microsecond == 123000
+
+
+def test_rest_trade_requires_rest_fields_and_rejects_ws_only_shape() -> None:
+    with pytest.raises(MarketDataSchemaError, match="T"):
+        parse_rest_aggregate_trade(
+            {"a": 1, "p": "1", "q": "1", "m": False},
+            asset=Asset.BTC,
+            recv_ts=RECV,
+            normalized_ts=NORMALIZED,
+            recv_monotonic_ns=126,
+        )
+    with pytest.raises(MarketDataSchemaError, match="s must"):
+        parse_aggregate_trade(
+            {"a": 1, "p": "1", "q": "1", "T": 1, "m": False},
+            asset=Asset.BTC,
+            recv_ts=RECV,
+            normalized_ts=NORMALIZED,
+            recv_monotonic_ns=127,
         )

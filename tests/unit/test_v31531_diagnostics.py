@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from direction_engine_v3.diagnostics.bucket_pipeline_probe import _ptb_diagnostic_fields
 from direction_engine_v3.diagnostics.rtds_probe import (
     sanitize_message_shape,
     subscription_for,
@@ -74,3 +75,13 @@ def test_chainlink_status_records_parse_counts_and_source_timestamp() -> None:
     assert status["message_count"] == 1
     assert status["last_source_timestamp"] == NOW.isoformat()
     assert status["latest_twap_by_asset"] == {"BTC": "60000"}
+
+
+def test_bucket_probe_distinguishes_unwired_official_service() -> None:
+    result = _ptb_diagnostic_fields(
+        status="PTB_UNAVAILABLE", reason="OFFICIAL_SERVICE_ABSENT"
+    )
+    assert result == {
+        "official_service_wired": False,
+        "ptb_diagnostic_status": "OFFICIAL_SERVICE_NOT_WIRED",
+    }
