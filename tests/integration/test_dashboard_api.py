@@ -271,6 +271,14 @@ def test_directional_status_preserves_newest_strategy_event(tmp_path, monkeypatc
             "action": "ABSTAIN",
             "reason": "MODEL_UNAVAILABLE",
             "model_state": "TRAINING_CORPUS_REQUIRED",
+            "model_version": "PAPER_RESEARCH_BASELINE",
+            "calibration_version": "PAPER_RESEARCH_BASELINE_UNPROMOTABLE",
+            "p_up": "0.62",
+            "p_down": "0.38",
+            "selected_side": "UP",
+            "executable_cost": "0.40",
+            "net_edge": "0.21",
+            "directional_execution": {"risk_approved": True},
         },
         observed_at=datetime(2026, 9, 15, 12, 2, tzinfo=UTC),
     )
@@ -310,6 +318,13 @@ async def _assert_newest_strategy_event_is_visible() -> None:
     bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
     assert bucket["last_abstain_reason"] == "MODEL_UNAVAILABLE"
     assert bucket["model_state"] == "TRAINING_CORPUS_REQUIRED"
+    assert bucket["model_version"] == "PAPER_RESEARCH_BASELINE"
+    assert bucket["calibration_version"] == "PAPER_RESEARCH_BASELINE_UNPROMOTABLE"
+    assert bucket["p_up"] == "0.62"
+    assert bucket["p_down"] == "0.38"
+    assert bucket["selected_side"] == "UP"
+    assert bucket["net_edge"] == "0.21"
+    assert bucket["directional_execution"]["risk_approved"] is True
 
 
 async def _assert_directional_status_contains_feed_health() -> None:

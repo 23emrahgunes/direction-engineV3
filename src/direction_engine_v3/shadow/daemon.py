@@ -36,6 +36,7 @@ from direction_engine_v3.domain import (
     OfficialReference,
     OrderSide,
     OutcomeSide,
+    ProbabilityForecast,
     ProxyReference,
     RiskDecision,
     StrategyCandidate,
@@ -45,6 +46,7 @@ from direction_engine_v3.domain import (
 from direction_engine_v3.execution import (
     PaperFillEvidence,
     PaperGateway,
+    build_directional_paper_plan,
     build_structural_buy_merge_paper_plan,
 )
 from direction_engine_v3.features import ExternalTemporalState, build_directional_features
@@ -71,7 +73,14 @@ from direction_engine_v3.market_data.official_runtime import (
     OfficialPriceToBeatService,
     PriceToBeatResolution,
 )
-from direction_engine_v3.models import ShadowBucketModelStatus, ShadowModelState, empty_registry
+from direction_engine_v3.models import (
+    PAPER_RESEARCH_BASELINE_MODEL_VERSION,
+    CalibrationReadiness,
+    ShadowBucketModelStatus,
+    ShadowModelState,
+    load_paper_registry_from_corpus,
+    paper_research_baseline_forecast,
+)
 from direction_engine_v3.pricing import (
     DepthSimulation,
     LiquidityRole,
@@ -99,7 +108,11 @@ from direction_engine_v3.shadow.evidence import (
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
 from direction_engine_v3.shadow.storage import SQLiteShadowRepository
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
-from direction_engine_v3.strategies.directional import DirectionalPolicy, assess_directional_edge
+from direction_engine_v3.strategies.directional import (
+    DirectionalAssessment,
+    DirectionalPolicy,
+    assess_directional_edge,
+)
 from direction_engine_v3.strategies.structural_arb import (
     StructuralAction,
     StructuralOpportunity,
@@ -677,7 +690,10 @@ class ShadowDaemon:
         self._directional_corpus_repository = directional_corpus_repository
         self._clock = clock or SystemClock()
         self._poll_seconds = poll_seconds
-        self._registry = empty_registry()
+        self._paper_model_result = load_paper_registry_from_corpus(
+            directional_corpus_repository
+        )
+        self._registry = self._paper_model_result.registry
 
     async def run_once(self) -> ShadowCycleResult:
         started_at = self._clock.utc_now()
@@ -744,7 +760,12 @@ class ShadowDaemon:
             if state.up_book is not None and state.down_book is not None:
                 book_observations += 2
             strategy_evaluations += 1
-            abstain_records += self._evaluate_directional(state, cycle_id=cycle_id)
+            directional_abstains, directional_trade = self._evaluate_directional(
+                state, cycle_id=cycle_id
+            )
+            abstain_records += directional_abstains
+            if directional_trade:
+                paper_trades += 1
             structural_trade = self._evaluate_structural(state, cycle_id=cycle_id)
             strategy_evaluations += 2
             if structural_trade:
@@ -779,7 +800,7 @@ class ShadowDaemon:
             observed_at=state.observed_at,
         )
 
-    def _evaluate_directional(self, state: ShadowMarketState, *, cycle_id: str) -> int:
+    def _evaluate_directional(self, state: ShadowMarketState, *, cycle_id: str) -> tuple[int, bool]:
         assert state.discovery is not None
         model_status = self._shadow_model_status(state)
         corpus_count = 0
@@ -789,12 +810,15 @@ class ShadowDaemon:
             )
         ptb_status = state.ptb_status
         up_pricing, down_pricing, pricing_status = self._directional_pricing(state)
+        forecast, calibration, forecast_status = self._directional_forecast(
+            state, model_status=model_status
+        )
         assessment = assess_directional_edge(
             state.discovery.market,
             state.price_to_beat,
             state.directional_features,
-            None,
-            self._registry.state_for(state.bucket).readiness,
+            forecast,
+            calibration,
             up_pricing,
             down_pricing,
             observed_at=state.observed_at,
@@ -806,6 +830,23 @@ class ShadowDaemon:
                 max_forecast_age=timedelta(seconds=5),
             ),
         )
+        trade_recorded = False
+        directional_execution: dict[str, object] = {}
+        execution_abstains = 0
+        if assessment.action is DecisionAction.TRADE:
+            trade_recorded, directional_execution, execution_abstains = (
+                self._execute_directional_paper(
+                    state,
+                    cycle_id=cycle_id,
+                    assessment=assessment,
+                    up_pricing=up_pricing,
+                    down_pricing=down_pricing,
+                    forecast=forecast,
+                    calibration_version=calibration.calibration_version
+                    if calibration is not None
+                    else None,
+                )
+            )
         self._shadow_repository.append_event(
             event_id=f"{cycle_id}:{state.discovery.market.condition_id}:directional",
             window_id=self._evidence_window.window_id,
@@ -832,13 +873,31 @@ class ShadowDaemon:
                 if state.price_to_beat is not None
                 else None,
                 "feature_status": state.feature_status,
-                "model_state": model_status.state.value,
-                "model_reason": model_status.reason,
-                "calibration_state": "CALIBRATION_NOT_READY",
+                "model_state": forecast_status["model_state"],
+                "model_reason": forecast_status["model_reason"],
+                "model_version": forecast.model_version if forecast is not None else None,
+                "calibration_state": forecast_status["calibration_state"],
+                "calibration_version": calibration.calibration_version
+                if calibration is not None
+                else None,
+                "p_up": str(forecast.p_up) if forecast is not None else None,
+                "p_down": str(forecast.p_down) if forecast is not None else None,
+                "selected_side": assessment.selected_side.value
+                if assessment.selected_side is not None
+                else None,
+                "selected_probability": str(assessment.selected_probability)
+                if assessment.selected_probability is not None
+                else None,
+                "executable_cost": str(assessment.executable_cost)
+                if assessment.executable_cost is not None
+                else None,
+                "net_edge": str(assessment.net_edge) if assessment.net_edge is not None else None,
                 "pricing_status": pricing_status,
+                "directional_execution": directional_execution,
                 "chainlink": dict(state.chainlink_status or {}),
                 "binance_hourly": dict(state.binance_hourly_status or {}),
                 "corpus_sample_count": corpus_count,
+                "training_report": self._paper_model_result.report_for(state.bucket).as_dict(),
                 "real_order_submission": False,
             },
             observed_at=state.observed_at,
@@ -850,7 +909,7 @@ class ShadowDaemon:
             model_status=model_status,
         )
         if assessment.action is DecisionAction.ABSTAIN:
-            return self._record_abstain(
+            abstains = self._record_abstain(
                 state,
                 cycle_id=cycle_id,
                 strategy=StrategyKind.DIRECTIONAL_EDGE,
@@ -861,12 +920,241 @@ class ShadowDaemon:
                     "ptb_status": ptb_status,
                     "ptb_reason": state.ptb_reason,
                     "feature_status": state.feature_status,
-                    "model_state": model_status.state.value,
+                    "model_state": forecast_status["model_state"],
+                    "model_version": forecast.model_version if forecast is not None else None,
+                    "calibration_state": forecast_status["calibration_state"],
                     "pricing_status": pricing_status,
                     "corpus_sample_count": corpus_count,
+                    "net_edge": str(assessment.net_edge)
+                    if assessment.net_edge is not None
+                    else None,
                 },
             )
-        return 0
+            return abstains, False
+        return execution_abstains, trade_recorded
+
+    def _directional_forecast(
+        self,
+        state: ShadowMarketState,
+        *,
+        model_status: ShadowBucketModelStatus,
+    ) -> tuple[ProbabilityForecast | None, CalibrationReadiness | None, dict[str, object]]:
+        readiness = self._registry.state_for(state.bucket).readiness
+        report = self._paper_model_result.report_for(state.bucket)
+        if state.directional_features is None:
+            return (
+                None,
+                readiness,
+                {
+                    "model_state": model_status.state.value,
+                    "model_reason": "FEATURES_UNAVAILABLE",
+                    "calibration_state": "CALIBRATION_NOT_READY",
+                },
+            )
+        if readiness.ready:
+            try:
+                forecast = self._registry.forecast(
+                    state.directional_features, generated_at=state.observed_at
+                )
+                return (
+                    forecast,
+                    readiness,
+                    {
+                        "model_state": ShadowModelState.SHADOW_CANDIDATE.value,
+                        "model_reason": "PAPER_BUCKET_MODEL_READY",
+                        "calibration_state": "CALIBRATION_READY",
+                    },
+                )
+            except Exception as exc:
+                return (
+                    None,
+                    readiness,
+                    {
+                        "model_state": ShadowModelState.REJECTED.value,
+                        "model_reason": f"PAPER_MODEL_FORECAST_FAILED:{type(exc).__name__}",
+                        "calibration_state": "CALIBRATION_NOT_READY",
+                    },
+                )
+        if APP_MODE == "PAPER":
+            forecast, baseline_readiness = paper_research_baseline_forecast(
+                state.directional_features,
+                generated_at=state.observed_at,
+            )
+            return (
+                forecast,
+                baseline_readiness,
+                {
+                    "model_state": PAPER_RESEARCH_BASELINE_MODEL_VERSION,
+                    "model_reason": report.reason,
+                    "calibration_state": "PAPER_RESEARCH_BASELINE_UNPROMOTABLE",
+                },
+            )
+        return (
+            None,
+            readiness,
+            {
+                "model_state": model_status.state.value,
+                "model_reason": model_status.reason,
+                "calibration_state": "CALIBRATION_NOT_READY",
+            },
+        )
+
+    def _execute_directional_paper(
+        self,
+        state: ShadowMarketState,
+        *,
+        cycle_id: str,
+        assessment: DirectionalAssessment,
+        up_pricing: DepthSimulation | None,
+        down_pricing: DepthSimulation | None,
+        forecast: ProbabilityForecast | None,
+        calibration_version: str | None,
+    ) -> tuple[bool, dict[str, object], int]:
+        assert state.discovery is not None
+        market = state.discovery.market
+        candidate = assessment.candidate
+        selected_side = assessment.selected_side
+        if not isinstance(candidate, StrategyCandidate) or not isinstance(
+            selected_side, OutcomeSide
+        ):
+            raise RuntimeError("directional TRADE assessment did not carry a candidate")
+        pricing = up_pricing if selected_side is OutcomeSide.UP else down_pricing
+        if pricing is None or pricing.vwap is None or pricing.worst_price is None:
+            raise RuntimeError("directional TRADE assessment did not carry executable pricing")
+        token_ids = tuple(token.token_id for token in market.tokens)
+        routing = route_opportunities(
+            (
+                RoutingOpportunity(
+                    candidate,
+                    market.condition_id,
+                    token_ids,
+                    Decimal("1"),
+                    Decimal("1"),
+                ),
+            ),
+            snapshot=RouterSnapshot(0, (), ()),
+            available_capital=Decimal("1000"),
+            policy=RouterPolicy(
+                "v3.15.4-directional-router",
+                (
+                    StrategyKind.DIRECTIONAL_EDGE,
+                    StrategyKind.STRUCTURAL_ARBITRAGE,
+                    StrategyKind.DUAL40,
+                ),
+                False,
+            ),
+            now=state.observed_at,
+        )
+        if routing.selected is None:
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason="ROUTER_REJECTED_DIRECTIONAL",
+                payload={"candidate_id": candidate.candidate_id, "label": _PAPER_LABEL},
+            )
+            return False, {"router_status": "ROUTER_REJECTED_DIRECTIONAL"}, abstains
+        risk = _risk_decision(
+            candidate,
+            market,
+            state,
+            approved_id=f"risk:{candidate.candidate_id}",
+        )
+        if not risk.approved:
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason=";".join(risk.reason_codes),
+                payload={
+                    "candidate_id": candidate.candidate_id,
+                    "risk_decision_id": risk.risk_decision_id,
+                    "label": _PAPER_LABEL,
+                },
+            )
+            return (
+                False,
+                {
+                    "router_status": "ROUTED",
+                    "risk_decision_id": risk.risk_decision_id,
+                    "risk_approved": False,
+                    "risk_reasons": list(risk.reason_codes),
+                },
+                abstains,
+            )
+        plan = build_directional_paper_plan(
+            candidate,
+            market,
+            risk,
+            decision_id=f"decision:{candidate.candidate_id}",
+            quantity=pricing.filled_quantity,
+            limit_price=pricing.worst_price,
+            created_at=state.observed_at,
+        )
+        gateway = PaperGateway(self._paper_repository)
+        result = gateway.execute(
+            plan,
+            (
+                PaperFillEvidence(
+                    plan.intents[0].client_order_id,
+                    pricing.filled_quantity,
+                    pricing.vwap,
+                    pricing.total_fee_usdc,
+                    state.observed_at,
+                    state.observed_at,
+                ),
+            ),
+            now=state.observed_at,
+            kill_switch_active=False,
+            ledger_reconciled=True,
+        )
+        trade = self._paper_repository.save_trade_snapshot(
+            trade_id=plan.idempotency_key,
+            decision_id=plan.decision_id,
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            asset=market.asset.value,
+            horizon=market.horizon.value,
+            condition_id=market.condition_id,
+            side=selected_side.value,
+            status="OPEN" if result.fills else "ACKNOWLEDGED",
+            payload={
+                "asset": market.asset.value,
+                "horizon": market.horizon.value,
+                "condition_id": market.condition_id,
+                "side": selected_side.value,
+                "ptb": str(state.price_to_beat.value)
+                if state.price_to_beat is not None
+                else None,
+                "p_up": str(forecast.p_up) if forecast is not None else None,
+                "p_down": str(forecast.p_down) if forecast is not None else None,
+                "executable_cost": str(assessment.executable_cost),
+                "entry_vwap": str(pricing.vwap),
+                "fee": str(pricing.total_fee_usdc),
+                "net_edge": str(assessment.net_edge),
+                "stake": str(candidate.required_capital),
+                "shares": str(pricing.filled_quantity),
+                "model_version": forecast.model_version if forecast is not None else None,
+                "calibration_version": calibration_version,
+                "risk_decision_id": risk.risk_decision_id,
+                "risk_approved": True,
+                "fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
+                "position_status": "OPEN",
+                "real_order_submission": False,
+                "label": _PAPER_LABEL,
+            },
+            observed_at=state.observed_at,
+        )
+        return (
+            True,
+            {
+                "router_status": "ROUTED",
+                "risk_decision_id": risk.risk_decision_id,
+                "risk_approved": True,
+                "paper_trade_id": trade.trade_id,
+                "paper_fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
+            },
+            0,
+        )
 
     def _directional_pricing(
         self, state: ShadowMarketState
@@ -968,6 +1256,8 @@ class ShadowDaemon:
                 "official_reference_ready": state.official_reference is not None,
                 "proxy_reference_ready": state.proxy_reference is not None,
                 "book_ready": state.up_book is not None and state.down_book is not None,
+                "feature_vector": _feature_vector_payload(state.directional_features),
+                "price_to_beat": _price_to_beat_payload(state.price_to_beat),
                 "directional_reason": reason,
                 "model_state": model_status.state.value,
                 "label": _PAPER_LABEL,
@@ -1640,6 +1930,41 @@ def _risk_decision(
         assessed_at=state.observed_at,
         risk_decision_id=approved_id,
     )
+
+
+def _feature_vector_payload(features: FeatureVector | None) -> dict[str, object] | None:
+    if features is None:
+        return None
+    return {
+        "market_id": features.market_id,
+        "asset": features.asset.value,
+        "horizon": features.horizon.value,
+        "feature_set_version": features.feature_set_version,
+        "generated_at": features.generated_at.isoformat(),
+        "features": [
+            {
+                "name": item.name,
+                "value": str(item.value),
+                "source": item.source,
+                "source_ts": item.source_ts.isoformat(),
+            }
+            for item in features.features
+        ],
+    }
+
+
+def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object] | None:
+    if record is None:
+        return None
+    return {
+        "condition_id": record.condition_id,
+        "persistence_id": record.persistence_id,
+        "value": str(record.value),
+        "reference_id": record.reference.reference_id,
+        "reference_source": record.reference.source,
+        "effective_ts": record.reference.effective_ts.isoformat(),
+        "established_at": record.established_at.isoformat(),
+    }
 
 
 def _slug(bucket: MarketBucket, start: datetime) -> str:

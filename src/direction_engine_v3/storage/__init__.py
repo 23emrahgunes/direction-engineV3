@@ -2,6 +2,7 @@
 
 from direction_engine_v3.storage.directional_corpus import (
     DirectionalCorpusRecord,
+    DirectionalTrainingRecord,
     SQLiteDirectionalCorpusRepository,
 )
 from direction_engine_v3.storage.paper import (
@@ -13,6 +14,7 @@ from direction_engine_v3.storage.paper import (
 
 __all__ = [
     "DirectionalCorpusRecord",
+    "DirectionalTrainingRecord",
     "PaperAbstainRecord",
     "PaperTradeSnapshot",
     "SQLiteDirectionalCorpusRepository",

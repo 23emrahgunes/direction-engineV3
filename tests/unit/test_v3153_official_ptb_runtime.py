@@ -238,7 +238,7 @@ def test_daemon_passes_ready_ptb_past_official_unavailable_gate(tmp_path: Path) 
     assert isinstance(payload, dict)
     assert payload["ptb_status"] == "PTB_READY"
     assert payload["ptb_value"] == "60000"
-    assert payload["reason"] == "MODEL_UNAVAILABLE"
+    assert payload["reason"] == "EXECUTABLE_PRICE_UNAVAILABLE"
 
 
 class _NoopDataClient:

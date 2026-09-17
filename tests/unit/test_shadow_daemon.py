@@ -2,7 +2,16 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from direction_engine_v3.domain import Asset, Horizon, Market, MarketToken, OutcomeSide
+from direction_engine_v3.domain import (
+    Asset,
+    Horizon,
+    Market,
+    MarketToken,
+    OfficialReference,
+    OutcomeSide,
+    ProxyReference,
+)
+from direction_engine_v3.features import ExternalDirectionalSnapshot, build_directional_features
 from direction_engine_v3.market_data import (
     OFFICIAL_REFERENCE_SOURCES,
     DataSource,
@@ -12,6 +21,7 @@ from direction_engine_v3.market_data import (
     MarketDiscovery,
     PolymarketBook,
     PolymarketLevel,
+    PriceToBeatRecord,
     SettlementMetadata,
     SettlementMethod,
 )
@@ -67,11 +77,15 @@ def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) ->
     assert first.book_observations == 2
     assert first.strategy_evaluations >= 3
     assert first.abstain_records >= 11
-    assert first.paper_trades == 1
-    assert second.paper_trades == 1
-    assert len(paper.trades()) == 1
-    assert paper.trades()[0].label == "PAPER / SHADOW — NO REAL ORDER"
-    assert paper.summary()["open_positions"] == 1
+    assert first.paper_trades == 2
+    assert second.paper_trades == 2
+    trades = paper.trades()
+    assert len(trades) == 2
+    directional = next(item for item in trades if item.strategy == "DIRECTIONAL_EDGE")
+    assert directional.label == "PAPER / SHADOW — NO REAL ORDER"
+    assert directional.payload["model_version"] == "PAPER_RESEARCH_BASELINE"
+    assert directional.payload["real_order_submission"] is False
+    assert paper.summary()["open_positions"] == 2
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
 
 
@@ -137,4 +151,68 @@ def _market_state(bucket: MarketBucket) -> ShadowMarketState:
         Decimal("2"),
         lineage,
     )
-    return ShadowMarketState(bucket, discovery, up, down, fee, None, None, NOW)
+    official = OfficialReference(
+        "official-btc-5m",
+        market.market_id,
+        bucket.asset,
+        Decimal("60000"),
+        market.settlement_source,
+        NOW,
+        NOW,
+        NOW,
+        True,
+    )
+    proxy = ProxyReference(
+        "proxy-btc-5m",
+        market.market_id,
+        bucket.asset,
+        Decimal("60600"),
+        "BINANCE_PROXY",
+        NOW,
+        NOW,
+        NOW,
+    )
+    ptb = PriceToBeatRecord(
+        market.condition_id,
+        official,
+        NOW,
+        "ptb:btc:5m:condition-btc-5m",
+    )
+    features = build_directional_features(
+        market,
+        ptb,
+        ExternalDirectionalSnapshot(
+            proxy,
+            Decimal("0.010"),
+            Decimal("0.012"),
+            Decimal("0.010"),
+            Decimal("0.001"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0.20"),
+            Decimal("0.010"),
+            Decimal("0.20"),
+            Decimal("0.90"),
+            Decimal("0.05"),
+            Decimal("0.20"),
+            "BINANCE_EXTERNAL_FEATURES",
+            NOW,
+        ),
+        generated_at=NOW,
+        feature_set_version="v3.15.4-test-features",
+    )
+    return ShadowMarketState(
+        bucket,
+        discovery,
+        up,
+        down,
+        fee,
+        proxy,
+        official,
+        NOW,
+        price_to_beat=ptb,
+        directional_features=features,
+        ptb_status="PTB_READY",
+        ptb_reason="PTB_ESTABLISHED",
+        feature_status="FEATURES_READY",
+    )
