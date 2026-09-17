@@ -56,7 +56,7 @@ def test_deploy_workflow_uses_oidc_ssm_exact_sha_and_concurrency() -> None:
 def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidence() -> None:
     source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
-    assert "sleep 75" in source
+    assert "sleep 45" in source
     assert "PTB_READY_NOT_OBSERVED" not in source
     assert "BOUNDARY" not in source
     assert "24h" not in source.lower()
@@ -72,6 +72,12 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "direction-engine-v3-shadow.service" in source
     assert "direction-engine-v3-dashboard.service" in source
     assert "systemctl restart" in source
+    assert "CHAINLINK_RUNTIME_BLOCKED" in source
+    assert "CHAINLINK_ACCEPTED" in source
+    assert "chainlink_gate" in source
+    assert "parse_success_count" in source
+    assert "history_size" in source
+    assert "last_message_at" in source
 
 
 def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:

@@ -135,3 +135,35 @@ def test_asset_hint_isolates_malformed_feed_and_history_bound() -> None:
         }
         collector.handle_message(payload, asset_hint=Asset.BTC)
     assert collector.status().history_size_by_asset["BTC"] == 2
+
+
+def test_asset_hint_does_not_relabel_returned_symbol() -> None:
+    collector = ChainlinkTwapCollector(FanoutTransport(asyncio.Event()), Clock())
+    parsed = collector.handle_message(
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "update",
+            "timestamp": int(NOW.timestamp() * 1000),
+            "payload": {
+                "symbol": "eth/usd",
+                "window_s": 60,
+                "data": [
+                    {
+                        "timestamp": int(NOW.timestamp() * 1000),
+                        "value": "3000",
+                        "full_accuracy_value": "3000000000000000000000",
+                    }
+                ],
+            },
+        },
+        asset_hint=Asset.BTC,
+    )
+
+    status = collector.status().as_dict()
+    assert parsed == 1
+    assert status["history_size_by_asset"]["BTC"] == 0
+    assert status["history_size_by_asset"]["ETH"] == 1
+    assert status["per_asset"]["BTC"]["filter_mismatch_count"] == 1
+    assert status["per_asset"]["BTC"]["last_filter_status"] == "FILTER_MISMATCH"
+    assert status["per_asset"]["BTC"]["last_returned_symbol"] == "ETH/USD"
+    assert status["per_asset"]["ETH"]["last_filter_status"] == "ROUTED_BY_RETURNED_SYMBOL"

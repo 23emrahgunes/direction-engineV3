@@ -179,10 +179,11 @@ smoke_check() {
   systemctl is-active --quiet direction-engine-v3-shadow.service
   systemctl is-active --quiet direction-engine-v3-dashboard.service
   local restarts_before restarts_after cycles_before cycles_after cycle_ts_before cycle_ts_after
+  local chainlink_gate_status
   restarts_before="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
   cycles_before="$(cycle_count)"
   cycle_ts_before="$(latest_cycle_ts)"
-  sleep 75
+  sleep 45
   systemctl is-active --quiet direction-engine-v3-shadow.service
   systemctl is-active --quiet direction-engine-v3-dashboard.service
   restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
@@ -200,12 +201,54 @@ smoke_check() {
   curl -fsS http://127.0.0.1:8130/api/dashboard >/tmp/direction-engine-v3-dashboard.json
   curl -fsS http://127.0.0.1:8130/api/directional/status >/tmp/direction-engine-v3-directional.json
   grep -q "PAPER / SHADOW" /tmp/direction-engine-v3-dashboard.html
+  chainlink_gate_status="$(chainlink_gate)"
   run_ubuntu_python <<'PY'
 from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENABLED
 if APP_MODE != 'PAPER' or LIVE_TRADING_ENABLED or LIVE_AUTO_ARM:
     raise SystemExit('PAPER/LIVE safety defaults violated')
 PY
   write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after"
+  if [ "$chainlink_gate_status" != "CHAINLINK_ACCEPTED" ]; then
+    echo "Chainlink runtime functional acceptance failed: $chainlink_gate_status" >&2
+    exit 22
+  fi
+}
+
+chainlink_gate() {
+  "$PY" - /tmp/direction-engine-v3-directional.json /tmp/direction-engine-v3-chainlink-gate.json <<'PY'
+import json
+import sys
+from pathlib import Path
+
+directional_path, gate_path = sys.argv[1:]
+payload = json.loads(Path(directional_path).read_text(encoding='utf-8'))
+buckets = payload.get('buckets', []) if isinstance(payload, dict) else []
+collector = next((item.get('chainlink') for item in buckets if isinstance(item, dict) and item.get('chainlink')), {})
+per_asset = collector.get('per_asset', {}) if isinstance(collector, dict) else {}
+required = ('BTC', 'ETH', 'SOL', 'XRP')
+failures = []
+for asset in required:
+    state = per_asset.get(asset, {}) if isinstance(per_asset, dict) else {}
+    if state.get('connection') != 'connected':
+        failures.append(f'{asset}:connection={state.get("connection")}')
+    if state.get('subscription_status') != 'SUBSCRIBED':
+        failures.append(f'{asset}:subscription_status={state.get("subscription_status")}')
+    if int(state.get('parse_success_count') or 0) <= 0:
+        failures.append(f'{asset}:parse_success_count={state.get("parse_success_count")}')
+    if int(state.get('history_size') or 0) <= 0:
+        failures.append(f'{asset}:history_size={state.get("history_size")}')
+    if state.get('last_message_at') is None:
+        failures.append(f'{asset}:last_message_at=null')
+status = 'CHAINLINK_ACCEPTED' if not failures else 'CHAINLINK_RUNTIME_BLOCKED'
+result = {
+    'status': status,
+    'required_assets': list(required),
+    'failures': failures,
+    'per_asset': per_asset,
+}
+Path(gate_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding='utf-8')
+print(status)
+PY
 }
 
 write_result() {
@@ -227,6 +270,7 @@ def read_json(path: str) -> object:
         return {'read_error': type(exc).__name__}
 
 directional = read_json('/tmp/direction-engine-v3-directional.json')
+chainlink_gate = read_json('/tmp/direction-engine-v3-chainlink-gate.json')
 buckets = directional.get('buckets', []) if isinstance(directional, dict) else []
 ptb_ready = [
     {
@@ -239,9 +283,16 @@ ptb_ready = [
     if isinstance(item, dict) and item.get('ptb_status') == 'PTB_READY'
 ]
 collector = next((item for item in buckets if isinstance(item, dict) and item.get('chainlink')), {})
+chainlink_gate_status = (
+    chainlink_gate.get('status')
+    if isinstance(chainlink_gate, dict)
+    else 'CHAINLINK_RUNTIME_BLOCKED'
+)
 result = {
     'generated_at': datetime.now(timezone.utc).isoformat(),
-    'status': 'DEPLOY_PAPER_ACCEPTED',
+    'status': 'DEPLOY_PAPER_ACCEPTED'
+    if chainlink_gate_status == 'CHAINLINK_ACCEPTED'
+    else 'CHAINLINK_RUNTIME_BLOCKED',
     'deployed_sha': expected_sha,
     'app_mode': 'PAPER',
     'live_trading_enabled': False,
@@ -254,6 +305,7 @@ result = {
     'latest_cycle_before': tb,
     'latest_cycle_after': ta,
     'chainlink': collector.get('chainlink') if isinstance(collector, dict) else {},
+    'chainlink_gate': chainlink_gate,
     'binance_hourly': collector.get('binance_hourly') if isinstance(collector, dict) else {},
     'ptb_ready_if_present': ptb_ready,
 }

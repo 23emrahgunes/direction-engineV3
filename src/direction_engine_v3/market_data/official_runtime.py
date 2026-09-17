@@ -10,7 +10,7 @@ from decimal import Decimal
 from direction_engine_v3.adapters.chainlink.rtds import (
     RTDS_HEARTBEAT_SECONDS,
     RTDS_WS_URL,
-    parse_twap,
+    parse_twap_from_symbol,
     twap_subscription,
 )
 from direction_engine_v3.adapters.public_transport import PublicTransport
@@ -131,6 +131,10 @@ class _AssetCollectorState:
     last_source_timestamp: datetime | None = None
     latest_twap: ChainlinkTwap | None = None
     last_error: str | None = None
+    filter_match_count: int = 0
+    filter_mismatch_count: int = 0
+    last_filter_status: str = "NO_DATA"
+    last_returned_symbol: str | None = None
 
 
 class ChainlinkTwapCollector:
@@ -217,32 +221,40 @@ class ChainlinkTwapCollector:
 
         parsed = 0
         for payload in _iter_rtds_payloads(raw):
-            assets = (asset_hint,) if asset_hint is not None else self._assets
-            for asset in assets:
+            intended_asset = asset_hint
+            try:
                 recv_ts = self._clock.utc_now()
-                try:
-                    twap = parse_twap(
-                        payload,
-                        asset=asset,
-                        window_seconds=60,
-                        recv_ts=recv_ts,
-                        normalized_ts=self._clock.utc_now(),
-                        recv_monotonic_ns=self._clock.monotonic_ns(),
-                    )
-                except MarketDataSchemaError as exc:
-                    state = self._asset_state[asset]
-                    state.parse_failure_count += 1
-                    state.last_error = str(exc)[:500]
-                    self._parse_failure_count += 1
-                    continue
-                self._record(twap)
-                state = self._asset_state[asset]
-                state.message_count += 1
-                state.parse_success_count += 1
-                state.last_message_at = self._clock.utc_now()
-                state.last_error = None
-                parsed += 1
-                break
+                twap = parse_twap_from_symbol(
+                    payload,
+                    window_seconds=60,
+                    recv_ts=recv_ts,
+                    normalized_ts=self._clock.utc_now(),
+                    recv_monotonic_ns=self._clock.monotonic_ns(),
+                )
+            except MarketDataSchemaError as exc:
+                self._record_parse_failure(intended_asset, exc)
+                continue
+            self._record(twap)
+            state = self._asset_state[twap.asset]
+            state.message_count += 1
+            state.parse_success_count += 1
+            state.last_message_at = self._clock.utc_now()
+            state.last_error = None
+            state.last_returned_symbol = f"{twap.asset.value}/USD"
+            if intended_asset is None or intended_asset is twap.asset:
+                state.filter_match_count += 1
+                state.last_filter_status = "FILTER_MATCH"
+            else:
+                intended_state = self._asset_state[intended_asset]
+                intended_state.filter_mismatch_count += 1
+                intended_state.last_filter_status = "FILTER_MISMATCH"
+                intended_state.last_returned_symbol = f"{twap.asset.value}/USD"
+                intended_state.last_error = (
+                    f"FILTER_MISMATCH:intended={intended_asset.value}:"
+                    f"returned={twap.asset.value}"
+                )
+                state.last_filter_status = "ROUTED_BY_RETURNED_SYMBOL"
+            parsed += 1
         if parsed:
             self._message_count += parsed
             self._parse_success_count += parsed
@@ -286,6 +298,10 @@ class ChainlinkTwapCollector:
                 if state.latest_twap is not None
                 else None,
                 "last_error": state.last_error,
+                "filter_match_count": state.filter_match_count,
+                "filter_mismatch_count": state.filter_mismatch_count,
+                "last_filter_status": state.last_filter_status,
+                "last_returned_symbol": state.last_returned_symbol,
             }
             for asset, state in self._asset_state.items()
         }
@@ -342,6 +358,18 @@ class ChainlinkTwapCollector:
             history[-1].publisher_ts != twap.publisher_ts or history[-1].value != twap.value
         ):
             history.append(twap)
+
+    def _record_parse_failure(
+        self,
+        intended_asset: Asset | None,
+        exc: MarketDataSchemaError,
+    ) -> None:
+        targets = (intended_asset,) if intended_asset is not None else self._assets
+        for asset in targets:
+            state = self._asset_state[asset]
+            state.parse_failure_count += 1
+            state.last_error = str(exc)[:500]
+        self._parse_failure_count += 1
 
 
 class BinanceHourlyOfficialCollector:

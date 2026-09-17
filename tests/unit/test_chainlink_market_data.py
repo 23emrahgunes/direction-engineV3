@@ -3,7 +3,12 @@ from decimal import Decimal
 
 import pytest
 
-from direction_engine_v3.adapters.chainlink import parse_twap, twap_subscription
+from direction_engine_v3.adapters.chainlink import (
+    inspect_twap_frame,
+    parse_twap,
+    parse_twap_from_symbol,
+    twap_subscription,
+)
 from direction_engine_v3.domain import Asset
 from direction_engine_v3.market_data import MarketDataSchemaError
 
@@ -89,6 +94,41 @@ def test_verified_live_twap60_envelope_is_normalized(asset: Asset) -> None:
     assert twap.window_seconds == 60
     assert twap.value == Decimal("60123.45")
     assert twap.publisher_ts != twap.lineage.source_ts
+
+
+def test_twap_asset_can_be_derived_from_returned_symbol() -> None:
+    raw = {
+        "topic": "crypto_prices_twap_sixty",
+        "type": "update",
+        "timestamp": 1789473600500,
+        "payload": {
+            "symbol": "eth/usd",
+            "window_s": 60,
+            "data": [
+                {
+                    "timestamp": 1789473600123,
+                    "value": "3000.25",
+                    "full_accuracy_value": "3000250000000000000000",
+                }
+            ],
+        },
+    }
+
+    frame = inspect_twap_frame(raw, window_seconds=60)
+    twap = parse_twap_from_symbol(
+        raw,
+        window_seconds=60,
+        recv_ts=RECV,
+        normalized_ts=RECV,
+        recv_monotonic_ns=101,
+    )
+
+    assert frame.asset is Asset.ETH
+    assert frame.symbol == "ETH/USD"
+    assert frame.data_item_count == 1
+    assert frame.data_item_keys == ("full_accuracy_value", "timestamp", "value")
+    assert twap.asset is Asset.ETH
+    assert twap.value == Decimal("3000.25")
 
 
 def test_verified_twap_rejects_missing_or_ambiguous_data() -> None:

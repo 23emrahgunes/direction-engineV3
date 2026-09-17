@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from direction_engine_v3.diagnostics.bucket_pipeline_probe import _ptb_diagnostic_fields
+from direction_engine_v3.diagnostics.chainlink_fanout_probe import _sanitize_frame
 from direction_engine_v3.diagnostics.rtds_probe import (
     sanitize_message_shape,
     subscription_for,
@@ -71,7 +72,7 @@ def test_chainlink_status_records_parse_counts_and_source_timestamp() -> None:
     status = collector.status().as_dict()
     assert status["selected_topic"] == "crypto_prices_twap_sixty"
     assert status["parse_success_count"] == 1
-    assert status["parse_failure_count"] == 4
+    assert status["parse_failure_count"] == 1
     assert status["message_count"] == 1
     assert status["last_source_timestamp"] == NOW.isoformat()
     assert status["latest_twap_by_asset"] == {"BTC": "60000"}
@@ -84,4 +85,42 @@ def test_bucket_probe_distinguishes_unwired_official_service() -> None:
     assert result == {
         "official_service_wired": False,
         "ptb_diagnostic_status": "OFFICIAL_SERVICE_NOT_WIRED",
+    }
+
+
+def test_chainlink_fanout_probe_sanitizes_frame_and_reports_filter_mismatch() -> None:
+    evidence = _sanitize_frame(
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "update",
+            "timestamp": int(NOW.timestamp() * 1000),
+            "payload": {
+                "symbol": "eth/usd",
+                "window_s": 60,
+                "api_secret": "must-not-leak",
+                "data": [
+                    {
+                        "timestamp": int(NOW.timestamp() * 1000),
+                        "value": "3000",
+                        "full_accuracy_value": "3000000000000000000000",
+                    }
+                ],
+            },
+        },
+        intended_asset=Asset.BTC,
+        clock=FakeClock(),
+    )
+
+    assert evidence == {
+        "intended_asset": "BTC",
+        "returned_topic": "crypto_prices_twap_sixty",
+        "returned_type": "update",
+        "returned_symbol": "eth/usd",
+        "returned_asset": "ETH",
+        "payload_keys": ["data", "symbol", "window_s"],
+        "data_item_count": 1,
+        "data_item_keys": ["full_accuracy_value", "timestamp", "value"],
+        "window_s": 60,
+        "parse_error": None,
+        "filter_status": "FILTER_MISMATCH",
     }

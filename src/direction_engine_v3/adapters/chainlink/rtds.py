@@ -1,6 +1,7 @@
 """Polymarket RTDS translation for Chainlink crypto TWAP messages."""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Final
@@ -27,6 +28,18 @@ _TOPICS: Final = {30: "crypto_prices_twap_thirty", 60: "crypto_prices_twap_sixty
 _SCALE: Final = Decimal(10) ** 18
 
 
+@dataclass(frozen=True, slots=True)
+class ChainlinkTwapFrame:
+    asset: Asset
+    topic: str
+    message_type: str
+    symbol: str
+    payload_keys: tuple[str, ...]
+    data_item_count: int | None
+    data_item_keys: tuple[str, ...]
+    window_s: int | None
+
+
 def twap_subscription(asset: Asset, *, window_seconds: int) -> dict[str, object]:
     if window_seconds not in _TOPICS:
         raise ValueError("window_seconds must be 30 or 60")
@@ -40,6 +53,69 @@ def twap_subscription(asset: Asset, *, window_seconds: int) -> dict[str, object]
             }
         ],
     }
+
+
+def inspect_twap_frame(raw: object, *, window_seconds: int) -> ChainlinkTwapFrame:
+    """Validate the RTDS TWAP envelope and derive the authoritative asset."""
+
+    payload = require_object(raw)
+    if window_seconds not in _TOPICS:
+        raise ValueError("window_seconds must be 30 or 60")
+    topic = require_str(payload, "topic")
+    if topic != _TOPICS[window_seconds]:
+        raise MarketDataSchemaError("unexpected Chainlink TWAP topic")
+    message_type = require_str(payload, "type")
+    if message_type != "update":
+        raise MarketDataSchemaError("unexpected Chainlink TWAP message type")
+    envelope = require_object(payload.get("payload"), "payload")
+    symbol = require_str(envelope, "symbol").replace("-", "/").upper()
+    asset = _asset_from_symbol(symbol)
+    window_s = require_int(envelope, "window_s") if "window_s" in envelope else None
+    if window_s is not None and window_s != window_seconds:
+        raise MarketDataSchemaError("unexpected Chainlink TWAP window")
+    data_item_count: int | None = None
+    data_item_keys: tuple[str, ...] = ()
+    if "data" in envelope:
+        raw_data = envelope.get("data")
+        if isinstance(raw_data, Mapping):
+            data_item_count = 1
+            data_item_keys = _sorted_keys(raw_data)
+        else:
+            values = require_sequence(raw_data, "data")
+            data_item_count = len(values)
+            if len(values) == 1:
+                data_item_keys = _sorted_keys(require_object(values[0], "data[0]"))
+    return ChainlinkTwapFrame(
+        asset=asset,
+        topic=topic,
+        message_type=message_type,
+        symbol=symbol,
+        payload_keys=_sorted_keys(envelope),
+        data_item_count=data_item_count,
+        data_item_keys=data_item_keys,
+        window_s=window_s,
+    )
+
+
+def parse_twap_from_symbol(
+    raw: object,
+    *,
+    window_seconds: int,
+    recv_ts: datetime,
+    normalized_ts: datetime,
+    recv_monotonic_ns: int,
+) -> ChainlinkTwap:
+    """Parse a TWAP using the validated returned symbol as asset identity."""
+
+    frame = inspect_twap_frame(raw, window_seconds=window_seconds)
+    return parse_twap(
+        raw,
+        asset=frame.asset,
+        window_seconds=window_seconds,
+        recv_ts=recv_ts,
+        normalized_ts=normalized_ts,
+        recv_monotonic_ns=recv_monotonic_ns,
+    )
 
 
 def parse_twap(
@@ -91,6 +167,17 @@ def parse_twap(
             recv_monotonic_ns=recv_monotonic_ns,
         ),
     )
+
+
+def _asset_from_symbol(symbol: str) -> Asset:
+    for asset in Asset:
+        if symbol == f"{asset.value}/USD":
+            return asset
+    raise MarketDataSchemaError("unsupported Chainlink TWAP symbol")
+
+
+def _sorted_keys(value: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(sorted(str(key) for key in value))
 
 
 def _normalize_twap_record(
