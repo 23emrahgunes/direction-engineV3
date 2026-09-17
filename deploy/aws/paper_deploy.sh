@@ -179,7 +179,8 @@ smoke_check() {
   systemctl is-active --quiet direction-engine-v3-shadow.service
   systemctl is-active --quiet direction-engine-v3-dashboard.service
   local restarts_before restarts_after cycles_before cycles_after cycle_ts_before cycle_ts_after
-  local chainlink_gate_status
+  local chainlink_gate_status smoke_started_at
+  smoke_started_at="$(date -u +%FT%TZ)"
   restarts_before="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
   cycles_before="$(cycle_count)"
   cycle_ts_before="$(latest_cycle_ts)"
@@ -201,13 +202,13 @@ smoke_check() {
   curl -fsS http://127.0.0.1:8130/api/dashboard >/tmp/direction-engine-v3-dashboard.json
   curl -fsS http://127.0.0.1:8130/api/directional/status >/tmp/direction-engine-v3-directional.json
   grep -q "PAPER / SHADOW" /tmp/direction-engine-v3-dashboard.html
-  chainlink_gate_status="$(chainlink_gate)"
+  chainlink_gate_status="$(chainlink_gate "$smoke_started_at")"
   run_ubuntu_python <<'PY'
 from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENABLED
 if APP_MODE != 'PAPER' or LIVE_TRADING_ENABLED or LIVE_AUTO_ARM:
     raise SystemExit('PAPER/LIVE safety defaults violated')
 PY
-  write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after"
+  write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at"
   if [ "$chainlink_gate_status" != "CHAINLINK_ACCEPTED" ]; then
     echo "Chainlink runtime functional acceptance failed: $chainlink_gate_status" >&2
     exit 22
@@ -215,17 +216,84 @@ PY
 }
 
 chainlink_gate() {
-  "$PY" - /tmp/direction-engine-v3-directional.json /tmp/direction-engine-v3-chainlink-gate.json <<'PY'
+  local smoke_started_at="$1"
+  "$PY" - /tmp/direction-engine-v3-directional.json /tmp/direction-engine-v3-chainlink-gate.json "$smoke_started_at" <<'PY'
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-directional_path, gate_path = sys.argv[1:]
+directional_path, gate_path, smoke_started_at_raw = sys.argv[1:]
+
+def parse_timestamp(raw):
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        value = raw.replace('Z', '+00:00')
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+smoke_started_at = parse_timestamp(smoke_started_at_raw)
+if smoke_started_at is None:
+    raise SystemExit(f'invalid smoke start timestamp: {smoke_started_at_raw!r}')
 payload = json.loads(Path(directional_path).read_text(encoding='utf-8'))
 buckets = payload.get('buckets', []) if isinstance(payload, dict) else []
-collector = next((item.get('chainlink') for item in buckets if isinstance(item, dict) and item.get('chainlink')), {})
-per_asset = collector.get('per_asset', {}) if isinstance(collector, dict) else {}
+fresh_candidates = []
+stale_candidates = []
+for item in buckets:
+    if not isinstance(item, dict) or not item.get('chainlink'):
+        continue
+    observed_raw = (
+        item.get('latest_observed_at')
+        or item.get('pipeline_observed_at')
+        or item.get('last_observed_at')
+    )
+    observed_at = parse_timestamp(observed_raw)
+    if observed_at is not None and observed_at >= smoke_started_at:
+        fresh_candidates.append((observed_at, item))
+    else:
+        stale_candidates.append(
+            {
+                'asset': item.get('asset'),
+                'horizon': item.get('horizon'),
+                'observed_at': observed_raw,
+            }
+        )
+if not fresh_candidates:
+    result = {
+        'status': 'WAITING_FOR_FRESH_PIPELINE_EVIDENCE',
+        'smoke_started_at': smoke_started_at_raw,
+        'stale_candidates': stale_candidates,
+    }
+    Path(gate_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding='utf-8')
+    print(result['status'])
+    raise SystemExit(0)
 required = ('BTC', 'ETH', 'SOL', 'XRP')
+fresh_assets = {
+    str(item.get('asset'))
+    for _observed_at, item in fresh_candidates
+    if item.get('asset') is not None
+}
+missing_fresh_assets = [asset for asset in required if asset not in fresh_assets]
+if missing_fresh_assets:
+    result = {
+        'status': 'WAITING_FOR_FRESH_PIPELINE_EVIDENCE',
+        'smoke_started_at': smoke_started_at_raw,
+        'missing_fresh_assets': missing_fresh_assets,
+        'fresh_assets': sorted(fresh_assets),
+        'stale_candidates': stale_candidates,
+    }
+    Path(gate_path).write_text(json.dumps(result, indent=2, sort_keys=True), encoding='utf-8')
+    print(result['status'])
+    raise SystemExit(0)
+fresh_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+fresh_bucket = fresh_candidates[0][1]
+collector = fresh_bucket.get('chainlink', {})
+per_asset = collector.get('per_asset', {}) if isinstance(collector, dict) else {}
 failures = []
 for asset in required:
     state = per_asset.get(asset, {}) if isinstance(per_asset, dict) else {}
@@ -239,9 +307,24 @@ for asset in required:
         failures.append(f'{asset}:history_size={state.get("history_size")}')
     if state.get('last_message_at') is None:
         failures.append(f'{asset}:last_message_at=null')
+    if int(state.get('subscription_snapshot_count') or 0) < 1:
+        failures.append(
+            f'{asset}:subscription_snapshot_count={state.get("subscription_snapshot_count")}'
+        )
+    if not state.get('last_frame_class'):
+        failures.append(f'{asset}:last_frame_class={state.get("last_frame_class")}')
 status = 'CHAINLINK_ACCEPTED' if not failures else 'CHAINLINK_RUNTIME_BLOCKED'
 result = {
     'status': status,
+    'smoke_started_at': smoke_started_at_raw,
+    'fresh_observed_at': fresh_candidates[0][0].isoformat(),
+    'fresh_bucket': {
+        'asset': fresh_bucket.get('asset'),
+        'horizon': fresh_bucket.get('horizon'),
+        'latest_observed_at': fresh_bucket.get('latest_observed_at'),
+        'pipeline_observed_at': fresh_bucket.get('pipeline_observed_at'),
+        'last_observed_at': fresh_bucket.get('last_observed_at'),
+    },
     'required_assets': list(required),
     'failures': failures,
     'per_asset': per_asset,
@@ -255,13 +338,14 @@ write_result() {
   STAGE="write-result"
   local restarts_before="$1" restarts_after="$2" cycles_before="$3" cycles_after="$4"
   local cycle_ts_before="$5" cycle_ts_after="$6"
-  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" <<'PY'
+  local smoke_started_at="$7"
+  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-path, expected_sha, rb, ra, cb, ca, tb, ta = sys.argv[1:]
+path, expected_sha, rb, ra, cb, ca, tb, ta, smoke_started_at = sys.argv[1:]
 
 def read_json(path: str) -> object:
     try:
@@ -288,12 +372,16 @@ chainlink_gate_status = (
     if isinstance(chainlink_gate, dict)
     else 'CHAINLINK_RUNTIME_BLOCKED'
 )
+deploy_status = (
+    'DEPLOY_PAPER_ACCEPTED'
+    if chainlink_gate_status == 'CHAINLINK_ACCEPTED'
+    else chainlink_gate_status
+)
 result = {
     'generated_at': datetime.now(timezone.utc).isoformat(),
-    'status': 'DEPLOY_PAPER_ACCEPTED'
-    if chainlink_gate_status == 'CHAINLINK_ACCEPTED'
-    else 'CHAINLINK_RUNTIME_BLOCKED',
+    'status': deploy_status,
     'deployed_sha': expected_sha,
+    'smoke_started_at': smoke_started_at,
     'app_mode': 'PAPER',
     'live_trading_enabled': False,
     'live_auto_arm': False,

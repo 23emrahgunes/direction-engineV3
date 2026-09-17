@@ -67,6 +67,35 @@ def test_shadow_repository_is_idempotent_and_append_only(tmp_path) -> None:
     assert repository.event_counts() == {"COLLECTOR_STARTED": 1}
 
 
+def test_shadow_repository_latest_events_returns_newest_first(tmp_path) -> None:
+    repository = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="old",
+        window_id="window",
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        payload={"version": "old"},
+        observed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+    )
+    repository.append_event(
+        event_id="new",
+        window_id="window",
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        payload={"version": "new"},
+        observed_at=datetime(2026, 9, 15, 12, 1, tzinfo=UTC),
+    )
+
+    events = repository.latest_events(
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        limit=10,
+    )
+
+    assert [event["event_id"] for event in events] == ["new", "old"]
+
+
 def test_write_reports_is_deterministic_and_machine_readable(tmp_path) -> None:
     summary = build_shadow_summary(evidence_window=_window(), generated_at=_window().started_at)
 

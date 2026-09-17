@@ -191,6 +191,127 @@ async def _assert_pipeline_failure_is_visible() -> None:
     assert bucket["ptb_status"] == "PTB_READY"
 
 
+def test_directional_status_preserves_newest_pipeline_event_and_schema_fields(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="pipeline-old",
+        window_id="window",
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        payload={
+            "latest_observed_at": "2026-09-15T12:00:00+00:00",
+            "fee_status": "FAILED",
+            "fee_error": "OLD_SCHEMA",
+            "ptb_status": "PTB_UNAVAILABLE",
+            "chainlink": {
+                "per_asset": {
+                    "BTC": {
+                        "parse_success_count": 0,
+                        "history_size": 0,
+                    }
+                }
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+    )
+    repository.append_event(
+        event_id="pipeline-new",
+        window_id="window",
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        payload={
+            "latest_observed_at": "2026-09-15T12:02:00+00:00",
+            "fee_status": "READY",
+            "ptb_status": "PTB_READY",
+            "chainlink": {
+                "per_asset": {
+                    "BTC": {
+                        "parse_success_count": 4,
+                        "history_size": 4,
+                        "subscription_snapshot_count": 1,
+                        "last_frame_class": "LIVE_UPDATE",
+                    }
+                }
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 2, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_newest_pipeline_event_is_visible())
+
+
+def test_directional_status_preserves_newest_strategy_event(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="strategy-old",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "OLD_REASON",
+            "model_state": "OLD_MODEL_STATE",
+        },
+        observed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+    )
+    repository.append_event(
+        event_id="strategy-new",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "MODEL_UNAVAILABLE",
+            "model_state": "TRAINING_CORPUS_REQUIRED",
+        },
+        observed_at=datetime(2026, 9, 15, 12, 2, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_newest_strategy_event_is_visible())
+
+
+async def _assert_newest_pipeline_event_is_visible() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["latest_observed_at"] == "2026-09-15T12:02:00+00:00"
+    assert bucket["fee_status"] == "READY"
+    assert bucket["fee_error"] is None
+    assert bucket["ptb_status"] == "PTB_READY"
+    btc_status = bucket["chainlink"]["per_asset"]["BTC"]
+    assert btc_status["parse_success_count"] == 4
+    assert btc_status["subscription_snapshot_count"] == 1
+    assert btc_status["last_frame_class"] == "LIVE_UPDATE"
+
+
+async def _assert_newest_strategy_event_is_visible() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["last_abstain_reason"] == "MODEL_UNAVAILABLE"
+    assert bucket["model_state"] == "TRAINING_CORPUS_REQUIRED"
+
+
 async def _assert_directional_status_contains_feed_health() -> None:
     app = create_app()
     client = TestClient(TestServer(app))

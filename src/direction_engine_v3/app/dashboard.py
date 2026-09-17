@@ -241,14 +241,17 @@ def build_directional_runtime_status() -> dict[str, object]:
         if event["bucket_key"] is None or not isinstance(payload_obj, dict):
             continue
         payload = dict(payload_obj)
-        if payload.get("strategy") == "DIRECTIONAL_EDGE":
-            by_bucket[str(event["bucket_key"])] = event
+        bucket_key = str(event["bucket_key"])
+        if payload.get("strategy") == "DIRECTIONAL_EDGE" and bucket_key not in by_bucket:
+            by_bucket[bucket_key] = event
     pipeline_by_bucket: dict[str, dict[str, object]] = {}
     for event in pipeline_events:
         payload_obj = event.get("payload")
         if event["bucket_key"] is None or not isinstance(payload_obj, dict):
             continue
-        pipeline_by_bucket[str(event["bucket_key"])] = event
+        bucket_key = str(event["bucket_key"])
+        if bucket_key not in pipeline_by_bucket:
+            pipeline_by_bucket[bucket_key] = event
     buckets = []
     for bucket in SUPPORTED_MARKET_BUCKETS:
         bucket_key = f"{bucket.asset.value}-{bucket.horizon.value}"
@@ -260,6 +263,11 @@ def build_directional_runtime_status() -> dict[str, object]:
         pipeline_payload = (
             dict(pipeline_payload_obj) if isinstance(pipeline_payload_obj, dict) else {}
         )
+        strategy_observed_at = latest["observed_at"] if latest is not None else None
+        pipeline_observed_at = (
+            latest_pipeline["observed_at"] if latest_pipeline is not None else None
+        )
+        latest_observed_at = pipeline_payload.get("latest_observed_at", pipeline_observed_at)
         trades = paper.trades(
             asset=bucket.asset.value,
             horizon=bucket.horizon.value,
@@ -271,7 +279,9 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "asset": bucket.asset.value,
                 "horizon": bucket.horizon.value,
                 "state": _directional_bucket_state(payload | pipeline_payload),
-                "latest_observed_at": pipeline_payload.get("latest_observed_at"),
+                "latest_observed_at": latest_observed_at,
+                "pipeline_observed_at": pipeline_observed_at,
+                "strategy_observed_at": strategy_observed_at,
                 "discovery_status": pipeline_payload.get("discovery_status", "UNKNOWN"),
                 "discovery_error": pipeline_payload.get("discovery_error"),
                 "book_status": pipeline_payload.get("book_status", "UNKNOWN"),
@@ -309,10 +319,7 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "pipeline_stages": pipeline_payload.get("pipeline_stages", ()),
                 "last_decision": payload.get("action", "ABSTAIN"),
                 "last_abstain_reason": payload.get("reason", "NO_RUNTIME_EVIDENCE"),
-                "last_observed_at": pipeline_payload.get(
-                    "latest_observed_at",
-                    latest["observed_at"] if latest is not None else None,
-                ),
+                "last_observed_at": latest_observed_at or strategy_observed_at,
                 "last_paper_trade": _trade_as_dict(trades[0]) if trades else None,
                 "evidence_sample_count": payload.get("corpus_sample_count", 0),
                 "p_up": None,

@@ -74,10 +74,31 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "systemctl restart" in source
     assert "CHAINLINK_RUNTIME_BLOCKED" in source
     assert "CHAINLINK_ACCEPTED" in source
+    assert "WAITING_FOR_FRESH_PIPELINE_EVIDENCE" in source
     assert "chainlink_gate" in source
+    assert 'chainlink_gate "$smoke_started_at"' in source
     assert "parse_success_count" in source
     assert "history_size" in source
     assert "last_message_at" in source
+    assert "subscription_snapshot_count" in source
+    assert "last_frame_class" in source
+
+
+def test_deploy_chainlink_gate_requires_fresh_current_schema_evidence() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "smoke_started_at=\"$(date -u +%FT%TZ)\"" in source
+    assert "observed_at >= smoke_started_at" in source
+    assert "fresh_candidates" in source
+    assert "missing_fresh_assets" in source
+    assert "WAITING_FOR_FRESH_PIPELINE_EVIDENCE" in source
+    assert "latest_observed_at" in source
+    assert "pipeline_observed_at" in source
+    assert "last_observed_at" in source
+    assert "subscription_snapshot_count" in source
+    assert "last_frame_class" in source
+    assert "subscription_snapshot_count') or 0) < 1" in source
+    assert "not state.get('last_frame_class')" in source
 
 
 def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:
