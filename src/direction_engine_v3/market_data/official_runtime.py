@@ -3,7 +3,7 @@
 import asyncio
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -58,6 +58,7 @@ class ChainlinkCollectorStatus:
     history_size_by_asset: Mapping[str, int]
     latest_twap_by_asset: Mapping[str, str]
     last_error: str | None
+    per_asset: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -77,6 +78,7 @@ class ChainlinkCollectorStatus:
             "history_size_by_asset": dict(self.history_size_by_asset),
             "latest_twap_by_asset": dict(self.latest_twap_by_asset),
             "last_error": self.last_error,
+            "per_asset": {asset: dict(status) for asset, status in self.per_asset.items()},
         }
 
 
@@ -117,6 +119,20 @@ class PriceToBeatResolution:
         return self.price_to_beat is not None
 
 
+@dataclass(slots=True)
+class _AssetCollectorState:
+    connected: bool = False
+    subscription_status: str = "NOT_STARTED"
+    reconnect_count: int = 0
+    message_count: int = 0
+    parse_success_count: int = 0
+    parse_failure_count: int = 0
+    last_message_at: datetime | None = None
+    last_source_timestamp: datetime | None = None
+    latest_twap: ChainlinkTwap | None = None
+    last_error: str | None = None
+
+
 class ChainlinkTwapCollector:
     """Persistent RTDS 60s-TWAP collector with bounded per-asset history."""
 
@@ -134,57 +150,75 @@ class ChainlinkTwapCollector:
         self._transport = transport
         self._clock = clock
         self._assets = tuple(assets)
+        if not self._assets or len(set(self._assets)) != len(self._assets):
+            raise ValueError("assets must be a non-empty unique sequence")
         self._history: dict[Asset, deque[ChainlinkTwap]] = {
             asset: deque(maxlen=history_limit) for asset in self._assets
         }
         self._latest: dict[Asset, ChainlinkTwap] = {}
         self._retry_policy = retry_policy or RetryPolicy(max_attempts=8)
-        self._connected = False
-        self._reconnect_count = 0
         self._message_count = 0
         self._parse_success_count = 0
         self._parse_failure_count = 0
         self._last_message_at: datetime | None = None
-        self._last_source_timestamp: datetime | None = None
         self._last_error: str | None = None
         self._subscription_status = "NOT_STARTED"
+        self._asset_state: dict[Asset, _AssetCollectorState] = {
+            asset: _AssetCollectorState() for asset in self._assets
+        }
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Run until stopped; retry transport errors with bounded backoff."""
+        """Run independent bounded RTDS subscriptions until stopped."""
 
+        tasks = [
+            asyncio.create_task(self._run_asset(asset, stop_event), name=f"chainlink-{asset.value}")
+            for asset in self._assets
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_asset(self, asset: Asset, stop_event: asyncio.Event) -> None:
+        state = self._asset_state[asset]
         while not stop_event.is_set():
             try:
-                self._connected = True
-                subscription = _combined_twap_subscription(self._assets)
-                self._subscription_status = "SUBSCRIBED"
+                state.connected = True
+                state.subscription_status = "SUBSCRIBED"
                 async for raw in self._transport.resilient_websocket_json(
                     RTDS_WS_URL,
-                    subscription=subscription,
+                    subscription=twap_subscription(asset, window_seconds=60),
                     text_heartbeat_seconds=RTDS_HEARTBEAT_SECONDS,
                     retry_policy=self._retry_policy,
                 ):
                     if stop_event.is_set():
                         break
-                    self.handle_message(raw)
+                    self.handle_message(raw, asset_hint=asset)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                self._subscription_status = "ERROR"
-                self._reconnect_count += 1
+                state.last_error = f"{type(exc).__name__}: {exc}"[:500]
+                state.subscription_status = "ERROR"
+                state.reconnect_count += 1
+            finally:
+                state.connected = False
+            if not stop_event.is_set():
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=5.0)
                 except TimeoutError:
                     continue
-            finally:
-                self._connected = False
 
-    def handle_message(self, raw: object) -> int:
+    def handle_message(self, raw: object, *, asset_hint: Asset | None = None) -> int:
         """Parse one RTDS message and record every valid supported 60s TWAP."""
 
         parsed = 0
         for payload in _iter_rtds_payloads(raw):
-            for asset in self._assets:
+            assets = (asset_hint,) if asset_hint is not None else self._assets
+            for asset in assets:
                 recv_ts = self._clock.utc_now()
                 try:
                     twap = parse_twap(
@@ -195,10 +229,18 @@ class ChainlinkTwapCollector:
                         normalized_ts=self._clock.utc_now(),
                         recv_monotonic_ns=self._clock.monotonic_ns(),
                     )
-                except MarketDataSchemaError:
+                except MarketDataSchemaError as exc:
+                    state = self._asset_state[asset]
+                    state.parse_failure_count += 1
+                    state.last_error = str(exc)[:500]
                     self._parse_failure_count += 1
                     continue
                 self._record(twap)
+                state = self._asset_state[asset]
+                state.message_count += 1
+                state.parse_success_count += 1
+                state.last_message_at = self._clock.utc_now()
+                state.last_error = None
                 parsed += 1
                 break
         if parsed:
@@ -225,13 +267,57 @@ class ChainlinkTwapCollector:
         return best
 
     def status(self) -> ChainlinkCollectorStatus:
+        per_asset = {
+            asset.value: {
+                "connection": "connected" if state.connected else "disconnected",
+                "subscription_status": state.subscription_status,
+                "reconnect_count": state.reconnect_count,
+                "message_count": state.message_count,
+                "parse_success_count": state.parse_success_count,
+                "parse_failure_count": state.parse_failure_count,
+                "last_message_at": state.last_message_at.isoformat()
+                if state.last_message_at is not None
+                else None,
+                "last_source_timestamp": state.last_source_timestamp.isoformat()
+                if state.last_source_timestamp is not None
+                else None,
+                "history_size": len(self._history.get(asset, ())),
+                "latest_twap": str(state.latest_twap.value)
+                if state.latest_twap is not None
+                else None,
+                "last_error": state.last_error,
+            }
+            for asset, state in self._asset_state.items()
+        }
+        connected_count = sum(1 for state in self._asset_state.values() if state.connected)
+        subscribed_count = sum(
+            1 for state in self._asset_state.values() if state.subscription_status == "SUBSCRIBED"
+        )
+        error_count = sum(
+            1 for state in self._asset_state.values() if state.subscription_status == "ERROR"
+        )
+        aggregate_subscription = (
+            "SUBSCRIBED"
+            if subscribed_count == len(self._assets)
+            else "PARTIAL"
+            if subscribed_count
+            else "ERROR"
+            if error_count
+            else self._subscription_status
+        )
+        source_timestamps = [
+            state.last_source_timestamp
+            for state in self._asset_state.values()
+            if state.last_source_timestamp is not None
+        ]
+        errors = [state.last_error for state in self._asset_state.values() if state.last_error]
         return ChainlinkCollectorStatus(
-            connection="connected" if self._connected else "disconnected",
+            connection="connected" if connected_count else "disconnected",
             selected_topic="crypto_prices_twap_sixty",
-            subscription_status=self._subscription_status,
+            subscription_status=aggregate_subscription,
             last_message_at=self._last_message_at,
-            last_source_timestamp=self._last_source_timestamp,
-            reconnect_count=self._reconnect_count,
+            last_source_timestamp=max(source_timestamps) if source_timestamps else None,
+            reconnect_count=sum(state.reconnect_count for state in self._asset_state.values()),
             message_count=self._message_count,
             parse_success_count=self._parse_success_count,
             parse_failure_count=self._parse_failure_count,
@@ -241,14 +327,16 @@ class ChainlinkTwapCollector:
             latest_twap_by_asset={
                 asset.value: str(twap.value) for asset, twap in self._latest.items()
             },
-            last_error=self._last_error,
+            last_error=errors[-1] if errors else self._last_error,
+            per_asset=per_asset,
         )
 
     def _record(self, twap: ChainlinkTwap) -> None:
         latest = self._latest.get(twap.asset)
         if latest is None or twap.publisher_ts >= latest.publisher_ts:
             self._latest[twap.asset] = twap
-            self._last_source_timestamp = twap.publisher_ts
+            self._asset_state[twap.asset].latest_twap = twap
+            self._asset_state[twap.asset].last_source_timestamp = twap.publisher_ts
         history = self._history.setdefault(twap.asset, deque(maxlen=4096))
         if not history or (
             history[-1].publisher_ts != twap.publisher_ts or history[-1].value != twap.value
@@ -463,17 +551,6 @@ class OfficialPriceToBeatService:
                 "PTB_UNAVAILABLE",
                 f"{reason}:{type(exc).__name__}",
             )
-
-
-def _combined_twap_subscription(assets: Sequence[Asset]) -> dict[str, object]:
-    subscriptions = []
-    for asset in assets:
-        message = twap_subscription(asset, window_seconds=60)
-        items = message.get("subscriptions")
-        if not isinstance(items, list):
-            raise MarketDataSchemaError("Chainlink subscription had unexpected shape")
-        subscriptions.extend(items)
-    return {"action": "subscribe", "subscriptions": subscriptions}
 
 
 def _iter_rtds_payloads(raw: object) -> tuple[object, ...]:
