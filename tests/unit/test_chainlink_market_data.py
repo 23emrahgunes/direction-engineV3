@@ -34,7 +34,9 @@ def test_twap_uses_full_accuracy_e18_and_separate_timestamps() -> None:
             "timestamp": 1789473600500,
             "payload": {
                 "symbol": "xrp/usd",
+                "window_s": 60,
                 "full_accuracy_value": "3123456789012345678",
+                "value": "3.123456789012345678",
                 "timestamp": 1789473600123,
             },
         },
@@ -55,7 +57,12 @@ def test_twap_never_falls_back_to_rounded_value() -> None:
                 "topic": "crypto_prices_twap_thirty",
                 "type": "update",
                 "timestamp": 1789473600500,
-                "payload": {"symbol": "btc/usd", "value": "60000", "timestamp": 1789473600123},
+                "payload": {
+                    "symbol": "btc/usd",
+                    "window_s": 30,
+                    "value": "60000",
+                    "timestamp": 1789473600123,
+                },
             },
             asset=Asset.BTC,
             window_seconds=30,
@@ -90,6 +97,33 @@ def test_verified_live_twap60_envelope_is_normalized(asset: Asset) -> None:
         normalized_ts=RECV,
         recv_monotonic_ns=101,
     )
+    assert twap.asset is asset
+    assert twap.window_seconds == 60
+    assert twap.value == Decimal("60123.45")
+    assert twap.publisher_ts != twap.lineage.source_ts
+
+
+@pytest.mark.parametrize("asset", [Asset.BTC, Asset.ETH, Asset.SOL, Asset.XRP])
+def test_verified_live_twap60_direct_envelope_is_normalized(asset: Asset) -> None:
+    twap = parse_twap_from_symbol(
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "update",
+            "timestamp": 1789473600500,
+            "payload": {
+                "symbol": f"{asset.value.lower()}/usd",
+                "window_s": 60,
+                "timestamp": 1789473600123,
+                "value": "60123.45",
+                "full_accuracy_value": "60123450000000000000000",
+            },
+        },
+        window_seconds=60,
+        recv_ts=RECV,
+        normalized_ts=RECV,
+        recv_monotonic_ns=101,
+    )
+
     assert twap.asset is asset
     assert twap.window_seconds == 60
     assert twap.value == Decimal("60123.45")
@@ -131,6 +165,40 @@ def test_twap_asset_can_be_derived_from_returned_symbol() -> None:
     assert twap.value == Decimal("3000.25")
 
 
+def test_subscribe_snapshot_is_classified_but_not_live_parsed() -> None:
+    raw = {
+        "topic": "crypto_prices_twap_sixty",
+        "type": "subscribe",
+        "timestamp": 1789473600500,
+        "payload": {
+            "symbol": "btc/usd",
+            "window_s": 60,
+            "data": [
+                {
+                    "timestamp": 1789473600123 + index,
+                    "value": "60000",
+                    "full_accuracy_value": "60000000000000000000000",
+                }
+                for index in range(58)
+            ],
+        },
+    }
+
+    frame = inspect_twap_frame(raw, window_seconds=60)
+
+    assert frame.frame_class == "SUBSCRIPTION_SNAPSHOT"
+    assert frame.asset is Asset.BTC
+    assert frame.data_item_count == 58
+    with pytest.raises(MarketDataSchemaError, match="message type"):
+        parse_twap_from_symbol(
+            raw,
+            window_seconds=60,
+            recv_ts=RECV,
+            normalized_ts=RECV,
+            recv_monotonic_ns=101,
+        )
+
+
 def test_verified_twap_rejects_missing_or_ambiguous_data() -> None:
     base = {
         "topic": "crypto_prices_twap_sixty",
@@ -165,4 +233,77 @@ def test_verified_twap_rejects_missing_or_ambiguous_data() -> None:
             recv_ts=RECV,
             normalized_ts=RECV,
             recv_monotonic_ns=103,
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "match"),
+    [
+        ({"full_accuracy_value": None}, "full_accuracy_value"),
+        ({"value": None}, "value is required"),
+        ({"window_s": 30}, "unexpected Chainlink TWAP window"),
+        ({"symbol": "doge/usd"}, "unsupported Chainlink TWAP symbol"),
+    ],
+)
+def test_verified_direct_twap_fails_closed(payload_update: dict[str, object], match: str) -> None:
+    payload = {
+        "symbol": "btc/usd",
+        "window_s": 60,
+        "timestamp": 1789473600123,
+        "value": "60000",
+        "full_accuracy_value": "60000000000000000000000",
+    } | payload_update
+    raw = {
+        "topic": "crypto_prices_twap_sixty",
+        "type": "update",
+        "timestamp": 1789473600500,
+        "payload": {key: value for key, value in payload.items() if value is not None},
+    }
+    with pytest.raises(MarketDataSchemaError, match=match):
+        parse_twap_from_symbol(
+            raw,
+            window_seconds=60,
+            recv_ts=RECV,
+            normalized_ts=RECV,
+            recv_monotonic_ns=104,
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {
+            "topic": "crypto_prices_chainlink",
+            "type": "update",
+            "timestamp": 1789473600500,
+            "payload": {
+                "symbol": "btc/usd",
+                "window_s": 60,
+                "timestamp": 1789473600123,
+                "value": "60000",
+                "full_accuracy_value": "60000000000000000000000",
+            },
+        },
+        {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "heartbeat",
+            "timestamp": 1789473600500,
+            "payload": {
+                "symbol": "btc/usd",
+                "window_s": 60,
+                "timestamp": 1789473600123,
+                "value": "60000",
+                "full_accuracy_value": "60000000000000000000000",
+            },
+        },
+    ],
+)
+def test_verified_direct_twap_rejects_wrong_topic_or_type(raw: dict[str, object]) -> None:
+    with pytest.raises(MarketDataSchemaError):
+        parse_twap_from_symbol(
+            raw,
+            window_seconds=60,
+            recv_ts=RECV,
+            normalized_ts=RECV,
+            recv_monotonic_ns=105,
         )

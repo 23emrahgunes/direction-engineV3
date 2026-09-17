@@ -30,6 +30,7 @@ _SCALE: Final = Decimal(10) ** 18
 
 @dataclass(frozen=True, slots=True)
 class ChainlinkTwapFrame:
+    frame_class: str
     asset: Asset
     topic: str
     message_type: str
@@ -65,7 +66,7 @@ def inspect_twap_frame(raw: object, *, window_seconds: int) -> ChainlinkTwapFram
     if topic != _TOPICS[window_seconds]:
         raise MarketDataSchemaError("unexpected Chainlink TWAP topic")
     message_type = require_str(payload, "type")
-    if message_type != "update":
+    if message_type not in {"update", "subscribe"}:
         raise MarketDataSchemaError("unexpected Chainlink TWAP message type")
     envelope = require_object(payload.get("payload"), "payload")
     symbol = require_str(envelope, "symbol").replace("-", "/").upper()
@@ -85,7 +86,9 @@ def inspect_twap_frame(raw: object, *, window_seconds: int) -> ChainlinkTwapFram
             data_item_count = len(values)
             if len(values) == 1:
                 data_item_keys = _sorted_keys(require_object(values[0], "data[0]"))
+    frame_class = _classify_frame(message_type, envelope)
     return ChainlinkTwapFrame(
+        frame_class=frame_class,
         asset=asset,
         topic=topic,
         message_type=message_type,
@@ -146,17 +149,16 @@ def parse_twap(
     ):
         raise MarketDataSchemaError("full_accuracy_value must be an E18 integer")
     value_raw = record.get("value")
-    if "data" in envelope and value_raw is None:
+    if value_raw is None:
         raise MarketDataSchemaError("value is required for verified Chainlink TWAP data")
-    if value_raw is not None:
-        value = require_decimal(record, "value")
-        if not value.is_finite() or value <= 0:
-            raise MarketDataSchemaError("value must be a positive finite decimal")
+    value = require_decimal(record, "value")
+    if not value.is_finite() or value <= 0:
+        raise MarketDataSchemaError("value must be a positive finite decimal")
     source_ts = utc_from_milliseconds(require_int(record, "timestamp"))
     publisher_ts = utc_from_milliseconds(require_int(payload, "timestamp"))
     return ChainlinkTwap(
         asset=asset,
-            value=full_accuracy / _SCALE,
+        value=full_accuracy / _SCALE,
         window_seconds=window_seconds,
         publisher_ts=publisher_ts,
         lineage=EventLineage(
@@ -183,13 +185,11 @@ def _sorted_keys(value: Mapping[str, object]) -> tuple[str, ...]:
 def _normalize_twap_record(
     envelope: Mapping[str, object], *, window_seconds: int
 ) -> Mapping[str, object]:
-    """Normalize the verified RTDS payload.data envelope without fallbacks."""
+    """Normalize verified RTDS update envelopes without loose fallbacks."""
 
     if "data" not in envelope:
-        # Preserve the already accepted legacy fixture shape while keeping its
-        # strict fields. Production live messages use the branch below.
-        if "window_s" in envelope:
-            raise MarketDataSchemaError("Chainlink TWAP data must be an array or object")
+        if require_int(envelope, "window_s") != window_seconds:
+            raise MarketDataSchemaError("unexpected Chainlink TWAP window")
         return envelope
 
     if require_int(envelope, "window_s") != window_seconds:
@@ -201,3 +201,14 @@ def _normalize_twap_record(
     if len(values) != 1:
         raise MarketDataSchemaError("Chainlink TWAP data must contain exactly one record")
     return require_object(values[0], "data[0]")
+
+
+def _classify_frame(message_type: str, envelope: Mapping[str, object]) -> str:
+    if message_type == "subscribe":
+        if "data" not in envelope:
+            raise MarketDataSchemaError("Chainlink subscribe frame missing snapshot data")
+        require_sequence(envelope.get("data"), "data")
+        return "SUBSCRIPTION_SNAPSHOT"
+    if message_type == "update":
+        return "LIVE_UPDATE"
+    raise MarketDataSchemaError("unexpected Chainlink TWAP message type")

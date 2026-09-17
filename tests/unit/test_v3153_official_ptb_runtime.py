@@ -67,7 +67,9 @@ def test_chainlink_collector_records_only_v3_60s_twap_and_selects_boundary() -> 
         "timestamp": int(NOW.timestamp() * 1000),
         "payload": {
             "symbol": "btc/usd",
+            "window_s": 60,
             "full_accuracy_value": "60000000000000000000000",
+            "value": "60000",
             "timestamp": int(NOW.timestamp() * 1000),
         },
     }
@@ -101,7 +103,9 @@ async def _assert_ptb_service_establishes_and_restores_short_boundary(tmp_path: 
             "timestamp": int(NOW.timestamp() * 1000),
             "payload": {
                 "symbol": "btc/usd",
+                "window_s": 60,
                 "full_accuracy_value": "60000000000000000000000",
+                "value": "60000",
                 "timestamp": int(NOW.timestamp() * 1000),
             },
         }

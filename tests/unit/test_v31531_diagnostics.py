@@ -63,7 +63,9 @@ def test_chainlink_status_records_parse_counts_and_source_timestamp() -> None:
             "timestamp": int(NOW.timestamp() * 1000),
             "payload": {
                 "symbol": "btc/usd",
+                "window_s": 60,
                 "full_accuracy_value": "60000000000000000000000",
+                "value": "60000",
                 "timestamp": int(NOW.timestamp() * 1000),
             },
         }
@@ -117,6 +119,7 @@ def test_chainlink_fanout_probe_sanitizes_frame_and_reports_filter_mismatch() ->
         "returned_type": "update",
         "returned_symbol": "eth/usd",
         "returned_asset": "ETH",
+        "frame_class": "LIVE_UPDATE",
         "payload_keys": ["data", "symbol", "window_s"],
         "data_item_count": 1,
         "data_item_keys": ["full_accuracy_value", "timestamp", "value"],

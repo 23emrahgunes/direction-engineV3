@@ -10,6 +10,7 @@ from decimal import Decimal
 from direction_engine_v3.adapters.chainlink.rtds import (
     RTDS_HEARTBEAT_SECONDS,
     RTDS_WS_URL,
+    inspect_twap_frame,
     parse_twap_from_symbol,
     twap_subscription,
 )
@@ -55,6 +56,7 @@ class ChainlinkCollectorStatus:
     message_count: int
     parse_success_count: int
     parse_failure_count: int
+    subscription_snapshot_count: int
     history_size_by_asset: Mapping[str, int]
     latest_twap_by_asset: Mapping[str, str]
     last_error: str | None
@@ -75,6 +77,7 @@ class ChainlinkCollectorStatus:
             "message_count": self.message_count,
             "parse_success_count": self.parse_success_count,
             "parse_failure_count": self.parse_failure_count,
+            "subscription_snapshot_count": self.subscription_snapshot_count,
             "history_size_by_asset": dict(self.history_size_by_asset),
             "latest_twap_by_asset": dict(self.latest_twap_by_asset),
             "last_error": self.last_error,
@@ -133,7 +136,9 @@ class _AssetCollectorState:
     last_error: str | None = None
     filter_match_count: int = 0
     filter_mismatch_count: int = 0
+    subscription_snapshot_count: int = 0
     last_filter_status: str = "NO_DATA"
+    last_frame_class: str = "NO_DATA"
     last_returned_symbol: str | None = None
 
 
@@ -164,6 +169,7 @@ class ChainlinkTwapCollector:
         self._message_count = 0
         self._parse_success_count = 0
         self._parse_failure_count = 0
+        self._subscription_snapshot_count = 0
         self._last_message_at: datetime | None = None
         self._last_error: str | None = None
         self._subscription_status = "NOT_STARTED"
@@ -223,6 +229,10 @@ class ChainlinkTwapCollector:
         for payload in _iter_rtds_payloads(raw):
             intended_asset = asset_hint
             try:
+                frame = inspect_twap_frame(payload, window_seconds=60)
+                if frame.frame_class == "SUBSCRIPTION_SNAPSHOT":
+                    self._record_subscription_snapshot(frame.asset, intended_asset)
+                    continue
                 recv_ts = self._clock.utc_now()
                 twap = parse_twap_from_symbol(
                     payload,
@@ -241,6 +251,7 @@ class ChainlinkTwapCollector:
             state.last_message_at = self._clock.utc_now()
             state.last_error = None
             state.last_returned_symbol = f"{twap.asset.value}/USD"
+            state.last_frame_class = "LIVE_UPDATE"
             if intended_asset is None or intended_asset is twap.asset:
                 state.filter_match_count += 1
                 state.last_filter_status = "FILTER_MATCH"
@@ -287,6 +298,7 @@ class ChainlinkTwapCollector:
                 "message_count": state.message_count,
                 "parse_success_count": state.parse_success_count,
                 "parse_failure_count": state.parse_failure_count,
+                "subscription_snapshot_count": state.subscription_snapshot_count,
                 "last_message_at": state.last_message_at.isoformat()
                 if state.last_message_at is not None
                 else None,
@@ -300,6 +312,7 @@ class ChainlinkTwapCollector:
                 "last_error": state.last_error,
                 "filter_match_count": state.filter_match_count,
                 "filter_mismatch_count": state.filter_mismatch_count,
+                "last_frame_class": state.last_frame_class,
                 "last_filter_status": state.last_filter_status,
                 "last_returned_symbol": state.last_returned_symbol,
             }
@@ -337,6 +350,7 @@ class ChainlinkTwapCollector:
             message_count=self._message_count,
             parse_success_count=self._parse_success_count,
             parse_failure_count=self._parse_failure_count,
+            subscription_snapshot_count=self._subscription_snapshot_count,
             history_size_by_asset={
                 asset.value: len(self._history.get(asset, ())) for asset in self._assets
             },
@@ -358,6 +372,26 @@ class ChainlinkTwapCollector:
             history[-1].publisher_ts != twap.publisher_ts or history[-1].value != twap.value
         ):
             history.append(twap)
+
+    def _record_subscription_snapshot(
+        self,
+        returned_asset: Asset,
+        intended_asset: Asset | None,
+    ) -> None:
+        state = self._asset_state[returned_asset]
+        state.subscription_snapshot_count += 1
+        state.last_frame_class = "SUBSCRIPTION_SNAPSHOT"
+        state.last_returned_symbol = f"{returned_asset.value}/USD"
+        if intended_asset is None or intended_asset is returned_asset:
+            state.filter_match_count += 1
+            state.last_filter_status = "FILTER_MATCH"
+        else:
+            intended_state = self._asset_state[intended_asset]
+            intended_state.filter_mismatch_count += 1
+            intended_state.last_filter_status = "FILTER_MISMATCH"
+            intended_state.last_frame_class = "SUBSCRIPTION_SNAPSHOT"
+            intended_state.last_returned_symbol = f"{returned_asset.value}/USD"
+        self._subscription_snapshot_count += 1
 
     def _record_parse_failure(
         self,

@@ -105,6 +105,7 @@ def _sanitize_frame(
     window_s = None
     parse_error = None
     returned_asset = None
+    frame_class = None
     filter_status = "FILTER_UNKNOWN"
     if isinstance(payload, Mapping):
         topic = payload.get("topic")
@@ -124,17 +125,19 @@ def _sanitize_frame(
                     data_item_keys = _sorted_keys(raw_data[0])
     try:
         frame = inspect_twap_frame(payload, window_seconds=60)
+        frame_class = frame.frame_class
         returned_asset = frame.asset.value
         filter_status = (
             "FILTER_MATCH" if frame.asset is intended_asset else "FILTER_MISMATCH"
         )
-        parse_twap_from_symbol(
-            payload,
-            window_seconds=60,
-            recv_ts=clock.utc_now(),
-            normalized_ts=clock.utc_now(),
-            recv_monotonic_ns=clock.monotonic_ns(),
-        )
+        if frame.frame_class == "LIVE_UPDATE":
+            parse_twap_from_symbol(
+                payload,
+                window_seconds=60,
+                recv_ts=clock.utc_now(),
+                normalized_ts=clock.utc_now(),
+                recv_monotonic_ns=clock.monotonic_ns(),
+            )
     except MarketDataSchemaError as exc:
         parse_error = _safe_error(exc)
     return {
@@ -143,6 +146,7 @@ def _sanitize_frame(
         "returned_type": message_type,
         "returned_symbol": returned_symbol,
         "returned_asset": returned_asset,
+        "frame_class": frame_class,
         "payload_keys": list(payload_keys),
         "data_item_count": data_item_count,
         "data_item_keys": list(data_item_keys),
