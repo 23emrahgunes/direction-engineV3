@@ -269,14 +269,16 @@ class PublicShadowDataClient:
             return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
 
         token_ids = {token.outcome: token.token_id for token in discovery.market.tokens}
-        observed_at = self._clock.utc_now()
+        ptb_observed_at = self._clock.utc_now()
         ptb_resolution = await self._stage(
             stages,
             "OFFICIAL_PTB_RESOLVE",
             bucket,
             slug=slug,
             discovery=discovery,
-            operation=lambda: self._resolve_ptb(discovery, observed_at=observed_at),
+            operation=lambda: self._resolve_ptb(
+                discovery, observed_at=ptb_observed_at
+            ),
         )
         if ptb_resolution is None:
             ptb_resolution = PriceToBeatResolution(
@@ -425,6 +427,7 @@ class PublicShadowDataClient:
             self._feature_state.add_book(external_book)
             if external_trade is not None:
                 self._feature_state.add_trade(external_trade)
+        evaluation_at = self._clock.utc_now()
         features = None
         feature_status = "FEATURES_UNAVAILABLE"
         if proxy is not None:
@@ -438,7 +441,7 @@ class PublicShadowDataClient:
                     discovery,
                     proxy,
                     ptb_resolution.price_to_beat,
-                    observed_at=observed_at,
+                    observed_at=evaluation_at,
                 ),
             )
             if feature_result is not None:
@@ -461,7 +464,7 @@ class PublicShadowDataClient:
             fee_schedule=fee,
             proxy_reference=proxy,
             official_reference=ptb_resolution.official_reference,
-            observed_at=observed_at,
+            observed_at=evaluation_at,
             unavailable_reason=_first_failure_reason(stages),
             price_to_beat=ptb_resolution.price_to_beat,
             directional_features=features,
@@ -1199,7 +1202,7 @@ class ShadowDaemon:
             )
             return up, down, "EXECUTABLE_PRICE_READY"
         except Exception as exc:
-            return None, None, f"EXECUTABLE_PRICE_UNAVAILABLE:{type(exc).__name__}"
+            return None, None, f"EXECUTABLE_PRICE_UNAVAILABLE:{_safe_error_text(exc)}"
 
     def _shadow_model_status(self, state: ShadowMarketState) -> ShadowBucketModelStatus:
         readiness = self._registry.state_for(state.bucket).readiness
@@ -1965,6 +1968,11 @@ def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object
         "effective_ts": record.reference.effective_ts.isoformat(),
         "established_at": record.established_at.isoformat(),
     }
+
+
+def _safe_error_text(exc: Exception) -> str:
+    text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    return text or type(exc).__name__
 
 
 def _slug(bucket: MarketBucket, start: datetime) -> str:

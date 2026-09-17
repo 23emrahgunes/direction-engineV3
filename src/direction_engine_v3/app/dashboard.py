@@ -311,6 +311,7 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "feature_error": pipeline_payload.get("feature_error"),
                 "model_state": payload.get("model_state", "TRAINING_CORPUS_REQUIRED"),
                 "model_version": payload.get("model_version"),
+                "training_report": payload.get("training_report", {}),
                 "calibration_state": payload.get("calibration_state", "CALIBRATION_NOT_READY"),
                 "calibration_version": payload.get("calibration_version"),
                 "pricing_status": payload.get("pricing_status", "UNKNOWN"),
