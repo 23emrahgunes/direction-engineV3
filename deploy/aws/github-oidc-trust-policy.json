@@ -10,7 +10,7 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:23emrahgunes/direction-engineV3:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:23emrahgunes@168855296/direction-engineV3@1371242858:ref:refs/heads/main"
         }
       }
     }
