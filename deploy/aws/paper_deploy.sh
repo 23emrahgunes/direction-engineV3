@@ -4,7 +4,8 @@ set -euo pipefail
 EXPECTED_SHA="${1:?expected git SHA is required}"
 PROJECT_DIR="${2:-/home/ubuntu/direction-engine-v3}"
 PY="$PROJECT_DIR/.venv/bin/python"
-DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"
+DEPLOY_STATE_DIR="/var/lib/direction-engine-v3/deploy"
+LEGACY_DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"
 DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"
 STAGE="start"
 
@@ -42,16 +43,42 @@ require_safe_environment() {
   STAGE="preflight"
   test -d "$PROJECT_DIR"
   test -x "$PY"
-  mkdir -p "$DEPLOY_STATE_DIR"
-  cd "$PROJECT_DIR"
   case "$EXPECTED_SHA" in
     (*[!0-9a-fA-F]* | "" ) echo "Invalid expected SHA: $EXPECTED_SHA" >&2; exit 10 ;;
   esac
+
+  cleanup_legacy_deploy_state
+  cd "$PROJECT_DIR"
   if [ "$(run_ubuntu "git status --short")" != "" ]; then
     echo "Project working tree is dirty; refusing exact-SHA deploy" >&2
     run_ubuntu "git status --short"
     exit 11
   fi
+  mkdir -p "$DEPLOY_STATE_DIR"
+}
+
+cleanup_legacy_deploy_state() {
+  if [ ! -e "$LEGACY_DEPLOY_STATE_DIR" ] && [ ! -L "$LEGACY_DEPLOY_STATE_DIR" ]; then
+    return 0
+  fi
+
+  local project_real runtime_real legacy_real expected_legacy
+  project_real="$(realpath -e "$PROJECT_DIR")"
+  runtime_real="$(realpath -e "$project_real/runtime")"
+  legacy_real="$(realpath -e "$LEGACY_DEPLOY_STATE_DIR")"
+  expected_legacy="$runtime_real/deploy"
+
+  if [ -z "$project_real" ] || [ -z "$runtime_real" ] || [ -z "$legacy_real" ] \
+    || [ "$legacy_real" != "$expected_legacy" ] \
+    || [ "$legacy_real" = "/" ] \
+    || [ "$legacy_real" = "$project_real" ] \
+    || [ "$legacy_real" = "$runtime_real" ]; then
+    echo "Refusing unsafe legacy deploy-state cleanup: $LEGACY_DEPLOY_STATE_DIR" >&2
+    exit 13
+  fi
+
+  log "removing known legacy deploy state: $legacy_real"
+  rm -rf -- "$legacy_real"
 }
 
 checkout_exact_sha() {

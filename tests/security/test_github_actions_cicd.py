@@ -74,6 +74,33 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "systemctl restart" in source
 
 
+def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert 'DEPLOY_STATE_DIR="/var/lib/direction-engine-v3/deploy"' in source
+    assert 'LEGACY_DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"' in source
+    assert 'DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"' in source
+    assert '\nDEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"' not in source
+    assert 'mkdir -p "$DEPLOY_STATE_DIR"' in source
+    assert 'rm -rf -- "$legacy_real"' in source
+    status_check = source.index('git status --short')
+    state_creation = source.index('mkdir -p "$DEPLOY_STATE_DIR"')
+    assert status_check < state_creation
+    assert 'if [ "$(run_ubuntu "git status --short")" != "" ]; then' in source
+    assert 'exit 11' in source
+
+
+def test_legacy_cleanup_is_canonical_and_protects_runtime_evidence() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert 'runtime_real="$(realpath -e "$project_real/runtime")"' in source
+    assert 'expected_legacy="$runtime_real/deploy"' in source
+    assert 'legacy_real="$expected_legacy"' not in source
+    assert '[ "$legacy_real" = "/" ]' in source
+    assert '[ "$legacy_real" = "$project_real" ]' in source
+    assert '[ "$legacy_real" = "$runtime_real" ]' in source
+    assert 'rm -rf -- "$PROJECT_DIR/runtime"' not in source
+    assert 'rm -rf -- "$project_real/runtime"' not in source
+
+
 def test_iam_trust_policy_restricts_repo_branch_and_audience() -> None:
     policy = json.loads(TRUST_POLICY.read_text(encoding="utf-8"))
     statement = policy["Statement"][0]
