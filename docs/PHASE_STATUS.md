@@ -334,3 +334,21 @@ local and VPS gates pass.
   must prove daemon cycle advancement, RTDS source evidence, Binance 1h source
   evidence, and at least one bounded real 5m `PTB_READY` before final status can
   become `V3.15.3.1_OFFICIAL_PTB_ACTIVE`.
+
+## V3 CI/CD local evidence
+
+- Status before one-time AWS setup: `GITHUB_OIDC_SETUP_REQUIRED`.
+- Added GitHub Actions CI for Python 3.12 compile, pytest, Ruff, mypy, and diff
+  whitespace checks on pull requests and pushes to `main`.
+- Added GitHub Actions PAPER deploy workflow using GitHub OIDC and SSM
+  `AWS-RunShellScript`; no static AWS keys, no local Windows AWS profile, no SSH,
+  and no public deployment port are required for ordinary deploys after the
+  one-time AWS role setup.
+- Added least-privilege IAM trust/permissions templates under `deploy/aws/` and
+  setup instructions in `docs/GITHUB-AWS-OIDC-SETUP.md`.
+- Deployment acceptance is intentionally fast operational health only. It does
+  not wait for future 5m/15m/1h boundaries, PTB_READY, PAPER trades, settlement,
+  or burn-in evidence.
+- Runtime evidence remains asynchronous and observable through dashboard/API.
+- Codex must not create the AWS IAM/OIDC role. A human AWS administrator must
+  complete the one-time setup for `direction-engine-v3-github-deploy-role`.

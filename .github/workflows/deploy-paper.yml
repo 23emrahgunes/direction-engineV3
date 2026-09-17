@@ -1,0 +1,187 @@
+name: Deploy PAPER
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: direction-engine-v3-paper-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-north-1
+  AWS_ROLE_ARN: arn:aws:iam::605618941421:role/direction-engine-v3-github-deploy-role
+  INSTANCE_ID: i-0c0e730834569177e
+  PROJECT_DIR: /home/ubuntu/direction-engine-v3
+
+jobs:
+  validate:
+    name: Validate before deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      deploy-sha: ${{ steps.deploy-sha.outputs.sha }}
+
+    steps:
+      - name: Resolve deploy SHA
+        id: deploy-sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout exact deploy SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.deploy-sha.outputs.sha }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Compile
+        run: python -m compileall src tests
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Mypy
+        run: python -m mypy src
+
+      - name: Diff whitespace check
+        run: git diff --check
+
+  deploy:
+    name: Deploy exact SHA to PAPER VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    needs:
+      - validate
+    if: needs.validate.result == 'success'
+
+    steps:
+      - name: Checkout exact deploy SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.deploy-sha }}
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send SSM deploy command
+        id: send-command
+        env:
+          DEPLOY_SHA: ${{ needs.validate.outputs.deploy-sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          script = Path("deploy/aws/paper_deploy.sh").read_text(encoding="utf-8")
+          deploy_sha = os.environ["DEPLOY_SHA"]
+          project_dir = os.environ["PROJECT_DIR"]
+          commands = [
+              "cat > /tmp/direction_engine_v3_paper_deploy.sh <<'DIRECTION_V3_DEPLOY'",
+              script,
+              "DIRECTION_V3_DEPLOY",
+              "chmod 700 /tmp/direction_engine_v3_paper_deploy.sh",
+              f"/usr/bin/env bash /tmp/direction_engine_v3_paper_deploy.sh {deploy_sha} {project_dir}",
+          ]
+          payload = {
+              "DocumentName": "AWS-RunShellScript",
+              "InstanceIds": [os.environ["INSTANCE_ID"]],
+              "Comment": f"direction-engineV3 PAPER deploy {deploy_sha}",
+              "Parameters": {
+                  "commands": commands,
+                  "executionTimeout": ["900"],
+              },
+          }
+          Path("ssm-payload.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+          command_id="$(
+            aws ssm send-command \
+              --cli-input-json file://ssm-payload.json \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+          echo "command-id=$command_id" >> "$GITHUB_OUTPUT"
+          echo "SSM CommandId: $command_id"
+
+      - name: Wait for SSM deploy result
+        env:
+          COMMAND_ID: ${{ steps.send-command.outputs.command-id }}
+          DEPLOY_SHA: ${{ needs.validate.outputs.deploy-sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import time
+
+          command_id = os.environ["COMMAND_ID"]
+          instance_id = os.environ["INSTANCE_ID"]
+          deploy_sha = os.environ["DEPLOY_SHA"]
+          print(f"Waiting for SSM CommandId={command_id} deploy_sha={deploy_sha}")
+          terminal = {"Success", "Cancelled", "TimedOut", "Failed", "Cancelling"}
+          last = None
+          deadline = time.time() + 900
+          while time.time() < deadline:
+              completed = subprocess.run(
+                  [
+                      "aws",
+                      "ssm",
+                      "get-command-invocation",
+                      "--command-id",
+                      command_id,
+                      "--instance-id",
+                      instance_id,
+                      "--output",
+                      "json",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              last = completed.stdout
+              status = __import__("json").loads(last)["Status"]
+              print(f"SSM status={status}")
+              if status in terminal:
+                  print(last)
+                  if status != "Success":
+                      sys.exit(1)
+                  break
+              time.sleep(10)
+          else:
+              if last:
+                  print(last)
+              raise SystemExit("Timed out waiting for SSM deploy command")
+          PY
