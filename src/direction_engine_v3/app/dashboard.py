@@ -121,6 +121,11 @@ def build_paper_summary() -> dict[str, object]:
     return repository.summary()
 
 
+def build_paper_performance(*, strategy: str = "DIRECTIONAL_EDGE") -> dict[str, object]:
+    repository = _paper_repository()
+    return repository.performance(strategy=strategy)
+
+
 def list_paper_trades(
     *,
     asset: str | None = None,

@@ -82,7 +82,7 @@ def load_paper_registry_from_corpus(
             if repository is None
             else repository.training_ready_records(asset=bucket.asset, horizon=bucket.horizon)
         )
-        count = len(records)
+        count = len({item.condition_id for item in records})
         if count < minimum_samples:
             readiness = CalibrationReadiness(
                 bucket.asset,

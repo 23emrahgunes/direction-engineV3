@@ -19,6 +19,7 @@
       <p>Read-only PRE-LIVE observability surface. LIVE remains disabled and unarmed.</p>
       <p class="label">PAPER / SHADOW — NO REAL ORDER</p>
       <section><h2>OVERVIEW</h2><pre id="overview">Loading...</pre></section>
+      <section><h2>PAPER PERFORMANCE</h2><pre id="paper-performance">Loading...</pre></section>
       <section><h2>PAPER TRADES</h2><pre id="paper-trades">Loading...</pre></section>
       <section><h2>ABSTAINS / REJECTIONS</h2><pre id="abstains">Loading...</pre></section>
       <section><h2>DIRECTIONAL EDGE</h2><pre id="directional">Loading...</pre></section>
@@ -43,12 +44,13 @@
 
       Promise.all([
         show("overview", "/api/paper/summary"),
+        show("paper-performance", "/api/paper/performance?strategy=DIRECTIONAL_EDGE"),
         show("paper-trades", "/api/paper/trades"),
         show("abstains", "/api/paper/abstains"),
         show("health", "/api/dashboard"),
         show("data-latency", "/api/shadow/status"),
         show("directional", "/api/directional/status")
-      ]).then(([summary, trades, abstains, dashboard, shadow, directional]) => {
+      ]).then(([summary, performance, trades, abstains, dashboard, shadow, directional]) => {
         document.getElementById("directional").textContent =
           JSON.stringify(directional, null, 2);
         document.getElementById("structural").textContent =
@@ -56,7 +58,7 @@
         document.getElementById("buckets").textContent =
           JSON.stringify(dashboard.metrics ? dashboard.metrics.markets : [], null, 2);
         document.getElementById("risk").textContent =
-          JSON.stringify({summary, shadow, label: "PAPER / SHADOW — NO REAL ORDER"}, null, 2);
+          JSON.stringify({summary, performance, shadow, label: "PAPER / SHADOW — NO REAL ORDER"}, null, 2);
       });
     </script>
   </body>

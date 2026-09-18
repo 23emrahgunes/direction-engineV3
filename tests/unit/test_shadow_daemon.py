@@ -78,9 +78,12 @@ def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) ->
     assert first.strategy_evaluations >= 3
     assert first.abstain_records >= 11
     assert first.paper_trades == 2
-    assert second.paper_trades == 2
+    assert second.paper_trades == 1
     trades = paper.trades()
     assert len(trades) == 2
+    assert any(
+        item.reason == "DIRECTIONAL_POSITION_ALREADY_OPEN" for item in paper.abstains()
+    )
     directional = next(item for item in trades if item.strategy == "DIRECTIONAL_EDGE")
     assert directional.label == "PAPER / SHADOW — NO REAL ORDER"
     assert directional.payload["model_version"] == "PAPER_RESEARCH_BASELINE"

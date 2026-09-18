@@ -103,15 +103,118 @@ class SQLiteDirectionalCorpusRepository:
         require_utc("attached_at", attached_at)
         encoded = json.dumps(_jsonable(dict(outcome)), sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT outcome_json FROM directional_corpus WHERE record_id=?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(record_id)
+            if row[0] is not None:
+                if str(row[0]) != encoded:
+                    raise RuntimeError("conflicting official outcome for corpus record")
+                return
             connection.execute(
                 """
                 UPDATE directional_corpus
-                SET outcome_json=COALESCE(outcome_json, ?),
-                    outcome_attached_at=COALESCE(outcome_attached_at, ?)
+                SET outcome_json=?,
+                    outcome_attached_at=?
                 WHERE record_id=?
                 """,
                 (encoded, attached_at.isoformat(), record_id),
             )
+
+    def attach_verified_outcome_to_condition_once(
+        self,
+        *,
+        condition_id: str,
+        outcome: Mapping[str, object],
+        official_resolved_at: datetime,
+        attached_at: datetime,
+    ) -> int:
+        require_text("condition_id", condition_id)
+        require_utc("official_resolved_at", official_resolved_at)
+        require_utc("attached_at", attached_at)
+        if outcome.get("settlement_source_kind") != "OFFICIAL":
+            raise ValueError("corpus outcomes must be official")
+        encoded = json.dumps(_jsonable(dict(outcome)), sort_keys=True, separators=(",", ":"))
+        updated = 0
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT record_id,observed_at,outcome_json FROM directional_corpus
+                WHERE condition_id=?
+                """,
+                (condition_id,),
+            ).fetchall()
+            for record_id, observed_at_raw, existing in rows:
+                observed_at = datetime.fromisoformat(str(observed_at_raw))
+                if observed_at >= official_resolved_at:
+                    continue
+                if existing is not None:
+                    if str(existing) != encoded:
+                        raise RuntimeError("conflicting official outcome for condition")
+                    continue
+                connection.execute(
+                    """
+                    UPDATE directional_corpus
+                    SET outcome_json=?, outcome_attached_at=?
+                    WHERE record_id=?
+                    """,
+                    (encoded, attached_at.isoformat(), str(record_id)),
+                )
+                updated += 1
+        return updated
+
+    def records_for_condition(self, condition_id: str) -> tuple[DirectionalCorpusRecord, ...]:
+        require_text("condition_id", condition_id)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT record_id,asset,horizon,condition_id,observed_at,payload_json,outcome_json
+                FROM directional_corpus WHERE condition_id=? ORDER BY observed_at ASC
+                """,
+                (condition_id,),
+            ).fetchall()
+        return tuple(
+            DirectionalCorpusRecord(
+                record_id=str(row[0]),
+                asset=Asset(str(row[1])),
+                horizon=Horizon(str(row[2])),
+                condition_id=str(row[3]),
+                observed_at=datetime.fromisoformat(str(row[4])),
+                payload=json.loads(str(row[5])),
+                outcome_attached=row[6] is not None,
+            )
+            for row in rows
+        )
+
+    def corpus_counts(
+        self, *, asset: Asset | None = None, horizon: Horizon | None = None
+    ) -> dict[str, int]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if asset is not None:
+            clauses.append("asset=?")
+            params.append(asset.value)
+        if horizon is not None:
+            clauses.append("horizon=?")
+            params.append(horizon.value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*),"
+                "SUM(CASE WHEN outcome_json IS NOT NULL THEN 1 ELSE 0 END),"
+                "COUNT(DISTINCT condition_id),"
+                "COUNT(DISTINCT CASE WHEN outcome_json IS NOT NULL THEN condition_id END) "
+                f"FROM directional_corpus{where}",
+                tuple(params),
+            ).fetchone()
+        return {
+            "observation_count": int(row[0] or 0),
+            "labeled_observation_count": int(row[1] or 0),
+            "unique_condition_count": int(row[2] or 0),
+            "labeled_unique_condition_count": int(row[3] or 0),
+        }
 
     def count(self, *, asset: Asset | None = None, horizon: Horizon | None = None) -> int:
         clauses: list[str] = []

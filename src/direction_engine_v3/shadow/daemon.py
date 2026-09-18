@@ -9,7 +9,7 @@ import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -90,16 +90,20 @@ from direction_engine_v3.pricing import (
 )
 from direction_engine_v3.risk import (
     LiquidityEvidence,
+    OpenExposure,
     PortfolioState,
     RiskPolicy,
     assess_candidate,
 )
 from direction_engine_v3.router import (
+    ClaimStatus,
+    RouterClaim,
     RouterPolicy,
     RouterSnapshot,
     RoutingOpportunity,
     route_opportunities,
 )
+from direction_engine_v3.settlement import GammaOfficialSettlementResolver, PaperSettlementService
 from direction_engine_v3.shadow.evidence import (
     AWSIdentityEvidence,
     EvidenceFingerprint,
@@ -680,6 +684,7 @@ class ShadowDaemon:
         evidence_window: EvidenceWindow,
         report_dir: Path,
         directional_corpus_repository: SQLiteDirectionalCorpusRepository | None = None,
+        settlement_service: PaperSettlementService | None = None,
         clock: SystemClock | None = None,
         poll_seconds: float = 30.0,
     ) -> None:
@@ -691,6 +696,7 @@ class ShadowDaemon:
         self._evidence_window = evidence_window
         self._report_dir = report_dir
         self._directional_corpus_repository = directional_corpus_repository
+        self._settlement_service = settlement_service
         self._clock = clock or SystemClock()
         self._poll_seconds = poll_seconds
         self._paper_model_result = load_paper_registry_from_corpus(
@@ -708,12 +714,23 @@ class ShadowDaemon:
             )
         )
         result = self._evaluate_cycle(cycle_id, started_at, states)
+        settlement_payload: dict[str, object] = {}
+        if self._settlement_service is not None:
+            settlement_payload = await self._settlement_service.run_once()
+            self._shadow_repository.append_event(
+                event_id=f"{self._evidence_window.window_id}:{cycle_id}:settlement",
+                window_id=self._evidence_window.window_id,
+                event_type="PAPER_SETTLEMENT_SCAN",
+                bucket_key=None,
+                payload=settlement_payload,
+                observed_at=started_at,
+            )
         self._shadow_repository.append_event(
             event_id=f"{self._evidence_window.window_id}:{cycle_id}",
             window_id=self._evidence_window.window_id,
             event_type="REAL_SHADOW_CYCLE",
             bucket_key=None,
-            payload=result.as_dict(),
+            payload=result.as_dict() | {"settlement": settlement_payload},
             observed_at=started_at,
         )
         write_reports(
@@ -1025,6 +1042,20 @@ class ShadowDaemon:
         if pricing is None or pricing.vwap is None or pricing.worst_price is None:
             raise RuntimeError("directional TRADE assessment did not carry executable pricing")
         token_ids = tuple(token.token_id for token in market.tokens)
+        if market.condition_id in self._active_directional_conditions(state.observed_at):
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason="DIRECTIONAL_POSITION_ALREADY_OPEN",
+                payload={"condition_id": market.condition_id, "label": _PAPER_LABEL},
+            )
+            return (
+                False,
+                {"router_status": "DIRECTIONAL_POSITION_ALREADY_OPEN"},
+                abstains,
+            )
+        paper_summary = self._paper_repository.summary()
         routing = route_opportunities(
             (
                 RoutingOpportunity(
@@ -1035,8 +1066,8 @@ class ShadowDaemon:
                     Decimal("1"),
                 ),
             ),
-            snapshot=RouterSnapshot(0, (), ()),
-            available_capital=Decimal("1000"),
+            snapshot=self._router_snapshot_from_paper(state.observed_at),
+            available_capital=Decimal(str(paper_summary["available_capital"])),
             policy=RouterPolicy(
                 "v3.15.4-directional-router",
                 (
@@ -1057,10 +1088,12 @@ class ShadowDaemon:
                 payload={"candidate_id": candidate.candidate_id, "label": _PAPER_LABEL},
             )
             return False, {"router_status": "ROUTER_REJECTED_DIRECTIONAL"}, abstains
+        portfolio_state = self._portfolio_state_from_paper(state.observed_at)
         risk = _risk_decision(
             candidate,
             market,
             state,
+            portfolio_state=portfolio_state,
             approved_id=f"risk:{candidate.candidate_id}",
         )
         if not risk.approved:
@@ -1124,6 +1157,9 @@ class ShadowDaemon:
                 "asset": market.asset.value,
                 "horizon": market.horizon.value,
                 "condition_id": market.condition_id,
+                "market_id": market.market_id,
+                "window_start": market.window_start.isoformat(),
+                "window_end": market.window_end.isoformat(),
                 "side": selected_side.value,
                 "ptb": str(state.price_to_beat.value)
                 if state.price_to_beat is not None
@@ -1135,6 +1171,7 @@ class ShadowDaemon:
                 "fee": str(pricing.total_fee_usdc),
                 "net_edge": str(assessment.net_edge),
                 "stake": str(candidate.required_capital),
+                "cost_basis_usdc": str(candidate.required_capital),
                 "shares": str(pricing.filled_quantity),
                 "model_version": forecast.model_version if forecast is not None else None,
                 "calibration_version": calibration_version,
@@ -1157,6 +1194,87 @@ class ShadowDaemon:
                 "paper_fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
             },
             0,
+        )
+
+    def _active_directional_conditions(self, now: datetime) -> set[str]:
+        active = set()
+        for trade in self._paper_repository.trades(
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            status="OPEN",
+            limit=100_000,
+        ):
+            window_end = _payload_datetime(trade.payload.get("window_end"))
+            if window_end is None or window_end > now:
+                active.add(trade.condition_id)
+        return active
+
+    def _router_snapshot_from_paper(self, now: datetime) -> RouterSnapshot:
+        claims: list[RouterClaim] = []
+        for trade in self._paper_repository.trades(
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            status="OPEN",
+            limit=100_000,
+        ):
+            window_end = _payload_datetime(trade.payload.get("window_end")) or (
+                now + timedelta(minutes=5)
+            )
+            if window_end <= now:
+                continue
+            stake = _payload_decimal(trade.payload, "cost_basis_usdc", "stake")
+            if stake <= Decimal("0"):
+                continue
+            claims.append(
+                RouterClaim(
+                    claim_id=f"paper-open:{trade.trade_id}",
+                    idempotency_key=f"paper-open:{trade.trade_id}",
+                    candidate_id=trade.decision_id,
+                    condition_id=trade.condition_id,
+                    token_ids=(str(trade.payload.get("token_id", trade.trade_id)),),
+                    strategy=StrategyKind.DIRECTIONAL_EDGE,
+                    reserved_capital=stake,
+                    created_at=trade.observed_at,
+                    expires_at=window_end,
+                    status=ClaimStatus.ACTIVE,
+                )
+            )
+        return RouterSnapshot(0, tuple(claims), ())
+
+    def _portfolio_state_from_paper(self, now: datetime) -> PortfolioState:
+        summary = self._paper_repository.summary()
+        exposures = []
+        for trade in self._paper_repository.trades(
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            status="OPEN",
+            limit=100_000,
+        ):
+            window_end = _payload_datetime(trade.payload.get("window_end")) or (
+                now + timedelta(minutes=5)
+            )
+            if window_end <= now:
+                continue
+            stake = _payload_decimal(trade.payload, "cost_basis_usdc", "stake")
+            if stake <= Decimal("0"):
+                continue
+            exposures.append(
+                OpenExposure(
+                    trade.trade_id,
+                    trade.condition_id,
+                    Asset(trade.asset),
+                    Horizon(trade.horizon),
+                    stake,
+                    window_end,
+                )
+            )
+        return PortfolioState(
+            Decimal(str(summary["available_capital"])),
+            tuple(exposures),
+            Decimal(str(summary["realized_pnl"])),
+            Decimal(str(summary["maximum_drawdown"])),
+            int(str(summary["current_losing_streak"])),
+            None,
+            False,
+            True,
+            now,
         )
 
     def _directional_pricing(
@@ -1799,6 +1917,12 @@ async def run_daemon(
             ),
         )
         feature_state = ExternalTemporalState(max_age=timedelta(seconds=120), minimum_points=3)
+        settlement_service = PaperSettlementService(
+            paper_repository=paper,
+            corpus_repository=directional_corpus,
+            resolver=GammaOfficialSettlementResolver(transport, clock),
+            clock=clock,
+        )
         daemon = ShadowDaemon(
             data_client=PublicShadowDataClient(
                 transport,
@@ -1811,6 +1935,7 @@ async def run_daemon(
             evidence_window=evidence_window,
             report_dir=report_dir,
             directional_corpus_repository=directional_corpus,
+            settlement_service=settlement_service,
             clock=clock,
             poll_seconds=poll_seconds,
         )
@@ -1873,6 +1998,7 @@ def _risk_decision(
     market: Market,
     state: ShadowMarketState,
     *,
+    portfolio_state: PortfolioState | None = None,
     approved_id: str,
 ) -> RiskDecision:
     liquidity = None
@@ -1901,16 +2027,9 @@ def _risk_decision(
         asset=market.asset,
         horizon=market.horizon,
         liquidity=liquidity,
-        state=PortfolioState(
-            Decimal("1000"),
-            (),
-            Decimal("0"),
-            Decimal("0"),
-            0,
-            None,
-            False,
-            True,
-            state.observed_at,
+        state=portfolio_state
+        or PortfolioState(
+            Decimal("1000"), (), Decimal("0"), Decimal("0"), 0, None, False, True, state.observed_at
         ),
         policy=RiskPolicy(
             20,
@@ -1973,6 +2092,17 @@ def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object
 def _safe_error_text(exc: Exception) -> str:
     text = str(exc).replace("\r", " ").replace("\n", " ").strip()
     return text or type(exc).__name__
+
+
+def _payload_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.astimezone(UTC)
+
+
+def _payload_decimal(payload: Mapping[str, object], primary: str, fallback: str) -> Decimal:
+    return Decimal(str(payload.get(primary, payload.get(fallback, "0"))))
 
 
 def _slug(bucket: MarketBucket, start: datetime) -> str:

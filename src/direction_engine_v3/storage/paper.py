@@ -47,6 +47,26 @@ class PaperAbstainRecord:
     observed_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class PaperTradeSettlement:
+    settlement_id: str
+    trade_id: str
+    condition_id: str
+    official_winning_side: str
+    selected_side: str
+    settlement_source_kind: str
+    settlement_source: str
+    official_resolved_at: datetime
+    settled_at: datetime
+    filled_shares: Decimal
+    cost_basis_usdc: Decimal
+    payout_usdc: Decimal
+    realized_paper_pnl: Decimal
+    win_loss: str
+    evidence_hash: str
+    payload: Mapping[str, object]
+
+
 class SQLitePaperRepository:
     """Durable idempotency and immutable audit events; never stores credentials."""
 
@@ -93,6 +113,24 @@ class SQLitePaperRepository:
                     reason TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     observed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS paper_trade_settlements (
+                    settlement_id TEXT PRIMARY KEY,
+                    trade_id TEXT NOT NULL UNIQUE,
+                    condition_id TEXT NOT NULL,
+                    official_winning_side TEXT NOT NULL,
+                    selected_side TEXT NOT NULL,
+                    settlement_source_kind TEXT NOT NULL,
+                    settlement_source TEXT NOT NULL,
+                    official_resolved_at TEXT NOT NULL,
+                    settled_at TEXT NOT NULL,
+                    filled_shares TEXT NOT NULL,
+                    cost_basis_usdc TEXT NOT NULL,
+                    payout_usdc TEXT NOT NULL,
+                    realized_paper_pnl TEXT NOT NULL,
+                    win_loss TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
                 );
                 """
             )
@@ -248,6 +286,123 @@ class SQLitePaperRepository:
             raise RuntimeError("paper abstain record was not durably recorded")
         return stored[0]
 
+    def save_settlement_once(
+        self,
+        *,
+        settlement_id: str,
+        trade_id: str,
+        condition_id: str,
+        official_winning_side: str,
+        selected_side: str,
+        settlement_source_kind: str,
+        settlement_source: str,
+        official_resolved_at: datetime,
+        settled_at: datetime,
+        filled_shares: Decimal,
+        cost_basis_usdc: Decimal,
+        payout_usdc: Decimal,
+        realized_paper_pnl: Decimal,
+        win_loss: str,
+        evidence_hash: str,
+        payload: Mapping[str, object],
+    ) -> PaperTradeSettlement:
+        for name, value in (
+            ("settlement_id", settlement_id),
+            ("trade_id", trade_id),
+            ("condition_id", condition_id),
+            ("official_winning_side", official_winning_side),
+            ("selected_side", selected_side),
+            ("settlement_source_kind", settlement_source_kind),
+            ("settlement_source", settlement_source),
+            ("win_loss", win_loss),
+            ("evidence_hash", evidence_hash),
+        ):
+            require_text(name, value)
+        require_utc("official_resolved_at", official_resolved_at)
+        require_utc("settled_at", settled_at)
+        require_decimal("filled_shares", filled_shares, minimum=Decimal("0"))
+        require_decimal("cost_basis_usdc", cost_basis_usdc, minimum=Decimal("0"))
+        require_decimal("payout_usdc", payout_usdc, minimum=Decimal("0"))
+        require_decimal("realized_paper_pnl", realized_paper_pnl)
+        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        values = (
+            settlement_id,
+            trade_id,
+            condition_id,
+            official_winning_side,
+            selected_side,
+            settlement_source_kind,
+            settlement_source,
+            official_resolved_at.isoformat(),
+            settled_at.isoformat(),
+            str(filled_shares),
+            str(cost_basis_usdc),
+            str(payout_usdc),
+            str(realized_paper_pnl),
+            win_loss,
+            evidence_hash,
+            encoded,
+        )
+        with sqlite3.connect(self._path) as connection:
+            existing = connection.execute(
+                "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
+                "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
+                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
+                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone()
+            if existing is not None:
+                stored = _settlement_from_row(existing)
+                if stored.evidence_hash != evidence_hash or stored.win_loss != win_loss:
+                    raise RuntimeError("conflicting PAPER settlement for trade")
+                return stored
+            connection.execute(
+                """
+                INSERT INTO paper_trade_settlements
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                values,
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO audit_events VALUES (?,?,?,?,?)",
+                (
+                    f"paper-settlement:{trade_id}",
+                    trade_id,
+                    "PAPER_SETTLEMENT",
+                    encoded,
+                    settled_at.isoformat(),
+                ),
+            )
+        inserted = self.settlement_for_trade(trade_id)
+        if inserted is None:
+            raise RuntimeError("paper settlement was not durably recorded")
+        return inserted
+
+    def settlement_for_trade(self, trade_id: str) -> PaperTradeSettlement | None:
+        require_text("trade_id", trade_id)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
+                "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
+                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
+                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone()
+        return None if row is None else _settlement_from_row(row)
+
+    def settlements(self) -> tuple[PaperTradeSettlement, ...]:
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
+                "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
+                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
+                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "ORDER BY settled_at DESC"
+            ).fetchall()
+        return tuple(_settlement_from_row(row) for row in rows)
+
     def trades(
         self,
         *,
@@ -268,21 +423,22 @@ class SQLitePaperRepository:
             raise ValueError("offset must be non-negative")
         clauses: list[str] = []
         params: list[object] = []
+        post_status = status
+        post_win_loss = win_loss
         for column, value in (
             ("asset", asset),
             ("horizon", horizon),
             ("strategy", strategy),
             ("side", side),
-            ("status", status),
         ):
             if value is not None:
                 require_text(column, value)
                 clauses.append(f"{column}=?")
                 params.append(value)
-        if win_loss is not None:
-            require_text("win_loss", win_loss)
-            clauses.append("json_extract(payload_json, '$.win_loss')=?")
-            params.append(win_loss)
+        if post_status is not None:
+            require_text("status", post_status)
+        if post_win_loss is not None:
+            require_text("win_loss", post_win_loss)
         if start is not None:
             require_utc("start", start)
             clauses.append("observed_at>=?")
@@ -297,11 +453,15 @@ class SQLitePaperRepository:
         )
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY observed_at DESC LIMIT ? OFFSET ?"
-        params.extend((limit, offset))
+        query += " ORDER BY observed_at DESC"
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
-        return tuple(_trade_from_row(row) for row in rows)
+        trades = tuple(self._overlay_trade(_trade_from_row(row)) for row in rows)
+        if post_status is not None:
+            trades = tuple(item for item in trades if item.status == post_status)
+        if post_win_loss is not None:
+            trades = tuple(item for item in trades if item.payload.get("win_loss") == post_win_loss)
+        return trades[offset : offset + limit]
 
     def trade_by_id(self, trade_id: str) -> PaperTradeSnapshot | None:
         require_text("trade_id", trade_id)
@@ -311,7 +471,7 @@ class SQLitePaperRepository:
                 "label,payload_json,observed_at FROM paper_trade_snapshots WHERE trade_id=?",
                 (trade_id,),
             ).fetchone()
-        return None if row is None else _trade_from_row(row)
+        return None if row is None else self._overlay_trade(_trade_from_row(row))
 
     def abstains(
         self,
@@ -353,7 +513,7 @@ class SQLitePaperRepository:
 
     def summary(self, *, initial_equity: Decimal = Decimal("1000")) -> dict[str, object]:
         require_decimal("initial_equity", initial_equity, minimum=Decimal("0"))
-        trades = self.trades(limit=10_000)
+        trades = self.trades(limit=100_000)
         realized_pnl = sum(
             (Decimal(str(item.payload.get("realized_paper_pnl", "0"))) for item in trades),
             Decimal("0"),
@@ -363,41 +523,121 @@ class SQLitePaperRepository:
             Decimal("0"),
         )
         settled = tuple(item for item in trades if item.status == "SETTLED")
+        open_trades = tuple(item for item in trades if item.status == "OPEN")
+        pending = tuple(item for item in trades if item.status == "SETTLEMENT_PENDING")
         wins = sum(1 for item in settled if item.payload.get("win_loss") == "WIN")
         losses = sum(1 for item in settled if item.payload.get("win_loss") == "LOSS")
+        voids = sum(1 for item in settled if item.payload.get("win_loss") == "VOID")
+        settled_cost_basis = sum(
+            (_capital_basis(item) for item in settled),
+            Decimal("0"),
+        )
         net_edges = [
             Decimal(str(item.payload["net_edge"]))
             for item in trades
             if item.payload.get("net_edge") is not None
         ]
-        open_positions = sum(1 for item in trades if item.status not in {"SETTLED", "REJECTED"})
+        open_exposure = sum(
+            (_capital_basis(item) for item in open_trades),
+            Decimal("0"),
+        )
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",
             "paper_initial_equity": str(initial_equity),
             "paper_current_equity": str(initial_equity + realized_pnl),
+            "available_capital": str(initial_equity + realized_pnl - open_exposure),
             "realized_pnl": str(realized_pnl),
-            "unrealized_open_exposure": str(
-                sum(
-                    (
-                        Decimal(str(item.payload.get("stake", "0")))
-                        for item in trades
-                        if item.status == "OPEN"
-                    ),
-                    Decimal("0"),
-                )
-            ),
-            "open_positions": open_positions,
+            "unrealized_open_exposure": str(open_exposure),
+            "open_positions": len(open_trades),
+            "settlement_pending": len(pending),
             "settled_trades": len(settled),
             "wins": wins,
             "losses": losses,
+            "voids": voids,
             "win_rate": str(Decimal(wins) / Decimal(len(settled))) if settled else "0",
+            "roi": str(realized_pnl / settled_cost_basis) if settled_cost_basis else "0",
             "total_fees": str(total_fees),
             "average_net_edge": str(sum(net_edges, Decimal("0")) / Decimal(len(net_edges)))
             if net_edges
             else "0",
-            "maximum_drawdown": "0",
+            "maximum_drawdown": str(_maximum_drawdown(trades)),
             "current_losing_streak": _current_losing_streak(trades),
         }
+
+    def performance(self, *, strategy: str = "DIRECTIONAL_EDGE") -> dict[str, object]:
+        require_text("strategy", strategy)
+        trades = self.trades(strategy=strategy, limit=100_000)
+        summary = self.summary()
+        buckets: dict[str, dict[str, object]] = {}
+        for item in trades:
+            key = f"{item.asset}-{item.horizon}"
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "asset": item.asset,
+                    "horizon": item.horizon,
+                    "total_trades": 0,
+                    "open_positions": 0,
+                    "settled_trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "realized_pnl": "0",
+                },
+            )
+            bucket["total_trades"] = int(str(bucket["total_trades"])) + 1
+            if item.status == "OPEN":
+                bucket["open_positions"] = int(str(bucket["open_positions"])) + 1
+            if item.status == "SETTLED":
+                bucket["settled_trades"] = int(str(bucket["settled_trades"])) + 1
+                if item.payload.get("win_loss") == "WIN":
+                    bucket["wins"] = int(str(bucket["wins"])) + 1
+                if item.payload.get("win_loss") == "LOSS":
+                    bucket["losses"] = int(str(bucket["losses"])) + 1
+                pnl = Decimal(str(bucket["realized_pnl"])) + Decimal(
+                    str(item.payload.get("realized_paper_pnl", "0"))
+                )
+                bucket["realized_pnl"] = str(pnl)
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "strategy": strategy,
+            "summary": summary,
+            "buckets": tuple(buckets.values()),
+        }
+
+    def _overlay_trade(self, trade: PaperTradeSnapshot) -> PaperTradeSnapshot:
+        settlement = self.settlement_for_trade(trade.trade_id)
+        if settlement is None:
+            return trade
+        payload = dict(trade.payload)
+        payload.update(
+            {
+                "official_winning_side": settlement.official_winning_side,
+                "settlement_source_kind": settlement.settlement_source_kind,
+                "settlement_source": settlement.settlement_source,
+                "official_resolved_at": settlement.official_resolved_at.isoformat(),
+                "settled_at": settlement.settled_at.isoformat(),
+                "filled_shares": str(settlement.filled_shares),
+                "cost_basis_usdc": str(settlement.cost_basis_usdc),
+                "payout_usdc": str(settlement.payout_usdc),
+                "realized_paper_pnl": str(settlement.realized_paper_pnl),
+                "win_loss": settlement.win_loss,
+                "evidence_hash": settlement.evidence_hash,
+                "position_status": "SETTLED",
+            }
+        )
+        return PaperTradeSnapshot(
+            trade.trade_id,
+            trade.decision_id,
+            trade.strategy,
+            trade.asset,
+            trade.horizon,
+            trade.condition_id,
+            trade.side,
+            "SETTLED",
+            trade.label,
+            payload,
+            trade.observed_at,
+        )
 
     @property
     def path(self) -> Path:
@@ -439,6 +679,30 @@ def _abstain_from_row(row: tuple[object, ...]) -> PaperAbstainRecord:
     )
 
 
+def _settlement_from_row(row: tuple[object, ...]) -> PaperTradeSettlement:
+    payload = json.loads(str(row[15]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("paper settlement payload is not an object")
+    return PaperTradeSettlement(
+        str(row[0]),
+        str(row[1]),
+        str(row[2]),
+        str(row[3]),
+        str(row[4]),
+        str(row[5]),
+        str(row[6]),
+        datetime.fromisoformat(str(row[7])),
+        datetime.fromisoformat(str(row[8])),
+        Decimal(str(row[9])),
+        Decimal(str(row[10])),
+        Decimal(str(row[11])),
+        Decimal(str(row[12])),
+        str(row[13]),
+        str(row[14]),
+        payload,
+    )
+
+
 def _current_losing_streak(trades: tuple[PaperTradeSnapshot, ...]) -> int:
     streak = 0
     for item in sorted(trades, key=lambda trade: trade.observed_at, reverse=True):
@@ -449,6 +713,23 @@ def _current_losing_streak(trades: tuple[PaperTradeSnapshot, ...]) -> int:
         if outcome == "WIN":
             break
     return streak
+
+
+def _maximum_drawdown(trades: tuple[PaperTradeSnapshot, ...]) -> Decimal:
+    equity = peak = maximum = Decimal("0")
+    settled = sorted(
+        (item for item in trades if item.status == "SETTLED"),
+        key=lambda trade: str(trade.payload.get("settled_at", trade.observed_at.isoformat())),
+    )
+    for item in settled:
+        equity += Decimal(str(item.payload.get("realized_paper_pnl", "0")))
+        peak = max(peak, equity)
+        maximum = max(maximum, peak - equity)
+    return maximum
+
+
+def _capital_basis(trade: PaperTradeSnapshot) -> Decimal:
+    return Decimal(str(trade.payload.get("cost_basis_usdc", trade.payload.get("stake", "0"))))
 
 
 def _jsonable(value: object) -> object:

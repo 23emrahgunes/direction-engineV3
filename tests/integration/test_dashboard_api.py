@@ -36,6 +36,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/metrics"),
         ("GET", "/api/dashboard"),
         ("GET", "/api/paper/summary"),
+        ("GET", "/api/paper/performance"),
         ("GET", "/api/paper/trades"),
         ("GET", "/api/paper/trades/{id}"),
         ("GET", "/api/paper/abstains"),

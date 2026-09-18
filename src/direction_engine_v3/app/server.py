@@ -10,6 +10,7 @@ from aiohttp import web
 from direction_engine_v3.app.dashboard import (
     build_dashboard_snapshot,
     build_directional_runtime_status,
+    build_paper_performance,
     build_paper_summary,
     build_shadow_status,
     get_paper_trade,
@@ -68,6 +69,12 @@ async def paper_summary(_request: web.Request) -> web.Response:
     return web.json_response(build_paper_summary())
 
 
+async def paper_performance(request: web.Request) -> web.Response:
+    return web.json_response(
+        build_paper_performance(strategy=request.query.get("strategy", "DIRECTIONAL_EDGE"))
+    )
+
+
 async def paper_trades(request: web.Request) -> web.Response:
     return web.json_response(
         list_paper_trades(
@@ -121,6 +128,7 @@ def create_app() -> web.Application:
     app.router.add_get("/metrics", metrics, allow_head=False)
     app.router.add_get("/api/dashboard", dashboard, allow_head=False)
     app.router.add_get("/api/paper/summary", paper_summary, allow_head=False)
+    app.router.add_get("/api/paper/performance", paper_performance, allow_head=False)
     app.router.add_get("/api/paper/trades", paper_trades, allow_head=False)
     app.router.add_get("/api/paper/trades/{id}", paper_trade_detail, allow_head=False)
     app.router.add_get("/api/paper/abstains", paper_abstains, allow_head=False)
