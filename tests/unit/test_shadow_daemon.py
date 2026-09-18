@@ -47,6 +47,22 @@ class FixtureClient:
         return _market_state(bucket)
 
 
+class SettlementProbe:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run_once(self) -> dict[str, object]:
+        self.calls += 1
+        return {
+            "settlement_checked": 0,
+            "settlement_pending": 0,
+            "settlement_completed": 0,
+            "settlement_blocked": 0,
+            "last_settlement_check_at": NOW.isoformat(),
+            "last_settlement_error": None,
+        }
+
+
 def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
     shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
@@ -90,6 +106,120 @@ def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) ->
     assert directional.payload["real_order_submission"] is False
     assert paper.summary()["open_positions"] == 2
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_scan(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    paper.save_trade_snapshot(
+        trade_id="existing-filled-over-budget",
+        decision_id="decision:existing",
+        strategy="DIRECTIONAL_EDGE",
+        asset="BTC",
+        horizon="5m",
+        condition_id="condition-existing",
+        side="UP",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=1),
+        payload={
+            "condition_id": "condition-existing",
+            "market_id": "market-existing",
+            "stake": "1200",
+            "cost_basis_usdc": "1200",
+            "shares": "1200",
+            "window_end": (NOW + timedelta(minutes=4)).isoformat(),
+            "fill_status": "FILLED",
+            "real_order_submission": False,
+        },
+    )
+    probe = SettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    result = asyncio.run(daemon.run_once())
+
+    assert probe.calls == 1
+    assert result.markets_discovered == 1
+    capital_abstain = next(
+        item for item in paper.abstains() if item.reason == "PAPER_CAPITAL_DEFICIT"
+    )
+    assert capital_abstain.payload["raw_available_capital"] == "-200"
+    assert capital_abstain.payload["spendable_capital"] == "0"
+    directional_trades = paper.trades(strategy="DIRECTIONAL_EDGE", limit=100)
+    assert len(directional_trades) == 1
+    summary = paper.summary(now=NOW)
+    assert Decimal(str(summary["raw_available_capital"])) < Decimal("0")
+    assert summary["spendable_capital"] == "0"
+    assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
+    assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_router_snapshot_does_not_reserve_filled_positions_twice(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    paper.save_trade_snapshot(
+        trade_id="filled-open",
+        decision_id="decision:filled",
+        strategy="DIRECTIONAL_EDGE",
+        asset="BTC",
+        horizon="5m",
+        condition_id="condition-filled",
+        side="UP",
+        status="OPEN",
+        observed_at=NOW,
+        payload={
+            "stake": "10",
+            "cost_basis_usdc": "10",
+            "window_end": (NOW + timedelta(minutes=5)).isoformat(),
+            "fill_status": "FILLED",
+            "real_order_submission": False,
+        },
+    )
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    snapshot = daemon._router_snapshot_from_paper(NOW)
+    portfolio = daemon._portfolio_state_from_paper(NOW)
+
+    assert snapshot.claims == ()
+    assert portfolio.bankroll_available == Decimal("990")
+    assert tuple(item.capital_at_risk for item in portfolio.exposures) == (Decimal("10"),)
 
 
 def _market_state(bucket: MarketBucket) -> ShadowMarketState:

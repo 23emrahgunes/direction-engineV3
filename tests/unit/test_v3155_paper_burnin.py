@@ -79,6 +79,75 @@ def test_official_down_settlement_settles_up_trade_as_loss(tmp_path):
     assert trade.payload["realized_paper_pnl"] == "-3.04150"
 
 
+def test_paper_summary_preserves_negative_raw_capital_and_accounting_buckets(tmp_path):
+    paper = _paper(tmp_path)
+    _trade(
+        paper,
+        trade_id="open-over-budget",
+        condition_id="condition-open",
+        stake="1200",
+        shares="1200",
+        fee="0",
+    )
+
+    summary = paper.summary(now=NOW)
+
+    assert summary["initial_equity"] == "1000"
+    assert summary["raw_available_capital"] == "-200"
+    assert summary["available_capital"] == "-200"
+    assert summary["spendable_capital"] == "0"
+    assert summary["open_cost_basis"] == "1200"
+    assert summary["expired_but_unsettled_cost_basis"] == "1200"
+    assert summary["unfilled_reservations"] == "0"
+    assert summary["open_trade_count"] == 1
+    assert summary["open_unique_condition_count"] == 1
+
+
+def test_settlement_scan_reports_legacy_open_trade_missing_window_end(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    paper.save_trade_snapshot(
+        trade_id="legacy-open",
+        decision_id="decision:legacy",
+        strategy="DIRECTIONAL_EDGE",
+        asset="BTC",
+        horizon="5m",
+        condition_id="condition-legacy",
+        side="UP",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=10),
+        payload={
+            "market_id": "market-legacy",
+            "condition_id": "condition-legacy",
+            "side": "UP",
+            "stake": "1",
+            "cost_basis_usdc": "1",
+            "shares": "1",
+            "real_order_submission": False,
+        },
+    )
+    resolver = Resolver(_official("UP", condition_id="condition-legacy", market_id="market-legacy"))
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=resolver,
+        clock=Clock(),
+    )
+
+    result = asyncio.run(service.run_once())
+    trade = paper.trade_by_id("legacy-open")
+
+    assert resolver.calls == 0
+    assert result["settlement_checked"] == 1
+    assert result["settlement_blocked"] == 1
+    assert (
+        result["last_settlement_error"]
+        == "condition-legacy:SETTLEMENT_BLOCKED:LEGACY_MARKET_IDENTITY_INCOMPLETE"
+    )
+    assert trade is not None
+    assert trade.status == "OPEN"
+
+
 def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
     pending = parse_gamma_official_settlement(
         _official("UP") | {"closed": False},

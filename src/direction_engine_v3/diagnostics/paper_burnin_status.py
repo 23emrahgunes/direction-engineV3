@@ -21,6 +21,13 @@ def main() -> None:
     print("-----------------")
     summary = payload["performance"]["summary"]
     for key in (
+        "initial_equity",
+        "raw_available_capital",
+        "spendable_capital",
+        "open_cost_basis",
+        "expired_but_unsettled_cost_basis",
+        "unfilled_reservations",
+        "legacy_missing_window_end_count",
         "open_positions",
         "settlement_pending",
         "settled_trades",

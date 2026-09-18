@@ -116,7 +116,7 @@ class PaperSettlementService:
             strategy="DIRECTIONAL_EDGE", status="OPEN", limit=100_000
         ):
             window_end = _trade_window_end(item)
-            if window_end is not None and window_end <= now:
+            if window_end is None or window_end <= now:
                 candidates.append(item)
         for trade in candidates:
             if checked >= self._max:
@@ -126,6 +126,13 @@ class PaperSettlementService:
             seen_conditions.add(trade.condition_id)
             matching = tuple(item for item in candidates if item.condition_id == trade.condition_id)
             checked += len(matching)
+            if _trade_window_end(trade) is None:
+                blocked += len(matching)
+                errors.append(
+                    f"{trade.condition_id}:SETTLEMENT_BLOCKED:"
+                    "LEGACY_MARKET_IDENTITY_INCOMPLETE"
+                )
+                continue
             try:
                 result = await self._resolver.resolve(
                     condition_id=trade.condition_id,

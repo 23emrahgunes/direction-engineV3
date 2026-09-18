@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -511,8 +511,16 @@ class SQLitePaperRepository:
             rows = connection.execute(query, tuple(params)).fetchall()
         return tuple(_abstain_from_row(row) for row in rows)
 
-    def summary(self, *, initial_equity: Decimal = Decimal("1000")) -> dict[str, object]:
+    def summary(
+        self,
+        *,
+        initial_equity: Decimal = Decimal("1000"),
+        now: datetime | None = None,
+    ) -> dict[str, object]:
         require_decimal("initial_equity", initial_equity, minimum=Decimal("0"))
+        if now is None:
+            now = datetime.now(UTC)
+        require_utc("now", now)
         trades = self.trades(limit=100_000)
         realized_pnl = sum(
             (Decimal(str(item.payload.get("realized_paper_pnl", "0"))) for item in trades),
@@ -524,6 +532,7 @@ class SQLitePaperRepository:
         )
         settled = tuple(item for item in trades if item.status == "SETTLED")
         open_trades = tuple(item for item in trades if item.status == "OPEN")
+        acknowledged = tuple(item for item in trades if item.status == "ACKNOWLEDGED")
         pending = tuple(item for item in trades if item.status == "SETTLEMENT_PENDING")
         wins = sum(1 for item in settled if item.payload.get("win_loss") == "WIN")
         losses = sum(1 for item in settled if item.payload.get("win_loss") == "LOSS")
@@ -537,18 +546,48 @@ class SQLitePaperRepository:
             for item in trades
             if item.payload.get("net_edge") is not None
         ]
-        open_exposure = sum(
+        open_cost_basis = sum(
             (_capital_basis(item) for item in open_trades),
             Decimal("0"),
         )
+        unfilled_reservations = sum(
+            (_capital_basis(item) for item in acknowledged),
+            Decimal("0"),
+        )
+        expired_but_unsettled_cost_basis = sum(
+            (
+                _capital_basis(item)
+                for item in open_trades
+                if (window_end := _payload_datetime(item.payload.get("window_end"))) is not None
+                and window_end <= now
+            ),
+            Decimal("0"),
+        )
+        legacy_missing_window_end_count = sum(
+            1 for item in open_trades if _payload_datetime(item.payload.get("window_end")) is None
+        )
+        open_unique_condition_count = len({item.condition_id for item in open_trades})
+        raw_available_capital = (
+            initial_equity + realized_pnl - open_cost_basis - unfilled_reservations
+        )
+        spendable_capital = max(Decimal("0"), raw_available_capital)
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",
+            "initial_equity": str(initial_equity),
             "paper_initial_equity": str(initial_equity),
             "paper_current_equity": str(initial_equity + realized_pnl),
-            "available_capital": str(initial_equity + realized_pnl - open_exposure),
+            "available_capital": str(raw_available_capital),
+            "raw_available_capital": str(raw_available_capital),
+            "spendable_capital": str(spendable_capital),
             "realized_pnl": str(realized_pnl),
-            "unrealized_open_exposure": str(open_exposure),
+            "open_cost_basis": str(open_cost_basis),
+            "expired_but_unsettled_cost_basis": str(expired_but_unsettled_cost_basis),
+            "unfilled_reservations": str(unfilled_reservations),
+            "unrealized_open_exposure": str(open_cost_basis),
             "open_positions": len(open_trades),
+            "open_trade_count": len(open_trades),
+            "open_unique_condition_count": open_unique_condition_count,
+            "legacy_missing_window_end_count": legacy_missing_window_end_count,
             "settlement_pending": len(pending),
             "settled_trades": len(settled),
             "wins": wins,
@@ -730,6 +769,15 @@ def _maximum_drawdown(trades: tuple[PaperTradeSnapshot, ...]) -> Decimal:
 
 def _capital_basis(trade: PaperTradeSnapshot) -> Decimal:
     return Decimal(str(trade.payload.get("cost_basis_usdc", trade.payload.get("stake", "0"))))
+
+
+def _payload_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
 
 
 def _jsonable(value: object) -> object:

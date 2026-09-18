@@ -707,13 +707,6 @@ class ShadowDaemon:
     async def run_once(self) -> ShadowCycleResult:
         started_at = self._clock.utc_now()
         cycle_id = f"shadow-cycle:{int(started_at.timestamp() * 1000)}"
-        states = await asyncio.gather(
-            *(
-                self._data_client.collect_bucket(bucket, now=started_at)
-                for bucket in SUPPORTED_MARKET_BUCKETS
-            )
-        )
-        result = self._evaluate_cycle(cycle_id, started_at, states)
         settlement_payload: dict[str, object] = {}
         if self._settlement_service is not None:
             settlement_payload = await self._settlement_service.run_once()
@@ -725,6 +718,13 @@ class ShadowDaemon:
                 payload=settlement_payload,
                 observed_at=started_at,
             )
+        states = await asyncio.gather(
+            *(
+                self._data_client.collect_bucket(bucket, now=started_at)
+                for bucket in SUPPORTED_MARKET_BUCKETS
+            )
+        )
+        result = self._evaluate_cycle(cycle_id, started_at, states)
         self._shadow_repository.append_event(
             event_id=f"{self._evidence_window.window_id}:{cycle_id}",
             window_id=self._evidence_window.window_id,
@@ -1055,7 +1055,36 @@ class ShadowDaemon:
                 {"router_status": "DIRECTIONAL_POSITION_ALREADY_OPEN"},
                 abstains,
             )
-        paper_summary = self._paper_repository.summary()
+        paper_summary = self._paper_repository.summary(now=state.observed_at)
+        capital = _paper_capital_gate(paper_summary, candidate.required_capital)
+        if capital.status != "PAPER_CAPITAL_OK":
+            payload = {
+                "candidate_id": candidate.candidate_id,
+                "label": _PAPER_LABEL,
+                "raw_available_capital": capital.raw_available_capital,
+                "spendable_capital": capital.spendable_capital,
+                "required_capital": str(candidate.required_capital),
+                "open_cost_basis": paper_summary.get("open_cost_basis"),
+                "expired_but_unsettled_cost_basis": paper_summary.get(
+                    "expired_but_unsettled_cost_basis"
+                ),
+                "unfilled_reservations": paper_summary.get("unfilled_reservations"),
+                "open_trade_count": paper_summary.get("open_trade_count"),
+                "open_unique_condition_count": paper_summary.get(
+                    "open_unique_condition_count"
+                ),
+                "legacy_missing_window_end_count": paper_summary.get(
+                    "legacy_missing_window_end_count"
+                ),
+            }
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason=capital.status,
+                payload=payload,
+            )
+            return False, {"router_status": capital.status, **payload}, abstains
         routing = route_opportunities(
             (
                 RoutingOpportunity(
@@ -1067,7 +1096,7 @@ class ShadowDaemon:
                 ),
             ),
             snapshot=self._router_snapshot_from_paper(state.observed_at),
-            available_capital=Decimal(str(paper_summary["available_capital"])),
+            available_capital=capital.spendable_decimal,
             policy=RouterPolicy(
                 "v3.15.4-directional-router",
                 (
@@ -1203,9 +1232,7 @@ class ShadowDaemon:
             status="OPEN",
             limit=100_000,
         ):
-            window_end = _payload_datetime(trade.payload.get("window_end"))
-            if window_end is None or window_end > now:
-                active.add(trade.condition_id)
+            active.add(trade.condition_id)
         return active
 
     def _router_snapshot_from_paper(self, now: datetime) -> RouterSnapshot:
@@ -1219,6 +1246,8 @@ class ShadowDaemon:
                 now + timedelta(minutes=5)
             )
             if window_end <= now:
+                continue
+            if str(trade.payload.get("fill_status", "")).upper() == "FILLED":
                 continue
             stake = _payload_decimal(trade.payload, "cost_basis_usdc", "stake")
             if stake <= Decimal("0"):
@@ -1240,7 +1269,7 @@ class ShadowDaemon:
         return RouterSnapshot(0, tuple(claims), ())
 
     def _portfolio_state_from_paper(self, now: datetime) -> PortfolioState:
-        summary = self._paper_repository.summary()
+        summary = self._paper_repository.summary(now=now)
         exposures = []
         for trade in self._paper_repository.trades(
             strategy=StrategyKind.DIRECTIONAL_EDGE.value,
@@ -1250,11 +1279,12 @@ class ShadowDaemon:
             window_end = _payload_datetime(trade.payload.get("window_end")) or (
                 now + timedelta(minutes=5)
             )
-            if window_end <= now:
-                continue
             stake = _payload_decimal(trade.payload, "cost_basis_usdc", "stake")
             if stake <= Decimal("0"):
                 continue
+            exposure_window_end = window_end
+            if exposure_window_end <= now:
+                exposure_window_end = now + timedelta(seconds=1)
             exposures.append(
                 OpenExposure(
                     trade.trade_id,
@@ -1262,11 +1292,11 @@ class ShadowDaemon:
                     Asset(trade.asset),
                     Horizon(trade.horizon),
                     stake,
-                    window_end,
+                    exposure_window_end,
                 )
             )
         return PortfolioState(
-            Decimal(str(summary["available_capital"])),
+            Decimal(str(summary["spendable_capital"])),
             tuple(exposures),
             Decimal(str(summary["realized_pnl"])),
             Decimal(str(summary["maximum_drawdown"])),
@@ -2104,6 +2134,48 @@ def _payload_datetime(value: object) -> datetime | None:
 
 def _payload_decimal(payload: Mapping[str, object], primary: str, fallback: str) -> Decimal:
     return Decimal(str(payload.get(primary, payload.get(fallback, "0"))))
+
+
+@dataclass(frozen=True, slots=True)
+class _PaperCapitalGate:
+    status: str
+    raw_available_decimal: Decimal | None
+    spendable_decimal: Decimal
+
+    @property
+    def raw_available_capital(self) -> str | None:
+        if self.raw_available_decimal is None:
+            return None
+        return str(self.raw_available_decimal)
+
+    @property
+    def spendable_capital(self) -> str:
+        return str(self.spendable_decimal)
+
+
+def _paper_capital_gate(
+    paper_summary: Mapping[str, object], required_capital: Decimal
+) -> _PaperCapitalGate:
+    try:
+        raw_value = paper_summary.get(
+            "raw_available_capital", paper_summary.get("available_capital")
+        )
+        if raw_value is None:
+            raise ValueError("raw_available_capital missing")
+        raw_available = Decimal(str(raw_value))
+    except Exception:
+        return _PaperCapitalGate("PAPER_CAPITAL_STATE_INVALID", None, Decimal("0"))
+    if not raw_available.is_finite():
+        return _PaperCapitalGate("PAPER_CAPITAL_STATE_INVALID", None, Decimal("0"))
+    if raw_available < Decimal("0"):
+        return _PaperCapitalGate("PAPER_CAPITAL_DEFICIT", raw_available, Decimal("0"))
+    if raw_available <= Decimal("0") or raw_available < required_capital:
+        return _PaperCapitalGate(
+            "INSUFFICIENT_PAPER_CAPITAL",
+            raw_available,
+            max(Decimal("0"), raw_available),
+        )
+    return _PaperCapitalGate("PAPER_CAPITAL_OK", raw_available, raw_available)
 
 
 def _slug(bucket: MarketBucket, start: datetime) -> str:
