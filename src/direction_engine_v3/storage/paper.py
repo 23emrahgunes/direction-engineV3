@@ -67,6 +67,25 @@ class PaperTradeSettlement:
     payload: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class PaperTradeIdentityOverlay:
+    condition_id: str
+    status: str
+    market_id: str | None
+    asset: str
+    horizon: str
+    window_start: datetime | None
+    window_end: datetime | None
+    outcome_tokens: Mapping[str, object]
+    source_kind: str
+    source: str
+    retrieved_at: datetime
+    verified_at: datetime
+    evidence_hash: str
+    blocker_reason: str | None
+    payload: Mapping[str, object]
+
+
 class SQLitePaperRepository:
     """Durable idempotency and immutable audit events; never stores credentials."""
 
@@ -130,6 +149,23 @@ class SQLitePaperRepository:
                     realized_paper_pnl TEXT NOT NULL,
                     win_loss TEXT NOT NULL,
                     evidence_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS paper_trade_identity_overlays (
+                    condition_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    market_id TEXT,
+                    asset TEXT NOT NULL,
+                    horizon TEXT NOT NULL,
+                    window_start TEXT,
+                    window_end TEXT,
+                    outcome_tokens_json TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    retrieved_at TEXT NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    blocker_reason TEXT,
                     payload_json TEXT NOT NULL
                 );
                 """
@@ -403,6 +439,115 @@ class SQLitePaperRepository:
             ).fetchall()
         return tuple(_settlement_from_row(row) for row in rows)
 
+    def save_identity_overlay_once(
+        self,
+        *,
+        condition_id: str,
+        status: str,
+        asset: str,
+        horizon: str,
+        source_kind: str,
+        source: str,
+        retrieved_at: datetime,
+        verified_at: datetime,
+        evidence_hash: str,
+        market_id: str | None = None,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+        outcome_tokens: Mapping[str, object] | None = None,
+        blocker_reason: str | None = None,
+        payload: Mapping[str, object] | None = None,
+    ) -> PaperTradeIdentityOverlay:
+        require_text("condition_id", condition_id)
+        require_text("status", status)
+        require_text("asset", asset)
+        require_text("horizon", horizon)
+        require_text("source_kind", source_kind)
+        require_text("source", source)
+        require_text("evidence_hash", evidence_hash)
+        require_utc("retrieved_at", retrieved_at)
+        require_utc("verified_at", verified_at)
+        if market_id is not None:
+            require_text("market_id", market_id)
+        if window_start is not None:
+            require_utc("window_start", window_start)
+        if window_end is not None:
+            require_utc("window_end", window_end)
+        token_payload = dict(outcome_tokens or {})
+        overlay_payload = dict(payload or {})
+        values = (
+            condition_id,
+            status,
+            market_id,
+            asset,
+            horizon,
+            window_start.isoformat() if window_start is not None else None,
+            window_end.isoformat() if window_end is not None else None,
+            json.dumps(_jsonable(token_payload), sort_keys=True, separators=(",", ":")),
+            source_kind,
+            source,
+            retrieved_at.isoformat(),
+            verified_at.isoformat(),
+            evidence_hash,
+            blocker_reason,
+            json.dumps(_jsonable(overlay_payload), sort_keys=True, separators=(",", ":")),
+        )
+        with sqlite3.connect(self._path) as connection:
+            existing = connection.execute(
+                "SELECT condition_id,status,market_id,asset,horizon,window_start,window_end,"
+                "outcome_tokens_json,source_kind,source,retrieved_at,verified_at,evidence_hash,"
+                "blocker_reason,payload_json FROM paper_trade_identity_overlays "
+                "WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+            if existing is not None:
+                stored = _identity_overlay_from_row(existing)
+                if (
+                    stored.status != status
+                    or stored.market_id != market_id
+                    or stored.asset != asset
+                    or stored.horizon != horizon
+                    or stored.window_start != window_start
+                    or stored.window_end != window_end
+                    or dict(stored.outcome_tokens) != token_payload
+                    or stored.evidence_hash != evidence_hash
+                    or stored.blocker_reason != blocker_reason
+                ):
+                    raise RuntimeError("conflicting paper identity overlay")
+                return stored
+            connection.execute(
+                "INSERT INTO paper_trade_identity_overlays VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+        inserted = self.identity_overlay(condition_id)
+        if inserted is None:
+            raise RuntimeError("paper identity overlay was not durably recorded")
+        return inserted
+
+    def identity_overlay(self, condition_id: str) -> PaperTradeIdentityOverlay | None:
+        require_text("condition_id", condition_id)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT condition_id,status,market_id,asset,horizon,window_start,window_end,"
+                "outcome_tokens_json,source_kind,source,retrieved_at,verified_at,evidence_hash,"
+                "blocker_reason,payload_json FROM paper_trade_identity_overlays "
+                "WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        return None if row is None else _identity_overlay_from_row(row)
+
+    def identity_overlay_counts(self) -> dict[str, int]:
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                "SELECT status,COUNT(*) FROM paper_trade_identity_overlays GROUP BY status"
+            ).fetchall()
+        counts = {str(status): int(count) for status, count in rows}
+        return {
+            "identity_recovered_count": counts.get("RECOVERED", 0),
+            "identity_blocked_count": counts.get("BLOCKED", 0),
+        }
+
     def trades(
         self,
         *,
@@ -546,6 +691,9 @@ class SQLitePaperRepository:
             for item in trades
             if item.payload.get("net_edge") is not None
         ]
+        overlays = {
+            item.condition_id: self.identity_overlay(item.condition_id) for item in open_trades
+        }
         open_cost_basis = sum(
             (_capital_basis(item) for item in open_trades),
             Decimal("0"),
@@ -554,12 +702,31 @@ class SQLitePaperRepository:
             (_capital_basis(item) for item in acknowledged),
             Decimal("0"),
         )
-        expired_but_unsettled_cost_basis = sum(
+        known_active_open_cost_basis = sum(
             (
                 _capital_basis(item)
                 for item in open_trades
-                if (window_end := _payload_datetime(item.payload.get("window_end"))) is not None
+                if (window_end := _effective_window_end(item, overlays.get(item.condition_id)))
+                is not None
+                and window_end > now
+            ),
+            Decimal("0"),
+        )
+        known_expired_unsettled_cost_basis = sum(
+            (
+                _capital_basis(item)
+                for item in open_trades
+                if (window_end := _effective_window_end(item, overlays.get(item.condition_id)))
+                is not None
                 and window_end <= now
+            ),
+            Decimal("0"),
+        )
+        unknown_window_open_cost_basis = sum(
+            (
+                _capital_basis(item)
+                for item in open_trades
+                if _effective_window_end(item, overlays.get(item.condition_id)) is None
             ),
             Decimal("0"),
         )
@@ -567,6 +734,7 @@ class SQLitePaperRepository:
             1 for item in open_trades if _payload_datetime(item.payload.get("window_end")) is None
         )
         open_unique_condition_count = len({item.condition_id for item in open_trades})
+        identity_counts = self.identity_overlay_counts()
         raw_available_capital = (
             initial_equity + realized_pnl - open_cost_basis - unfilled_reservations
         )
@@ -581,13 +749,17 @@ class SQLitePaperRepository:
             "spendable_capital": str(spendable_capital),
             "realized_pnl": str(realized_pnl),
             "open_cost_basis": str(open_cost_basis),
-            "expired_but_unsettled_cost_basis": str(expired_but_unsettled_cost_basis),
+            "known_active_open_cost_basis": str(known_active_open_cost_basis),
+            "known_expired_unsettled_cost_basis": str(known_expired_unsettled_cost_basis),
+            "unknown_window_open_cost_basis": str(unknown_window_open_cost_basis),
+            "expired_but_unsettled_cost_basis": str(known_expired_unsettled_cost_basis),
             "unfilled_reservations": str(unfilled_reservations),
             "unrealized_open_exposure": str(open_cost_basis),
             "open_positions": len(open_trades),
             "open_trade_count": len(open_trades),
             "open_unique_condition_count": open_unique_condition_count,
             "legacy_missing_window_end_count": legacy_missing_window_end_count,
+            **identity_counts,
             "settlement_pending": len(pending),
             "settled_trades": len(settled),
             "wins": wins,
@@ -742,6 +914,30 @@ def _settlement_from_row(row: tuple[object, ...]) -> PaperTradeSettlement:
     )
 
 
+def _identity_overlay_from_row(row: tuple[object, ...]) -> PaperTradeIdentityOverlay:
+    tokens = json.loads(str(row[7]))
+    payload = json.loads(str(row[14]))
+    if not isinstance(tokens, dict) or not isinstance(payload, dict):
+        raise RuntimeError("paper identity overlay payload is not an object")
+    return PaperTradeIdentityOverlay(
+        condition_id=str(row[0]),
+        status=str(row[1]),
+        market_id=None if row[2] is None else str(row[2]),
+        asset=str(row[3]),
+        horizon=str(row[4]),
+        window_start=None if row[5] is None else datetime.fromisoformat(str(row[5])),
+        window_end=None if row[6] is None else datetime.fromisoformat(str(row[6])),
+        outcome_tokens=tokens,
+        source_kind=str(row[8]),
+        source=str(row[9]),
+        retrieved_at=datetime.fromisoformat(str(row[10])),
+        verified_at=datetime.fromisoformat(str(row[11])),
+        evidence_hash=str(row[12]),
+        blocker_reason=None if row[13] is None else str(row[13]),
+        payload=payload,
+    )
+
+
 def _current_losing_streak(trades: tuple[PaperTradeSnapshot, ...]) -> int:
     streak = 0
     for item in sorted(trades, key=lambda trade: trade.observed_at, reverse=True):
@@ -778,6 +974,14 @@ def _payload_datetime(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def _effective_window_end(
+    trade: PaperTradeSnapshot, overlay: PaperTradeIdentityOverlay | None
+) -> datetime | None:
+    return _payload_datetime(trade.payload.get("window_end")) or (
+        overlay.window_end if overlay is not None and overlay.status == "RECOVERED" else None
+    )
 
 
 def _jsonable(value: object) -> object:

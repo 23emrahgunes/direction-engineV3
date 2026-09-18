@@ -25,10 +25,20 @@ class Resolver:
         self.payload = payload
         self.calls = 0
 
+    async def market_metadata(self, condition_id):
+        if isinstance(self.payload, dict) and condition_id in self.payload:
+            return self.payload[condition_id]
+        return self.payload
+
     async def resolve(self, *, condition_id, asset, horizon, expected_market_id=None):
         self.calls += 1
+        payload = (
+            self.payload[condition_id]
+            if isinstance(self.payload, dict) and condition_id in self.payload
+            else self.payload
+        )
         return parse_gamma_official_settlement(
-            self.payload,
+            payload,
             asset=asset,
             horizon=horizon,
             condition_id=condition_id,
@@ -103,7 +113,7 @@ def test_paper_summary_preserves_negative_raw_capital_and_accounting_buckets(tmp
     assert summary["open_unique_condition_count"] == 1
 
 
-def test_settlement_scan_reports_legacy_open_trade_missing_window_end(tmp_path):
+def test_settlement_recovers_legacy_open_trade_identity_and_settles(tmp_path):
     paper = _paper(tmp_path)
     corpus = _corpus(tmp_path)
     paper.save_trade_snapshot(
@@ -137,15 +147,69 @@ def test_settlement_scan_reports_legacy_open_trade_missing_window_end(tmp_path):
     result = asyncio.run(service.run_once())
     trade = paper.trade_by_id("legacy-open")
 
-    assert resolver.calls == 0
+    assert resolver.calls == 1
     assert result["settlement_checked"] == 1
-    assert result["settlement_blocked"] == 1
-    assert (
-        result["last_settlement_error"]
-        == "condition-legacy:SETTLEMENT_BLOCKED:LEGACY_MARKET_IDENTITY_INCOMPLETE"
-    )
+    assert result["identity_recovered"] == 1
+    assert result["settlement_completed"] == 1
     assert trade is not None
-    assert trade.status == "OPEN"
+    assert trade.status == "SETTLED"
+    overlay = paper.identity_overlay("condition-legacy")
+    assert overlay is not None
+    assert overlay.status == "RECOVERED"
+    assert overlay.market_id == "market-legacy"
+    assert overlay.window_end == NOW
+
+
+def test_blocked_legacy_condition_does_not_starve_later_condition(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    for condition in ("condition-bad", "condition-good"):
+        paper.save_trade_snapshot(
+            trade_id=f"trade-{condition}",
+            decision_id=f"decision:{condition}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=condition,
+            side="UP",
+            status="OPEN",
+            observed_at=NOW - timedelta(minutes=10),
+            payload={
+                "market_id": f"market-{condition}",
+                "condition_id": condition,
+                "side": "UP",
+                "stake": "1",
+                "cost_basis_usdc": "1",
+                "shares": "1",
+                "real_order_submission": False,
+            },
+        )
+    bad = _official("UP", condition_id="condition-bad", market_id="market-condition-bad")
+    bad["cryptoMarketConfig"] = dict(bad["cryptoMarketConfig"]) | {"asset": "eth"}
+    resolver = Resolver(
+        {
+            "condition-bad": bad,
+            "condition-good": _official(
+                "UP", condition_id="condition-good", market_id="market-condition-good"
+            ),
+        }
+    )
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=resolver,
+        clock=Clock(),
+        max_trades_per_pass=5,
+    )
+
+    result = asyncio.run(service.run_once())
+
+    assert result["settlement_checked"] == 2
+    assert result["identity_blocked"] == 1
+    assert result["identity_recovered"] == 1
+    assert result["settlement_completed"] == 1
+    assert paper.trade_by_id("trade-condition-good").status == "SETTLED"
+    assert paper.trade_by_id("trade-condition-bad").status == "OPEN"
 
 
 def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
@@ -370,6 +434,20 @@ def _official(
         "active": False,
         "outcomes": '["Down", "Up"]',
         "clobTokenIds": '["down-token", "up-token"]',
+        "eventStartTime": (NOW - timedelta(minutes=5)).isoformat(),
+        "endDate": NOW.isoformat(),
+        "resolutionSource": "Chainlink TWAP",
+        "description": "BTC up or down test market",
+        "version": "1",
+        "cryptoMarketConfigId": "btc-5m",
+        "cryptoMarketConfig": {
+            "id": "btc-5m",
+            "asset": "btc",
+            "duration": "5m",
+            "twapEnabled": True,
+            "twapLookbackSeconds": 60,
+        },
+        "updatedAt": NOW.isoformat(),
         "winningOutcome": winner,
         "resolvedAt": NOW.isoformat(),
     }

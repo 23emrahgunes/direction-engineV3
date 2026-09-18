@@ -1546,6 +1546,30 @@ class ShadowDaemon:
             min(market.window_end, state.observed_at + timedelta(seconds=5)),
         )
         token_ids = tuple(token.token_id for token in market.tokens)
+        paper_summary = self._paper_repository.summary(now=state.observed_at)
+        capital = _paper_capital_gate(paper_summary, candidate.required_capital)
+        if capital.status != "PAPER_CAPITAL_OK":
+            self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                reason=capital.status,
+                payload={
+                    "candidate_id": candidate.candidate_id,
+                    "label": _PAPER_LABEL,
+                    "raw_available_capital": capital.raw_available_capital,
+                    "spendable_capital": capital.spendable_capital,
+                    "required_capital": str(candidate.required_capital),
+                    "open_cost_basis": paper_summary.get("open_cost_basis"),
+                    "known_expired_unsettled_cost_basis": paper_summary.get(
+                        "known_expired_unsettled_cost_basis"
+                    ),
+                    "unknown_window_open_cost_basis": paper_summary.get(
+                        "unknown_window_open_cost_basis"
+                    ),
+                },
+            )
+            return
         routing = route_opportunities(
             (
                 RoutingOpportunity(
@@ -1556,8 +1580,8 @@ class ShadowDaemon:
                     Decimal("1"),
                 ),
             ),
-            snapshot=RouterSnapshot(0, (), ()),
-            available_capital=Decimal("1000"),
+            snapshot=self._router_snapshot_from_paper(state.observed_at),
+            available_capital=capital.spendable_decimal,
             policy=RouterPolicy(
                 "v3.15.1-shadow-router",
                 (
@@ -1570,11 +1594,19 @@ class ShadowDaemon:
             now=state.observed_at,
         )
         if routing.selected is None:
-            raise RuntimeError("fresh structural candidate was not routed")
+            self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                reason="ROUTER_REJECTED_STRUCTURAL",
+                payload={"candidate_id": candidate.candidate_id, "label": _PAPER_LABEL},
+            )
+            return
         risk = _risk_decision(
             candidate,
             market,
             state,
+            portfolio_state=self._portfolio_state_from_paper(state.observed_at),
             approved_id=f"risk:{candidate.candidate_id}",
         )
         if not risk.approved:

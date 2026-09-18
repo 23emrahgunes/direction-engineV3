@@ -167,8 +167,14 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     assert capital_abstain.payload["spendable_capital"] == "0"
     directional_trades = paper.trades(strategy="DIRECTIONAL_EDGE", limit=100)
     assert len(directional_trades) == 1
+    structural_trades = paper.trades(strategy="STRUCTURAL_ARBITRAGE", limit=100)
+    assert structural_trades == ()
+    assert any(
+        item.reason == "PAPER_CAPITAL_DEFICIT" and item.strategy == "STRUCTURAL_ARBITRAGE"
+        for item in paper.abstains()
+    )
     summary = paper.summary(now=NOW)
-    assert Decimal(str(summary["raw_available_capital"])) < Decimal("0")
+    assert summary["raw_available_capital"] == "-200"
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1

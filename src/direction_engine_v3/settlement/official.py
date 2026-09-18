@@ -9,9 +9,11 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
 
+from direction_engine_v3.adapters.polymarket import parse_gamma_market
 from direction_engine_v3.adapters.polymarket.market_data import GAMMA_MARKETS_URL
 from direction_engine_v3.domain import Asset, Horizon, OutcomeSide
 from direction_engine_v3.domain._validation import require_text, require_utc
+from direction_engine_v3.market_data import MarketDataSchemaError
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 from direction_engine_v3.storage.paper import PaperTradeSnapshot
 
@@ -59,6 +61,17 @@ class GammaOfficialSettlementResolver:
         self._transport = transport
         self._clock = clock
 
+    async def market_metadata(self, condition_id: str) -> Mapping[str, object] | None:
+        require_text("condition_id", condition_id)
+        payload = await self._transport.get_json(
+            GAMMA_MARKETS_URL,
+            params={"condition_ids": condition_id, "limit": "1"},
+        )
+        items = payload if isinstance(payload, list) else [payload]
+        if not items or not isinstance(items[0], Mapping):
+            return None
+        return items[0]
+
     async def resolve(
         self,
         *,
@@ -68,15 +81,11 @@ class GammaOfficialSettlementResolver:
         expected_market_id: str | None = None,
     ) -> OfficialSettlementResult:
         require_text("condition_id", condition_id)
-        payload = await self._transport.get_json(
-            GAMMA_MARKETS_URL,
-            params={"condition_ids": condition_id, "limit": "1"},
-        )
-        items = payload if isinstance(payload, list) else [payload]
-        if not items:
+        item = await self.market_metadata(condition_id)
+        if item is None:
             return _blocked(condition_id, asset, horizon, "MARKET_METADATA_NOT_FOUND", self._now())
         return parse_gamma_official_settlement(
-            items[0],
+            item,
             asset=asset,
             horizon=horizon,
             condition_id=condition_id,
@@ -108,7 +117,7 @@ class PaperSettlementService:
 
     async def run_once(self) -> dict[str, object]:
         now = self._clock.utc_now()
-        checked = pending = completed = blocked = 0
+        checked = pending = completed = blocked = recovered = identity_blocked = 0
         errors: list[str] = []
         seen_conditions: set[str] = set()
         candidates = []
@@ -124,21 +133,27 @@ class PaperSettlementService:
             if trade.condition_id in seen_conditions:
                 continue
             seen_conditions.add(trade.condition_id)
+            if len(seen_conditions) > self._max:
+                break
             matching = tuple(item for item in candidates if item.condition_id == trade.condition_id)
             checked += len(matching)
-            if _trade_window_end(trade) is None:
+            identity = await self._effective_identity(trade, now)
+            if identity.get("status") == "RECOVERED":
+                recovered += 1
+            else:
+                identity_blocked += 1
                 blocked += len(matching)
-                errors.append(
-                    f"{trade.condition_id}:SETTLEMENT_BLOCKED:"
-                    "LEGACY_MARKET_IDENTITY_INCOMPLETE"
-                )
+                errors.append(f"{trade.condition_id}:{identity['reason']}")
+                continue
+            raw_window_end = identity["window_end"]
+            if not isinstance(raw_window_end, datetime) or raw_window_end > now:
                 continue
             try:
                 result = await self._resolver.resolve(
                     condition_id=trade.condition_id,
                     asset=Asset(trade.asset),
                     horizon=Horizon(trade.horizon),
-                    expected_market_id=str(trade.payload.get("market_id", "")) or None,
+                    expected_market_id=str(identity["market_id"]),
                 )
                 if result.status is OfficialSettlementStatus.SETTLEMENT_PENDING:
                     pending += len(matching)
@@ -162,8 +177,169 @@ class PaperSettlementService:
             "settlement_pending": pending,
             "settlement_completed": completed,
             "settlement_blocked": blocked,
+            "identity_recovered": recovered,
+            "identity_blocked": identity_blocked,
+            "condition_cursor_processed": len(seen_conditions),
             "last_settlement_check_at": now.isoformat(),
             "last_settlement_error": errors[-1] if errors else None,
+        }
+
+    async def _effective_identity(
+        self, trade: PaperTradeSnapshot, now: datetime
+    ) -> Mapping[str, object]:
+        overlay = self._paper.identity_overlay(trade.condition_id)
+        if overlay is not None and overlay.status == "RECOVERED":
+            return {
+                "status": "RECOVERED",
+                "market_id": overlay.market_id,
+                "window_start": overlay.window_start,
+                "window_end": overlay.window_end,
+                "source": overlay.source,
+            }
+        if overlay is not None and overlay.status == "BLOCKED":
+            return {
+                "status": "BLOCKED",
+                "reason": overlay.blocker_reason
+                or "SETTLEMENT_BLOCKED:LEGACY_MARKET_IDENTITY_INCOMPLETE",
+            }
+        window_end = _trade_window_end(trade)
+        market_id = str(trade.payload.get("market_id", ""))
+        window_start = _trade_window_start(trade)
+        if market_id and window_start is not None and window_end is not None:
+            return {
+                "status": "RECOVERED",
+                "market_id": market_id,
+                "window_start": window_start,
+                "window_end": window_end,
+                "source": "PAPER_TRADE_SNAPSHOT",
+            }
+        recovered = self._recover_identity_from_corpus(trade, now)
+        if recovered is not None:
+            return recovered
+        recovered = await self._recover_identity_from_official_metadata(trade, now)
+        if recovered is not None:
+            return recovered
+        return {
+            "status": "BLOCKED",
+            "reason": "SETTLEMENT_BLOCKED:LEGACY_MARKET_IDENTITY_INCOMPLETE",
+        }
+
+    def _recover_identity_from_corpus(
+        self, trade: PaperTradeSnapshot, now: datetime
+    ) -> Mapping[str, object] | None:
+        if self._corpus is None:
+            return None
+        for record in self._corpus.records_for_condition(trade.condition_id):
+            payload = record.payload
+            try:
+                market_id = _payload_text(payload.get("market_id"))
+                window_start = _datetime_from_payload(payload.get("window_start"))
+                window_end = _datetime_from_payload(payload.get("window_end"))
+                _validate_identity(
+                    condition_id=trade.condition_id,
+                    asset=Asset(trade.asset),
+                    horizon=Horizon(trade.horizon),
+                    market_id=market_id,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+            except (ValueError, TypeError):
+                continue
+            return self._save_recovered_identity(
+                trade,
+                market_id=market_id,
+                window_start=window_start,
+                window_end=window_end,
+                outcome_tokens={},
+                source_kind="LOCAL_CORPUS",
+                source=f"directional_corpus:{record.record_id}",
+                retrieved_at=record.observed_at,
+                verified_at=now,
+                evidence={"record_id": record.record_id, "market_id": market_id},
+            )
+        return None
+
+    async def _recover_identity_from_official_metadata(
+        self, trade: PaperTradeSnapshot, now: datetime
+    ) -> Mapping[str, object] | None:
+        raw = await self._resolver.market_metadata(trade.condition_id)
+        if raw is None:
+            return None
+        try:
+            market = parse_gamma_market(
+                raw,
+                asset=Asset(trade.asset),
+                horizon=Horizon(trade.horizon),
+            )
+        except (MarketDataSchemaError, ValueError, TypeError) as exc:
+            self._paper.save_identity_overlay_once(
+                condition_id=trade.condition_id,
+                status="BLOCKED",
+                asset=trade.asset,
+                horizon=trade.horizon,
+                source_kind="POLYMARKET_OFFICIAL_METADATA",
+                source="GAMMA_MARKETS_BY_CONDITION",
+                retrieved_at=now,
+                verified_at=now,
+                evidence_hash=_evidence_hash(
+                    {"condition_id": trade.condition_id, "reason": type(exc).__name__}
+                ),
+                blocker_reason=f"SETTLEMENT_BLOCKED:{type(exc).__name__}",
+                payload={"reason": _safe_error_text(exc)},
+            )
+            return None
+        if market.condition_id != trade.condition_id:
+            return None
+        outcome_tokens = {token.outcome.value: token.token_id for token in market.tokens}
+        return self._save_recovered_identity(
+            trade,
+            market_id=market.market_id,
+            window_start=market.window_start,
+            window_end=market.window_end,
+            outcome_tokens=outcome_tokens,
+            source_kind="POLYMARKET_OFFICIAL_METADATA",
+            source="GAMMA_MARKETS_BY_CONDITION",
+            retrieved_at=now,
+            verified_at=now,
+            evidence=_sanitized_evidence(raw),
+        )
+
+    def _save_recovered_identity(
+        self,
+        trade: PaperTradeSnapshot,
+        *,
+        market_id: str,
+        window_start: datetime,
+        window_end: datetime,
+        outcome_tokens: Mapping[str, object],
+        source_kind: str,
+        source: str,
+        retrieved_at: datetime,
+        verified_at: datetime,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        overlay = self._paper.save_identity_overlay_once(
+            condition_id=trade.condition_id,
+            status="RECOVERED",
+            market_id=market_id,
+            asset=trade.asset,
+            horizon=trade.horizon,
+            window_start=window_start,
+            window_end=window_end,
+            outcome_tokens=outcome_tokens,
+            source_kind=source_kind,
+            source=source,
+            retrieved_at=retrieved_at,
+            verified_at=verified_at,
+            evidence_hash=_evidence_hash(evidence),
+            payload={"evidence": dict(evidence), "real_order_submission": False},
+        )
+        return {
+            "status": "RECOVERED",
+            "market_id": overlay.market_id,
+            "window_start": overlay.window_start,
+            "window_end": overlay.window_end,
+            "source": overlay.source,
         }
 
     def _settle_trade(
@@ -417,8 +593,59 @@ def _cost_basis(trade: PaperTradeSnapshot) -> Decimal:
     return Decimal(str(value))
 
 
+def _trade_window_start(trade: PaperTradeSnapshot) -> datetime | None:
+    value = trade.payload.get("window_start")
+    if not isinstance(value, str) or not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
 def _trade_window_end(trade: PaperTradeSnapshot) -> datetime | None:
     value = trade.payload.get("window_end")
     if not isinstance(value, str) or not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _payload_text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("payload value was not text")
+    return value
+
+
+def _datetime_from_payload(value: object) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("payload value was not datetime text")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _validate_identity(
+    *,
+    condition_id: str,
+    asset: Asset,
+    horizon: Horizon,
+    market_id: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> None:
+    require_text("condition_id", condition_id)
+    require_text("market_id", market_id)
+    require_utc("window_start", window_start)
+    require_utc("window_end", window_end)
+    if window_end <= window_start:
+        raise ValueError("window_end must be after window_start")
+    expected = {
+        Horizon.FIVE_MINUTES: 300,
+        Horizon.FIFTEEN_MINUTES: 900,
+        Horizon.ONE_HOUR: 3600,
+    }[horizon]
+    if int((window_end - window_start).total_seconds()) != expected:
+        raise ValueError("window duration does not match horizon")
+    if int(window_start.timestamp()) % expected != 0:
+        raise ValueError("window start is not canonical")
+    if asset not in {Asset.BTC, Asset.ETH, Asset.SOL, Asset.XRP}:
+        raise ValueError("unsupported settlement asset")
+
+
+def _safe_error_text(exc: Exception) -> str:
+    return str(exc).replace("\r", " ").replace("\n", " ").strip() or type(exc).__name__
