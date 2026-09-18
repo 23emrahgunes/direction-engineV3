@@ -23,8 +23,10 @@ class Clock:
 class Resolver:
     def __init__(self, payload):
         self.payload = payload
+        self.calls = 0
 
     async def resolve(self, *, condition_id, asset, horizon, expected_market_id=None):
+        self.calls += 1
         return parse_gamma_official_settlement(
             self.payload,
             asset=asset,
@@ -217,6 +219,31 @@ def test_corpus_condition_labeling_rejects_proxy_conflict_and_post_outcome(tmp_p
         )
 
 
+def test_settlement_pass_is_bounded_per_cycle(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    for index in range(3):
+        _trade(
+            paper,
+            trade_id=f"trade-{index}",
+            condition_id=f"condition-{index}",
+            market_id=f"market-{index}",
+        )
+    resolver = Resolver(_official("UP", condition_id="condition-0", market_id="market-0"))
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=resolver,
+        clock=Clock(),
+        max_trades_per_pass=1,
+    )
+
+    result = asyncio.run(service.run_once())
+
+    assert resolver.calls == 1
+    assert result["settlement_checked"] == 1
+
+
 def _paper(tmp_path) -> SQLitePaperRepository:
     repo = SQLitePaperRepository(tmp_path / "paper.sqlite3")
     repo.initialize()
@@ -232,24 +259,27 @@ def _corpus(tmp_path) -> SQLiteDirectionalCorpusRepository:
 def _trade(
     paper: SQLitePaperRepository,
     *,
+    trade_id: str = "trade-1",
+    condition_id: str = "condition-1",
+    market_id: str = "market-1",
     side: str = "UP",
     stake: str = "0.5",
     shares: str = "1",
     fee: str = "0",
 ) -> None:
     paper.save_trade_snapshot(
-        trade_id="trade-1",
-        decision_id="decision-1",
+        trade_id=trade_id,
+        decision_id=f"decision:{trade_id}",
         strategy="DIRECTIONAL_EDGE",
         asset="BTC",
         horizon="5m",
-        condition_id="condition-1",
+        condition_id=condition_id,
         side=side,
         status="OPEN",
         observed_at=NOW - timedelta(minutes=10),
         payload={
-            "market_id": "market-1",
-            "condition_id": "condition-1",
+            "market_id": market_id,
+            "condition_id": condition_id,
             "side": side,
             "stake": stake,
             "cost_basis_usdc": stake,
@@ -261,10 +291,12 @@ def _trade(
     )
 
 
-def _official(winner: str) -> dict[str, object]:
+def _official(
+    winner: str, *, condition_id: str = "condition-1", market_id: str = "market-1"
+) -> dict[str, object]:
     return {
-        "id": "market-1",
-        "conditionId": "condition-1",
+        "id": market_id,
+        "conditionId": condition_id,
         "closed": True,
         "active": False,
         "outcomes": '["Down", "Up"]',

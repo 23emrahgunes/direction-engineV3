@@ -1922,6 +1922,7 @@ async def run_daemon(
             corpus_repository=directional_corpus,
             resolver=GammaOfficialSettlementResolver(transport, clock),
             clock=clock,
+            max_trades_per_pass=1,
         )
         daemon = ShadowDaemon(
             data_client=PublicShadowDataClient(
