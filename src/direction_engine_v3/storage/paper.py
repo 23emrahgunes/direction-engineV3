@@ -86,6 +86,19 @@ class PaperTradeIdentityOverlay:
     payload: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class PaperSettlementConditionAttempt:
+    condition_id: str
+    state: str
+    last_attempt_at: datetime | None
+    next_attempt_at: datetime | None
+    attempt_count: int
+    last_reason: str | None
+    last_error: str | None
+    last_successful_settlement_at: datetime | None
+    payload: Mapping[str, object]
+
+
 class SQLitePaperRepository:
     """Durable idempotency and immutable audit events; never stores credentials."""
 
@@ -166,6 +179,17 @@ class SQLitePaperRepository:
                     verified_at TEXT NOT NULL,
                     evidence_hash TEXT NOT NULL,
                     blocker_reason TEXT,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS paper_settlement_condition_attempts (
+                    condition_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    last_attempt_at TEXT,
+                    next_attempt_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_reason TEXT,
+                    last_error TEXT,
+                    last_successful_settlement_at TEXT,
                     payload_json TEXT NOT NULL
                 );
                 """
@@ -390,7 +414,13 @@ class SQLitePaperRepository:
             ).fetchone()
             if existing is not None:
                 stored = _settlement_from_row(existing)
-                if stored.evidence_hash != evidence_hash or stored.win_loss != win_loss:
+                if (
+                    stored.official_winning_side != official_winning_side
+                    or stored.selected_side != selected_side
+                    or stored.win_loss != win_loss
+                    or stored.payout_usdc != payout_usdc
+                    or stored.realized_paper_pnl != realized_paper_pnl
+                ):
                     raise RuntimeError("conflicting PAPER settlement for trade")
                 return stored
             connection.execute(
@@ -546,6 +576,174 @@ class SQLitePaperRepository:
         return {
             "identity_recovered_count": counts.get("RECOVERED", 0),
             "identity_blocked_count": counts.get("BLOCKED", 0),
+        }
+
+    def settlement_attempt(self, condition_id: str) -> PaperSettlementConditionAttempt | None:
+        require_text("condition_id", condition_id)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT condition_id,state,last_attempt_at,next_attempt_at,attempt_count,"
+                "last_reason,last_error,last_successful_settlement_at,payload_json "
+                "FROM paper_settlement_condition_attempts WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        return None if row is None else _settlement_attempt_from_row(row)
+
+    def save_settlement_condition_attempt(
+        self,
+        *,
+        condition_id: str,
+        state: str,
+        attempted_at: datetime,
+        next_attempt_at: datetime | None,
+        reason: str,
+        error: str | None = None,
+        successful_at: datetime | None = None,
+        payload: Mapping[str, object] | None = None,
+    ) -> PaperSettlementConditionAttempt:
+        require_text("condition_id", condition_id)
+        require_text("state", state)
+        require_text("reason", reason)
+        require_utc("attempted_at", attempted_at)
+        if next_attempt_at is not None:
+            require_utc("next_attempt_at", next_attempt_at)
+        if successful_at is not None:
+            require_utc("successful_at", successful_at)
+        encoded = json.dumps(_jsonable(dict(payload or {})), sort_keys=True, separators=(",", ":"))
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT INTO paper_settlement_condition_attempts
+                    (condition_id,state,last_attempt_at,next_attempt_at,attempt_count,
+                     last_reason,last_error,last_successful_settlement_at,payload_json)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    state=excluded.state,
+                    last_attempt_at=excluded.last_attempt_at,
+                    next_attempt_at=excluded.next_attempt_at,
+                    attempt_count=paper_settlement_condition_attempts.attempt_count + 1,
+                    last_reason=excluded.last_reason,
+                    last_error=excluded.last_error,
+                    last_successful_settlement_at=COALESCE(
+                        excluded.last_successful_settlement_at,
+                        paper_settlement_condition_attempts.last_successful_settlement_at
+                    ),
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    condition_id,
+                    state,
+                    attempted_at.isoformat(),
+                    next_attempt_at.isoformat() if next_attempt_at is not None else None,
+                    1,
+                    reason,
+                    error,
+                    successful_at.isoformat() if successful_at is not None else None,
+                    encoded,
+                ),
+            )
+        stored = self.settlement_attempt(condition_id)
+        if stored is None:
+            raise RuntimeError("paper settlement condition attempt was not durably recorded")
+        return stored
+
+    def due_settlement_conditions(
+        self, condition_ids: tuple[str, ...], *, now: datetime
+    ) -> tuple[str, ...]:
+        require_utc("now", now)
+        if not condition_ids:
+            return ()
+        unique: list[str] = []
+        seen: set[str] = set()
+        for condition_id in condition_ids:
+            require_text("condition_id", condition_id)
+            if condition_id not in seen:
+                seen.add(condition_id)
+                unique.append(condition_id)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                "SELECT condition_id,state,next_attempt_at "
+                "FROM paper_settlement_condition_attempts "
+                f"WHERE condition_id IN ({','.join('?' for _ in unique)})",
+                tuple(unique),
+            ).fetchall()
+        attempts = {str(row[0]): (str(row[1]), row[2]) for row in rows}
+        due: list[str] = []
+        for condition_id in unique:
+            attempt = attempts.get(condition_id)
+            if attempt is None:
+                due.append(condition_id)
+                continue
+            state, raw_next = attempt
+            if state in {"SETTLED", "BLOCKED_PERMANENT"}:
+                continue
+            if raw_next is None:
+                due.append(condition_id)
+                continue
+            if datetime.fromisoformat(str(raw_next)) <= now:
+                due.append(condition_id)
+        return tuple(due)
+
+    def settlement_queue_summary(
+        self, *, condition_ids: tuple[str, ...] = (), now: datetime | None = None
+    ) -> dict[str, object]:
+        if now is None:
+            now = datetime.now(UTC)
+        require_utc("now", now)
+        clauses: list[str] = []
+        params: list[object] = []
+        if condition_ids:
+            unique = tuple(dict.fromkeys(condition_ids))
+            clauses.append(f"condition_id IN ({','.join('?' for _ in unique)})")
+            params.extend(unique)
+        query = (
+            "SELECT condition_id,state,last_attempt_at,next_attempt_at,attempt_count,"
+            "last_reason,last_error,last_successful_settlement_at,payload_json "
+            "FROM paper_settlement_condition_attempts"
+        )
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        attempts = tuple(_settlement_attempt_from_row(row) for row in rows)
+        due = tuple(
+            item
+            for item in attempts
+            if item.state not in {"SETTLED", "BLOCKED_PERMANENT"}
+            and (item.next_attempt_at is None or item.next_attempt_at <= now)
+        )
+        pending = tuple(item for item in attempts if item.state == "PENDING")
+        blocked = tuple(
+            item
+            for item in attempts
+            if item.state in {"BLOCKED_RETRYABLE", "BLOCKED_PERMANENT"}
+        )
+        last_attempted = max(
+            (item for item in attempts if item.last_attempt_at is not None),
+            key=lambda item: item.last_attempt_at or datetime.min.replace(tzinfo=UTC),
+            default=None,
+        )
+        successful = max(
+            (item for item in attempts if item.last_successful_settlement_at is not None),
+            key=lambda item: item.last_successful_settlement_at
+            or datetime.min.replace(tzinfo=UTC),
+            default=None,
+        )
+        return {
+            "settlement_queue_due_condition_count": len(due),
+            "settlement_pending_condition_count": len(pending),
+            "settlement_blocked_condition_count": len(blocked),
+            "last_attempted_condition": last_attempted.condition_id
+            if last_attempted is not None
+            else None,
+            "last_attempt_reason": last_attempted.last_reason
+            if last_attempted is not None
+            else None,
+            "last_successful_settlement_at": (
+                successful.last_successful_settlement_at.isoformat()
+                if successful is not None and successful.last_successful_settlement_at is not None
+                else None
+            ),
         }
 
     def trades(
@@ -733,8 +931,17 @@ class SQLitePaperRepository:
         legacy_missing_window_end_count = sum(
             1 for item in open_trades if _payload_datetime(item.payload.get("window_end")) is None
         )
+        effective_identity_missing_trade_count = sum(
+            1
+            for item in open_trades
+            if _effective_window_end(item, overlays.get(item.condition_id)) is None
+        )
         open_unique_condition_count = len({item.condition_id for item in open_trades})
         identity_counts = self.identity_overlay_counts()
+        settlement_queue = self.settlement_queue_summary(
+            condition_ids=tuple(item.condition_id for item in open_trades),
+            now=now,
+        )
         raw_available_capital = (
             initial_equity + realized_pnl - open_cost_basis - unfilled_reservations
         )
@@ -759,7 +966,11 @@ class SQLitePaperRepository:
             "open_trade_count": len(open_trades),
             "open_unique_condition_count": open_unique_condition_count,
             "legacy_missing_window_end_count": legacy_missing_window_end_count,
+            "raw_snapshot_missing_window_end_count": legacy_missing_window_end_count,
+            "effective_identity_missing_trade_count": effective_identity_missing_trade_count,
             **identity_counts,
+            "identity_recovered_condition_count": identity_counts["identity_recovered_count"],
+            **settlement_queue,
             "settlement_pending": len(pending),
             "settled_trades": len(settled),
             "wins": wins,
@@ -934,6 +1145,27 @@ def _identity_overlay_from_row(row: tuple[object, ...]) -> PaperTradeIdentityOve
         verified_at=datetime.fromisoformat(str(row[11])),
         evidence_hash=str(row[12]),
         blocker_reason=None if row[13] is None else str(row[13]),
+        payload=payload,
+    )
+
+
+def _settlement_attempt_from_row(
+    row: tuple[object, ...],
+) -> PaperSettlementConditionAttempt:
+    payload = json.loads(str(row[8]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("paper settlement attempt payload is not an object")
+    return PaperSettlementConditionAttempt(
+        condition_id=str(row[0]),
+        state=str(row[1]),
+        last_attempt_at=None if row[2] is None else datetime.fromisoformat(str(row[2])),
+        next_attempt_at=None if row[3] is None else datetime.fromisoformat(str(row[3])),
+        attempt_count=int(str(row[4])),
+        last_reason=None if row[5] is None else str(row[5]),
+        last_error=None if row[6] is None else str(row[6]),
+        last_successful_settlement_at=None
+        if row[7] is None
+        else datetime.fromisoformat(str(row[7])),
         payload=payload,
     )
 

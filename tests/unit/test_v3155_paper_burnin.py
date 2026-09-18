@@ -212,6 +212,85 @@ def test_blocked_legacy_condition_does_not_starve_later_condition(tmp_path):
     assert paper.trade_by_id("trade-condition-bad").status == "OPEN"
 
 
+def test_condition_attempt_queue_prevents_starvation_across_restarts(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    for suffix in ("a", "b", "c", "d"):
+        _trade(
+            paper,
+            trade_id=f"trade-{suffix}",
+            condition_id=f"condition-{suffix}",
+            market_id=f"market-{suffix}",
+        )
+    blocked = _official("UP", condition_id="condition-a", market_id="market-a")
+    blocked["winningOutcome"] = ""
+    pending = _official("UP", condition_id="condition-c", market_id="market-c") | {
+        "closed": False
+    }
+    resolver = Resolver(
+        {
+            "condition-a": blocked,
+            "condition-b": _official("UP", condition_id="condition-b", market_id="market-b"),
+            "condition-c": pending,
+            "condition-d": _official("UP", condition_id="condition-d", market_id="market-d"),
+        }
+    )
+
+    first = asyncio.run(
+        PaperSettlementService(
+            paper_repository=paper,
+            corpus_repository=corpus,
+            resolver=resolver,
+            clock=Clock(),
+            max_conditions_per_pass=1,
+        ).run_once()
+    )
+    second = asyncio.run(
+        PaperSettlementService(
+            paper_repository=paper,
+            corpus_repository=corpus,
+            resolver=resolver,
+            clock=Clock(),
+            max_conditions_per_pass=1,
+        ).run_once()
+    )
+    third = asyncio.run(
+        PaperSettlementService(
+            paper_repository=paper,
+            corpus_repository=corpus,
+            resolver=resolver,
+            clock=Clock(),
+            max_conditions_per_pass=1,
+        ).run_once()
+    )
+    fourth = asyncio.run(
+        PaperSettlementService(
+            paper_repository=paper,
+            corpus_repository=corpus,
+            resolver=resolver,
+            clock=Clock(),
+            max_conditions_per_pass=1,
+        ).run_once()
+    )
+
+    assert first["conditions_attempted"] == ("condition-a",)
+    assert first["settlement_blocked"] == 1
+    assert second["conditions_attempted"] == ("condition-b",)
+    assert second["settlement_completed"] == 1
+    assert third["conditions_attempted"] == ("condition-c",)
+    assert third["settlement_pending"] == 1
+    assert fourth["conditions_attempted"] == ("condition-d",)
+    assert fourth["settlement_completed"] == 1
+    assert paper.trade_by_id("trade-b").status == "SETTLED"
+    assert paper.trade_by_id("trade-d").status == "SETTLED"
+    assert paper.trade_by_id("trade-a").status == "OPEN"
+    assert paper.trade_by_id("trade-c").status == "OPEN"
+    assert paper.settlement_attempt("condition-a").state == "BLOCKED_RETRYABLE"
+    assert paper.settlement_attempt("condition-b").state == "SETTLED"
+    assert paper.settlement_attempt("condition-c").state == "PENDING"
+    assert paper.settlement_attempt("condition-d").state == "SETTLED"
+
+
 def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
     pending = parse_gamma_official_settlement(
         _official("UP") | {"closed": False},
@@ -280,6 +359,24 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
         evidence_hash="hash-1",
         payload={"settlement_source_kind": "OFFICIAL"},
     ) == settlement
+    assert paper.save_settlement_once(
+        settlement_id="s1",
+        trade_id="trade-1",
+        condition_id="condition-1",
+        official_winning_side="UP",
+        selected_side="UP",
+        settlement_source_kind="OFFICIAL",
+        settlement_source="POLYMARKET_OFFICIAL_METADATA",
+        official_resolved_at=NOW,
+        settled_at=NOW,
+        filled_shares=Decimal("1"),
+        cost_basis_usdc=Decimal("0.5"),
+        payout_usdc=Decimal("1"),
+        realized_paper_pnl=Decimal("0.5"),
+        win_loss="WIN",
+        evidence_hash="hash-retrieved-again",
+        payload={"settlement_source_kind": "OFFICIAL"},
+    ) == settlement
     with pytest.raises(RuntimeError, match="conflicting"):
         paper.save_settlement_once(
             settlement_id="s2",
@@ -299,6 +396,20 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
             evidence_hash="hash-2",
             payload={"settlement_source_kind": "OFFICIAL"},
         )
+
+
+def test_official_settlement_requires_real_resolved_at_not_updated_at(tmp_path):
+    result = parse_gamma_official_settlement(
+        _official("UP") | {"resolvedAt": "", "closedTime": "", "updatedAt": NOW.isoformat()},
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition-1",
+        expected_market_id="market-1",
+        observed_at=NOW,
+    )
+
+    assert result.status is OfficialSettlementStatus.SETTLEMENT_BLOCKED
+    assert result.reason == "OFFICIAL_RESOLVED_AT_MISSING"
 
 
 def test_corpus_condition_labeling_rejects_proxy_conflict_and_post_outcome(tmp_path):
@@ -375,6 +486,56 @@ def test_settlement_pass_is_bounded_per_cycle(tmp_path):
 
     assert resolver.calls == 1
     assert result["settlement_checked"] == 1
+
+
+def test_effective_identity_summary_uses_overlay_without_mutating_snapshot(tmp_path):
+    paper = _paper(tmp_path)
+    paper.save_trade_snapshot(
+        trade_id="legacy-open",
+        decision_id="decision:legacy",
+        strategy="DIRECTIONAL_EDGE",
+        asset="BTC",
+        horizon="5m",
+        condition_id="condition-legacy",
+        side="UP",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=10),
+        payload={
+            "market_id": "market-legacy",
+            "condition_id": "condition-legacy",
+            "side": "UP",
+            "stake": "1",
+            "cost_basis_usdc": "1",
+            "shares": "1",
+            "real_order_submission": False,
+        },
+    )
+    before = paper.trade_by_id("legacy-open")
+    paper.save_identity_overlay_once(
+        condition_id="condition-legacy",
+        market_id="market-legacy",
+        asset=Asset.BTC.value,
+        horizon=Horizon.FIVE_MINUTES.value,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        outcome_tokens={"up": "up-token", "down": "down-token"},
+        source_kind="OFFICIAL_METADATA",
+        source="test",
+        retrieved_at=NOW,
+        verified_at=NOW,
+        evidence_hash="identity-hash",
+        status="RECOVERED",
+        blocker_reason=None,
+        payload={"source": "test"},
+    )
+
+    summary = paper.summary(now=NOW)
+    after = paper.trade_by_id("legacy-open")
+
+    assert summary["raw_snapshot_missing_window_end_count"] == 1
+    assert summary["effective_identity_missing_trade_count"] == 0
+    assert before is not None and after is not None
+    assert before.payload == after.payload
 
 
 def _paper(tmp_path) -> SQLitePaperRepository:

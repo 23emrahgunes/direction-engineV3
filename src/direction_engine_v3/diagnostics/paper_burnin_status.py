@@ -6,6 +6,7 @@ from typing import Any
 
 from direction_engine_v3.app.dashboard import build_paper_performance, runtime_data_dir
 from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS
+from direction_engine_v3.shadow.storage import SQLiteShadowRepository
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 
 
@@ -33,6 +34,15 @@ def main() -> None:
         "identity_recovered_count",
         "identity_blocked_count",
         "legacy_missing_window_end_count",
+        "raw_snapshot_missing_window_end_count",
+        "effective_identity_missing_trade_count",
+        "identity_recovered_condition_count",
+        "settlement_queue_due_condition_count",
+        "settlement_pending_condition_count",
+        "settlement_blocked_condition_count",
+        "last_attempted_condition",
+        "last_attempt_reason",
+        "last_successful_settlement_at",
         "open_positions",
         "settlement_pending",
         "settled_trades",
@@ -59,14 +69,27 @@ def main() -> None:
             f"unique_markets={counts['unique_condition_count']} "
             f"labeled_unique={counts['labeled_unique_condition_count']}"
         )
+    print("\nRECENT SETTLEMENT SCANS")
+    for event in payload["recent_settlement_scans"]:
+        event_payload = event["payload"]
+        print(
+            f"{event['observed_at']} condition={event_payload.get('last_attempted_condition')} "
+            f"checked={event_payload.get('settlement_checked')} "
+            f"pending={event_payload.get('settlement_pending')} "
+            f"blocked={event_payload.get('settlement_blocked')} "
+            f"completed={event_payload.get('settlement_completed')} "
+            f"error={event_payload.get('last_settlement_error')}"
+        )
 
 
 def _payload() -> dict[str, Any]:
     data_dir = runtime_data_dir()
     paper = SQLitePaperRepository(data_dir / "paper.sqlite3")
     corpus = SQLiteDirectionalCorpusRepository(data_dir / "directional_corpus.sqlite3")
+    shadow = SQLiteShadowRepository(data_dir / "shadow.sqlite3")
     paper.initialize()
     corpus.initialize()
+    shadow.initialize()
     counts: dict[str, dict[str, int]] = {
         f"{bucket.asset.value}-{bucket.horizon.value}": corpus.corpus_counts(
             asset=bucket.asset, horizon=bucket.horizon
@@ -77,6 +100,9 @@ def _payload() -> dict[str, Any]:
         "label": "PAPER / SHADOW — NO REAL ORDER",
         "performance": build_paper_performance(strategy="DIRECTIONAL_EDGE"),
         "corpus": counts,
+        "recent_settlement_scans": shadow.latest_events(
+            event_type="PAPER_SETTLEMENT_SCAN", limit=5
+        ),
         "real_order_submission": False,
     }
 

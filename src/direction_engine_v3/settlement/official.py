@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
@@ -108,34 +108,48 @@ class PaperSettlementService:
         resolver: GammaOfficialSettlementResolver,
         clock: _Clock,
         max_trades_per_pass: int = 25,
+        max_conditions_per_pass: int | None = None,
+        max_trades_per_condition: int = 500,
     ) -> None:
         self._paper = paper_repository
         self._corpus = corpus_repository
         self._resolver = resolver
         self._clock = clock
-        self._max = max_trades_per_pass
+        self._max_conditions = (
+            max_trades_per_pass if max_conditions_per_pass is None else max_conditions_per_pass
+        )
+        self._max_trades_per_condition = max_trades_per_condition
+        if self._max_conditions < 1:
+            raise ValueError("max_conditions_per_pass must be positive")
+        if self._max_trades_per_condition < 1:
+            raise ValueError("max_trades_per_condition must be positive")
 
     async def run_once(self) -> dict[str, object]:
         now = self._clock.utc_now()
         checked = pending = completed = blocked = recovered = identity_blocked = 0
         errors: list[str] = []
-        seen_conditions: set[str] = set()
-        candidates = []
+        attempted_conditions: list[str] = []
+        candidates: list[PaperTradeSnapshot] = []
         for item in self._paper.trades(
             strategy="DIRECTIONAL_EDGE", status="OPEN", limit=100_000
         ):
             window_end = _trade_window_end(item)
             if window_end is None or window_end <= now:
                 candidates.append(item)
-        for trade in candidates:
-            if checked >= self._max:
+        grouped: dict[str, list[PaperTradeSnapshot]] = {}
+        for item in candidates:
+            grouped.setdefault(item.condition_id, []).append(item)
+        due_conditions = self._paper.due_settlement_conditions(
+            tuple(grouped.keys()), now=now
+        )
+        for condition_id in due_conditions:
+            if len(attempted_conditions) >= self._max_conditions:
                 break
-            if trade.condition_id in seen_conditions:
+            matching = tuple(grouped.get(condition_id, ()))[: self._max_trades_per_condition]
+            if not matching:
                 continue
-            seen_conditions.add(trade.condition_id)
-            if len(seen_conditions) > self._max:
-                break
-            matching = tuple(item for item in candidates if item.condition_id == trade.condition_id)
+            trade = matching[0]
+            attempted_conditions.append(condition_id)
             checked += len(matching)
             identity = await self._effective_identity(trade, now)
             if identity.get("status") == "RECOVERED":
@@ -143,35 +157,87 @@ class PaperSettlementService:
             else:
                 identity_blocked += 1
                 blocked += len(matching)
-                errors.append(f"{trade.condition_id}:{identity['reason']}")
+                reason = str(identity["reason"])
+                errors.append(f"{condition_id}:{reason}")
+                self._record_attempt(
+                    condition_id=condition_id,
+                    state=_attempt_state_for_reason(reason),
+                    now=now,
+                    reason=reason,
+                    matching_count=len(matching),
+                )
                 continue
             raw_window_end = identity["window_end"]
             if not isinstance(raw_window_end, datetime) or raw_window_end > now:
+                reason = "SETTLEMENT_PENDING:WINDOW_NOT_ENDED"
+                pending += len(matching)
+                self._record_attempt(
+                    condition_id=condition_id,
+                    state="PENDING",
+                    now=now,
+                    reason=reason,
+                    matching_count=len(matching),
+                )
                 continue
             try:
                 result = await self._resolver.resolve(
-                    condition_id=trade.condition_id,
+                    condition_id=condition_id,
                     asset=Asset(trade.asset),
                     horizon=Horizon(trade.horizon),
                     expected_market_id=str(identity["market_id"]),
                 )
                 if result.status is OfficialSettlementStatus.SETTLEMENT_PENDING:
                     pending += len(matching)
+                    self._record_attempt(
+                        condition_id=condition_id,
+                        state="PENDING",
+                        now=now,
+                        reason=result.reason,
+                        matching_count=len(matching),
+                    )
                     continue
                 if result.status not in {
                     OfficialSettlementStatus.SETTLED,
                     OfficialSettlementStatus.VOID,
                 }:
                     blocked += len(matching)
-                    errors.append(f"{trade.condition_id}:{result.reason}")
+                    errors.append(f"{condition_id}:{result.reason}")
+                    self._record_attempt(
+                        condition_id=condition_id,
+                        state=_attempt_state_for_reason(result.reason),
+                        now=now,
+                        reason=result.reason,
+                        matching_count=len(matching),
+                    )
                     continue
                 for item in matching:
                     self._settle_trade(item, result, now)
                     completed += 1
                 self._label_corpus(result, now)
+                self._record_attempt(
+                    condition_id=condition_id,
+                    state="SETTLED",
+                    now=now,
+                    reason=result.reason,
+                    matching_count=len(matching),
+                    successful_at=now,
+                )
             except Exception as exc:
                 blocked += len(matching)
-                errors.append(f"{trade.condition_id}:{type(exc).__name__}")
+                reason = f"SETTLEMENT_BLOCKED:{type(exc).__name__}"
+                errors.append(f"{condition_id}:{type(exc).__name__}")
+                self._record_attempt(
+                    condition_id=condition_id,
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    error=_safe_error_text(exc),
+                    matching_count=len(matching),
+                )
+        queue_summary = self._paper.settlement_queue_summary(
+            condition_ids=tuple(grouped.keys()),
+            now=now,
+        )
         return {
             "settlement_checked": checked,
             "settlement_pending": pending,
@@ -179,10 +245,43 @@ class PaperSettlementService:
             "settlement_blocked": blocked,
             "identity_recovered": recovered,
             "identity_blocked": identity_blocked,
-            "condition_cursor_processed": len(seen_conditions),
+            "condition_cursor_processed": len(attempted_conditions),
+            "conditions_attempted": tuple(attempted_conditions),
+            "last_attempted_condition": attempted_conditions[-1]
+            if attempted_conditions
+            else None,
             "last_settlement_check_at": now.isoformat(),
             "last_settlement_error": errors[-1] if errors else None,
+            **queue_summary,
         }
+
+    def _record_attempt(
+        self,
+        *,
+        condition_id: str,
+        state: str,
+        now: datetime,
+        reason: str,
+        matching_count: int,
+        error: str | None = None,
+        successful_at: datetime | None = None,
+    ) -> None:
+        self._paper.save_settlement_condition_attempt(
+            condition_id=condition_id,
+            state=state,
+            attempted_at=now,
+            next_attempt_at=_next_attempt_at(state, now),
+            reason=reason,
+            error=error,
+            successful_at=successful_at,
+            payload={
+                "condition_id": condition_id,
+                "state": state,
+                "reason": reason,
+                "matching_trade_count": matching_count,
+                "real_order_submission": False,
+            },
+        )
 
     async def _effective_identity(
         self, trade: PaperTradeSnapshot, now: datetime
@@ -464,6 +563,16 @@ def parse_gamma_official_settlement(
             observed_at,
             evidence,
         )
+    resolved_at = _resolved_at(raw)
+    if resolved_at is None:
+        return _blocked(
+            condition_id,
+            asset,
+            horizon,
+            "OFFICIAL_RESOLVED_AT_MISSING",
+            observed_at,
+            evidence,
+        )
     return OfficialSettlementResult(
         OfficialSettlementStatus.SETTLED,
         market_id,
@@ -473,7 +582,7 @@ def parse_gamma_official_settlement(
         winner,
         "OFFICIAL",
         "POLYMARKET_OFFICIAL_METADATA",
-        _resolved_at(raw) or observed_at,
+        resolved_at,
         observed_at,
         evidence_hash,
         "OFFICIAL_FINAL",
@@ -546,11 +655,36 @@ def _evidence_hash(evidence: Mapping[str, object]) -> str:
 
 
 def _resolved_at(raw: Mapping[str, object]) -> datetime | None:
-    for key in ("resolvedAt", "closedTime", "updatedAt"):
+    for key in ("resolvedAt", "closedTime"):
         value = raw.get(key)
         if isinstance(value, str) and value:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             return parsed.astimezone(UTC)
+    return None
+
+
+def _attempt_state_for_reason(reason: str) -> str:
+    if reason.startswith("SETTLEMENT_PENDING") or reason == "MARKET_NOT_FINAL":
+        return "PENDING"
+    permanent_markers = (
+        "LEGACY_MARKET_IDENTITY_INCOMPLETE",
+        "CONDITION_ID_MISMATCH",
+        "MARKET_ID_MISMATCH",
+        "official",
+        "conflicting",
+    )
+    if any(marker in reason for marker in permanent_markers):
+        return "BLOCKED_PERMANENT"
+    if reason in {"OFFICIAL_WINNER_MISSING", "OFFICIAL_RESOLVED_AT_MISSING"}:
+        return "BLOCKED_RETRYABLE"
+    return "BLOCKED_RETRYABLE"
+
+
+def _next_attempt_at(state: str, now: datetime) -> datetime | None:
+    if state == "PENDING":
+        return now + timedelta(minutes=10)
+    if state == "BLOCKED_RETRYABLE":
+        return now + timedelta(minutes=5)
     return None
 
 
