@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ from direction_engine_v3.domain import (
     OfficialReference,
     OutcomeSide,
     ProxyReference,
+    StrategyKind,
 )
 from direction_engine_v3.features import ExternalDirectionalSnapshot, build_directional_features
 from direction_engine_v3.market_data import (
@@ -40,11 +42,34 @@ class StaticClock:
         return 1
 
 
+class SequenceClock:
+    def __init__(self, values: tuple[datetime, ...]) -> None:
+        self._values = values
+        self._index = 0
+
+    def utc_now(self) -> datetime:
+        value = self._values[min(self._index, len(self._values) - 1)]
+        self._index += 1
+        return value
+
+    def monotonic_ns(self) -> int:
+        return self._index
+
+
 class FixtureClient:
     async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
         if bucket != MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES):
             return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
         return _market_state(bucket)
+
+
+class RecordingClient:
+    def __init__(self) -> None:
+        self.selection_times: list[datetime] = []
+
+    async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
+        self.selection_times.append(now)
+        return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
 
 
 class SettlementProbe:
@@ -178,6 +203,84 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_shadow_daemon_uses_post_settlement_time_for_market_selection(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    client = RecordingClient()
+    probe = SettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=client,
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=SequenceClock(
+            (
+                NOW,
+                NOW + timedelta(minutes=5, seconds=1),
+                NOW + timedelta(minutes=5, seconds=2),
+                NOW + timedelta(minutes=5, seconds=3),
+            )
+        ),
+        poll_seconds=1,
+    )
+
+    asyncio.run(daemon.run_once())
+
+    assert probe.calls == 1
+    assert set(client.selection_times) == {NOW + timedelta(minutes=5, seconds=2)}
+
+
+def test_expired_bucket_abstains_without_strategy_or_paper_fill(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    expired_state = replace(
+        state,
+        observed_at=NOW + timedelta(minutes=5),
+        unavailable_reason="MARKET_WINDOW_EXPIRED",
+        feature_status="MARKET_WINDOW_EXPIRED",
+        directional_features=None,
+    )
+
+    result = daemon._evaluate_cycle("cycle-expired", NOW, (expired_state,))
+
+    assert result.paper_trades == 0
+    assert result.abstain_records == 2
+    assert paper.trades() == ()
+    reasons = {(item.strategy, item.reason) for item in paper.abstains()}
+    assert (StrategyKind.DIRECTIONAL_EDGE.value, "MARKET_WINDOW_EXPIRED") in reasons
+    assert (StrategyKind.STRUCTURAL_ARBITRAGE.value, "MARKET_WINDOW_EXPIRED") in reasons
 
 
 def test_router_snapshot_does_not_reserve_filled_positions_twice(tmp_path) -> None:

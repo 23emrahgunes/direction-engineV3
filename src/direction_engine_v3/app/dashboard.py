@@ -20,7 +20,7 @@ from direction_engine_v3.observability import (
     MetricsSnapshot,
     ReadinessReport,
 )
-from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteShadowRepository
 from direction_engine_v3.storage import SQLitePaperRepository
 
 
@@ -199,11 +199,19 @@ def list_paper_abstains(
 
 def build_shadow_status() -> dict[str, object]:
     data_dir = runtime_data_dir()
-    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
+    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3", read_only=True)
     event_counts: dict[str, int]
     try:
-        shadow.initialize()
         event_counts = shadow.event_counts()
+    except ShadowStorageUnavailable as exc:
+        event_counts = {"SHADOW_STATUS_UNAVAILABLE": 1}
+        return {
+            "status": "DATABASE_NOT_INITIALIZED",
+            "reason": str(exc),
+            "real_order_submission": False,
+            "event_counts": event_counts,
+            "paper_database": str(data_dir / "paper.sqlite3"),
+        }
     except Exception as exc:
         event_counts = {"SHADOW_STATUS_UNAVAILABLE": 1}
         return {
@@ -226,12 +234,19 @@ def build_shadow_status() -> dict[str, object]:
 
 def build_directional_runtime_status() -> dict[str, object]:
     data_dir = runtime_data_dir()
-    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
+    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3", read_only=True)
     paper = _paper_repository()
     try:
-        shadow.initialize()
         directional_events = shadow.latest_events(event_type="STRATEGY_EVALUATION", limit=500)
         pipeline_events = shadow.latest_events(event_type="MARKET_DATA_PIPELINE", limit=500)
+    except ShadowStorageUnavailable as exc:
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "status": "DATABASE_NOT_INITIALIZED",
+            "reason": str(exc),
+            "real_order_submission": False,
+            "buckets": [],
+        }
     except Exception as exc:
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",

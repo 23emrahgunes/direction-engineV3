@@ -17,7 +17,11 @@ from direction_engine_v3.shadow.evidence import (
     StructuralEvidence,
 )
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
-from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import (
+    ShadowStorageBusy,
+    ShadowStorageUnavailable,
+    SQLiteShadowRepository,
+)
 
 __all__ = [
     "AWSIdentityEvidence",
@@ -30,6 +34,8 @@ __all__ = [
     "ShadowCycleResult",
     "ShadowDaemon",
     "ShadowMarketState",
+    "ShadowStorageBusy",
+    "ShadowStorageUnavailable",
     "ShadowSummary",
     "StructuralEvidence",
     "build_shadow_summary",

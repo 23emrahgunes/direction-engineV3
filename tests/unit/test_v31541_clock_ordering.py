@@ -41,6 +41,17 @@ class SequenceClock:
         return self._index
 
 
+class FixedClock:
+    def __init__(self, value: datetime) -> None:
+        self._value = value
+
+    def utc_now(self) -> datetime:
+        return self._value
+
+    def monotonic_ns(self) -> int:
+        return 1
+
+
 class FixedOfficial:
     def __init__(self) -> None:
         self.observed_at: datetime | None = None
@@ -120,6 +131,16 @@ class FixtureTransport:
         raise AssertionError(f"unexpected URL {url}")
 
 
+class MarketOverrideTransport(FixtureTransport):
+    def __init__(self, **overrides: object) -> None:
+        self._overrides = overrides
+
+    async def get_json(self, url: str, *, params=None):
+        if "gamma-api" in url:
+            return {"id": "event-1", "markets": [_gamma_market() | self._overrides]}
+        return await super().get_json(url, params=params)
+
+
 def test_collect_bucket_uses_post_collection_evaluation_clock_for_features_and_pricing(
     tmp_path,
 ) -> None:
@@ -159,6 +180,50 @@ def test_collect_bucket_uses_post_collection_evaluation_clock_for_features_and_p
     daemon = _daemon(tmp_path)
     _up, _down, pricing_status = daemon._directional_pricing(state)
     assert pricing_status == "EXECUTABLE_PRICE_READY"
+
+
+def test_collect_bucket_marks_market_expired_at_exact_window_end_without_feature_crash() -> None:
+    state = asyncio.run(
+        PublicShadowDataClient(
+            MarketOverrideTransport(endDate=(NOW + timedelta(minutes=5)).isoformat()),
+            FixedClock(NOW + timedelta(minutes=5)),
+            official_ptb=FixedOfficial(),
+            feature_state=ExternalTemporalState(max_age=timedelta(seconds=30), minimum_points=2),
+        ).collect_bucket(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES), now=NOW)
+    )
+
+    assert state.discovery is not None
+    assert state.observed_at == NOW + timedelta(minutes=5)
+    assert state.unavailable_reason == "MARKET_WINDOW_EXPIRED"
+    assert state.feature_status == "MARKET_WINDOW_EXPIRED"
+    assert state.directional_features is None
+    assert any(
+        stage.stage == "FEATURE_BUILD"
+        and stage.status == "SKIPPED"
+        and stage.reason == "MARKET_WINDOW_EXPIRED"
+        for stage in state.pipeline_stages
+    )
+
+
+def test_collect_bucket_marks_market_not_started_without_feature_crash() -> None:
+    future_start = NOW + timedelta(minutes=5)
+    state = asyncio.run(
+        PublicShadowDataClient(
+            MarketOverrideTransport(
+                eventStartTime=future_start.isoformat(),
+                startDate=future_start.isoformat(),
+                endDate=(future_start + timedelta(minutes=5)).isoformat(),
+            ),
+            SequenceClock(),
+            official_ptb=FixedOfficial(),
+            feature_state=ExternalTemporalState(max_age=timedelta(seconds=30), minimum_points=2),
+        ).collect_bucket(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES), now=NOW)
+    )
+
+    assert state.discovery is not None
+    assert state.unavailable_reason == "MARKET_WINDOW_NOT_STARTED"
+    assert state.feature_status == "MARKET_WINDOW_NOT_STARTED"
+    assert state.directional_features is None
 
 
 def test_future_validators_still_reject_genuinely_future_feature_and_pricing(

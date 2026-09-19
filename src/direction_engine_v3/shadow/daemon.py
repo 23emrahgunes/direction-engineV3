@@ -43,6 +43,7 @@ from direction_engine_v3.domain import (
     StrategyKind,
     TradingMode,
 )
+from direction_engine_v3.domain._validation import require_utc
 from direction_engine_v3.execution import (
     PaperFillEvidence,
     PaperGateway,
@@ -110,7 +111,7 @@ from direction_engine_v3.shadow.evidence import (
     EvidenceWindow,
 )
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
-from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import ShadowStorageBusy, SQLiteShadowRepository
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 from direction_engine_v3.strategies.directional import (
     DirectionalAssessment,
@@ -432,6 +433,38 @@ class PublicShadowDataClient:
             if external_trade is not None:
                 self._feature_state.add_trade(external_trade)
         evaluation_at = self._clock.utc_now()
+        market_lifecycle_reason = _market_lifecycle_reason(discovery.market, evaluation_at)
+        if market_lifecycle_reason is not None:
+            stages.append(
+                _stage_record(
+                    "FEATURE_BUILD",
+                    "SKIPPED",
+                    evaluation_at,
+                    reason=market_lifecycle_reason,
+                )
+            )
+            fee = _shared_fee_schedule(up_fee, down_fee)
+            return ShadowMarketState(
+                bucket=bucket,
+                discovery=discovery,
+                up_book=up_book,
+                down_book=down_book,
+                fee_schedule=fee,
+                proxy_reference=proxy,
+                official_reference=ptb_resolution.official_reference,
+                observed_at=evaluation_at,
+                unavailable_reason=market_lifecycle_reason,
+                price_to_beat=ptb_resolution.price_to_beat,
+                directional_features=None,
+                ptb_status=ptb_resolution.ptb_status,
+                ptb_reason=ptb_resolution.reason,
+                feature_status=market_lifecycle_reason,
+                chainlink_status=chainlink_status,
+                binance_hourly_status=binance_hourly_status,
+                pipeline_stages=tuple(stages),
+                up_fee_schedule=up_fee,
+                down_fee_schedule=down_fee,
+            )
         features = None
         feature_status = "FEATURES_UNAVAILABLE"
         if proxy is not None:
@@ -705,36 +738,46 @@ class ShadowDaemon:
         self._registry = self._paper_model_result.registry
 
     async def run_once(self) -> ShadowCycleResult:
-        started_at = self._clock.utc_now()
-        cycle_id = f"shadow-cycle:{int(started_at.timestamp() * 1000)}"
+        cycle_started_at = self._clock.utc_now()
+        cycle_id = f"shadow-cycle:{int(cycle_started_at.timestamp() * 1000)}"
         settlement_payload: dict[str, object] = {}
         if self._settlement_service is not None:
             settlement_payload = await self._settlement_service.run_once()
-            self._shadow_repository.append_event(
+            self._append_shadow_event(
                 event_id=f"{self._evidence_window.window_id}:{cycle_id}:settlement",
                 window_id=self._evidence_window.window_id,
                 event_type="PAPER_SETTLEMENT_SCAN",
                 bucket_key=None,
                 payload=settlement_payload,
-                observed_at=started_at,
+                observed_at=self._clock.utc_now(),
             )
+        market_selection_at = self._clock.utc_now()
         states = await asyncio.gather(
             *(
-                self._data_client.collect_bucket(bucket, now=started_at)
+                self._data_client.collect_bucket(bucket, now=market_selection_at)
                 for bucket in SUPPORTED_MARKET_BUCKETS
             )
         )
-        result = self._evaluate_cycle(cycle_id, started_at, states)
-        self._shadow_repository.append_event(
+        result = self._evaluate_cycle(cycle_id, cycle_started_at, states)
+        completed_at = self._clock.utc_now()
+        self._append_shadow_event(
             event_id=f"{self._evidence_window.window_id}:{cycle_id}",
             window_id=self._evidence_window.window_id,
             event_type="REAL_SHADOW_CYCLE",
             bucket_key=None,
-            payload=result.as_dict() | {"settlement": settlement_payload},
-            observed_at=started_at,
+            payload=result.as_dict()
+            | {
+                "settlement": settlement_payload,
+                "cycle_started_at": cycle_started_at.isoformat(),
+                "market_selection_at": market_selection_at.isoformat(),
+                "completed_at": completed_at.isoformat(),
+            },
+            observed_at=completed_at,
         )
         write_reports(
-            build_shadow_summary(evidence_window=self._evidence_window, generated_at=started_at),
+            build_shadow_summary(
+                evidence_window=self._evidence_window, generated_at=completed_at
+            ),
             self._report_dir,
         )
         return result
@@ -762,7 +805,16 @@ class ShadowDaemon:
         paper_trades = 0
         for state in states:
             bucket_key = f"{state.bucket.asset.value}-{state.bucket.horizon.value}"
-            self._record_pipeline_state(state, cycle_id=cycle_id)
+            pipeline_recorded = self._record_pipeline_state(state, cycle_id=cycle_id)
+            if not pipeline_recorded:
+                abstain_records += self._record_abstain(
+                    state,
+                    cycle_id=cycle_id,
+                    strategy=StrategyKind.DIRECTIONAL_EDGE,
+                    reason="SHADOW_STORAGE_DEGRADED",
+                    payload={"bucket": bucket_key, "storage_status": "STORAGE_BUSY"},
+                )
+                continue
             if state.discovery is None:
                 abstain_records += self._record_abstain(
                     state,
@@ -779,6 +831,34 @@ class ShadowDaemon:
                 official_observations += 1
             if state.up_book is not None and state.down_book is not None:
                 book_observations += 2
+            if state.unavailable_reason in {
+                "MARKET_WINDOW_NOT_STARTED",
+                "MARKET_WINDOW_EXPIRED",
+            }:
+                abstain_payload = {
+                    "bucket": bucket_key,
+                    "market_id": state.discovery.market.market_id,
+                    "condition_id": state.discovery.market.condition_id,
+                    "window_start": state.discovery.market.window_start.isoformat(),
+                    "window_end": state.discovery.market.window_end.isoformat(),
+                    "evaluation_at": state.observed_at.isoformat(),
+                    "label": _PAPER_LABEL,
+                }
+                abstain_records += self._record_abstain(
+                    state,
+                    cycle_id=cycle_id,
+                    strategy=StrategyKind.DIRECTIONAL_EDGE,
+                    reason=state.unavailable_reason,
+                    payload=abstain_payload,
+                )
+                abstain_records += self._record_abstain(
+                    state,
+                    cycle_id=cycle_id,
+                    strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                    reason=state.unavailable_reason,
+                    payload=abstain_payload,
+                )
+                continue
             strategy_evaluations += 1
             directional_abstains, directional_trade = self._evaluate_directional(
                 state, cycle_id=cycle_id
@@ -804,11 +884,11 @@ class ShadowDaemon:
             paper_trades,
         )
 
-    def _record_pipeline_state(self, state: ShadowMarketState, *, cycle_id: str) -> None:
+    def _record_pipeline_state(self, state: ShadowMarketState, *, cycle_id: str) -> bool:
         market = state.discovery.market if state.discovery is not None else None
         payload = _pipeline_payload(state)
         condition_id = market.condition_id if market is not None else "UNAVAILABLE"
-        self._shadow_repository.append_event(
+        return self._append_shadow_event(
             event_id=(
                 f"{cycle_id}:{state.bucket.asset.value}:{state.bucket.horizon.value}:"
                 f"{condition_id}:pipeline"
@@ -819,6 +899,29 @@ class ShadowDaemon:
             payload=payload,
             observed_at=state.observed_at,
         )
+
+    def _append_shadow_event(
+        self,
+        *,
+        event_id: str,
+        window_id: str,
+        event_type: str,
+        bucket_key: str | None,
+        payload: Mapping[str, object],
+        observed_at: datetime,
+    ) -> bool:
+        try:
+            self._shadow_repository.append_event(
+                event_id=event_id,
+                window_id=window_id,
+                event_type=event_type,
+                bucket_key=bucket_key,
+                payload=payload,
+                observed_at=observed_at,
+            )
+        except ShadowStorageBusy:
+            return False
+        return True
 
     def _evaluate_directional(self, state: ShadowMarketState, *, cycle_id: str) -> tuple[int, bool]:
         assert state.discovery is not None
@@ -867,7 +970,7 @@ class ShadowDaemon:
                     else None,
                 )
             )
-        self._shadow_repository.append_event(
+        self._append_shadow_event(
             event_id=f"{cycle_id}:{state.discovery.market.condition_id}:directional",
             window_id=self._evidence_window.window_id,
             event_type="STRATEGY_EVALUATION",
@@ -1032,6 +1135,21 @@ class ShadowDaemon:
     ) -> tuple[bool, dict[str, object], int]:
         assert state.discovery is not None
         market = state.discovery.market
+        entry_checked_at = self._clock.utc_now()
+        market_lifecycle_reason = _market_lifecycle_reason(market, entry_checked_at)
+        if market_lifecycle_reason is not None:
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason=market_lifecycle_reason,
+                payload={
+                    "condition_id": market.condition_id,
+                    "entry_checked_at": entry_checked_at.isoformat(),
+                    "label": _PAPER_LABEL,
+                },
+            )
+            return False, {"router_status": market_lifecycle_reason}, abstains
         candidate = assessment.candidate
         selected_side = assessment.selected_side
         if not isinstance(candidate, StrategyCandidate) or not isinstance(
@@ -1477,7 +1595,7 @@ class ShadowDaemon:
                         "error_type": type(exc).__name__,
                     },
                 )
-                self._shadow_repository.append_event(
+                self._append_shadow_event(
                     event_id=(
                         f"{cycle_id}:{state.discovery.market.condition_id}:"
                         f"structural:{action.value}:{reason}"
@@ -1497,7 +1615,7 @@ class ShadowDaemon:
                 return False
         scans = tuple(scans_list)
         executable = next((scan for scan in scans if scan.opportunity is not None), None)
-        self._shadow_repository.append_event(
+        self._append_shadow_event(
             event_id=f"{cycle_id}:{state.discovery.market.condition_id}:structural",
             window_id=self._evidence_window.window_id,
             event_type="STRUCTURAL_EVALUATION",
@@ -1535,6 +1653,21 @@ class ShadowDaemon:
     ) -> None:
         assert state.discovery is not None
         market = state.discovery.market
+        entry_checked_at = self._clock.utc_now()
+        market_lifecycle_reason = _market_lifecycle_reason(market, entry_checked_at)
+        if market_lifecycle_reason is not None:
+            self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                reason=market_lifecycle_reason,
+                payload={
+                    "condition_id": market.condition_id,
+                    "entry_checked_at": entry_checked_at.isoformat(),
+                    "label": _PAPER_LABEL,
+                },
+            )
+            return
         candidate = StrategyCandidate(
             opportunity.opportunity_id,
             StrategyKind.STRUCTURAL_ARBITRAGE,
@@ -1727,6 +1860,15 @@ def _structural_market_quality_reason(exc: Exception) -> str | None:
     return None
 
 
+def _market_lifecycle_reason(market: Market, observed_at: datetime) -> str | None:
+    require_utc("observed_at", observed_at)
+    if observed_at < market.window_start:
+        return "MARKET_WINDOW_NOT_STARTED"
+    if observed_at >= market.window_end:
+        return "MARKET_WINDOW_EXPIRED"
+    return None
+
+
 def _stage_record(
     stage: str,
     status: str,
@@ -1892,7 +2034,7 @@ def _combined_error(
 ) -> str | None:
     for name in stage_names:
         stage = by_stage.get(name)
-        if stage is not None and stage.status == "FAIL":
+        if stage is not None and stage.status in {"FAIL", "SKIPPED"}:
             return stage.reason
     return None
 

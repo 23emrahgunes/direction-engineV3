@@ -2,22 +2,46 @@
 
 import json
 import sqlite3
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
 from direction_engine_v3.domain._validation import require_text, require_utc
 
 
+class ShadowStorageUnavailable(RuntimeError):
+    """Raised when shadow evidence storage cannot be opened for the requested mode."""
+
+
+class ShadowStorageBusy(RuntimeError):
+    """Raised when bounded SQLite lock contention retry is exhausted."""
+
+
 class SQLiteShadowRepository:
     """Append-only evidence repository; stores no secrets or credentials."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        read_only: bool = False,
+        busy_timeout_ms: int = 250,
+        max_busy_retries: int = 3,
+        busy_retry_sleep_seconds: float = 0.05,
+    ) -> None:
         self._path = path
+        self._read_only = read_only
+        self._busy_timeout_ms = busy_timeout_ms
+        self._max_busy_retries = max_busy_retries
+        self._busy_retry_sleep_seconds = busy_retry_sleep_seconds
 
     def initialize(self) -> None:
+        if self._read_only:
+            raise ShadowStorageUnavailable("read-only shadow repository cannot initialize schema")
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._path) as connection:
+        with closing(self._connect(write=True)) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS evidence_windows (
@@ -35,6 +59,7 @@ class SQLiteShadowRepository:
                 );
                 """
             )
+            connection.commit()
 
     def save_window_once(
         self, *, window_id: str, payload: Mapping[str, object], started_at: datetime
@@ -42,11 +67,12 @@ class SQLiteShadowRepository:
         require_text("window_id", window_id)
         require_utc("started_at", started_at)
         encoded = _encode(payload)
-        with sqlite3.connect(self._path) as connection:
-            connection.execute(
+        self._write_with_retry(
+            lambda connection: connection.execute(
                 "INSERT OR IGNORE INTO evidence_windows VALUES (?,?,?)",
                 (window_id, encoded, started_at.isoformat()),
             )
+        )
 
     def append_event(
         self,
@@ -67,8 +93,8 @@ class SQLiteShadowRepository:
         if bucket_key is not None:
             require_text("bucket_key", bucket_key)
         require_utc("observed_at", observed_at)
-        with sqlite3.connect(self._path) as connection:
-            connection.execute(
+        self._write_with_retry(
+            lambda connection: connection.execute(
                 "INSERT OR IGNORE INTO shadow_events VALUES (?,?,?,?,?,?)",
                 (
                     event_id,
@@ -79,12 +105,12 @@ class SQLiteShadowRepository:
                     observed_at.isoformat(),
                 ),
             )
+        )
 
     def latest_window_payload(self) -> dict[str, object] | None:
-        with sqlite3.connect(self._path) as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM evidence_windows ORDER BY started_at DESC LIMIT 1"
-            ).fetchone()
+        row = self._read_one(
+            "SELECT payload_json FROM evidence_windows ORDER BY started_at DESC LIMIT 1"
+        )
         if row is None:
             return None
         payload = json.loads(str(row[0]))
@@ -93,11 +119,14 @@ class SQLiteShadowRepository:
         return payload
 
     def event_counts(self) -> dict[str, int]:
-        with sqlite3.connect(self._path) as connection:
-            rows = connection.execute(
-                "SELECT event_type, COUNT(*) FROM shadow_events GROUP BY event_type"
-            ).fetchall()
-        return {str(row[0]): int(row[1]) for row in rows}
+        rows = self._read_all(
+            "SELECT event_type, COUNT(*) FROM shadow_events GROUP BY event_type"
+        )
+        return {str(row[0]): int(str(row[1])) for row in rows}
+
+    def journal_mode(self) -> str:
+        row = self._read_one("PRAGMA journal_mode")
+        return "" if row is None else str(row[0])
 
     def latest_events(
         self,
@@ -126,8 +155,7 @@ class SQLiteShadowRepository:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY observed_at DESC LIMIT ?"
         params.append(limit)
-        with sqlite3.connect(self._path) as connection:
-            rows = connection.execute(query, tuple(params)).fetchall()
+        rows = self._read_all(query, tuple(params))
         events: list[dict[str, object]] = []
         for row in rows:
             payload = json.loads(str(row[3]))
@@ -143,6 +171,66 @@ class SQLiteShadowRepository:
                 }
             )
         return tuple(events)
+
+    def _connect(self, *, write: bool = False) -> sqlite3.Connection:
+        if write and self._read_only:
+            raise ShadowStorageUnavailable("read-only shadow repository cannot write")
+        if self._read_only:
+            if not self._path.exists():
+                raise ShadowStorageUnavailable("DATABASE_NOT_INITIALIZED")
+            uri_path = self._path.resolve().as_posix().replace("?", "%3f").replace("#", "%23")
+            connection = sqlite3.connect(
+                f"file:{uri_path}?mode=ro",
+                timeout=self._busy_timeout_ms / 1000,
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(
+                self._path,
+                timeout=self._busy_timeout_ms / 1000,
+            )
+        connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+        return connection
+
+    def _write_with_retry(self, operation: Callable[[sqlite3.Connection], object]) -> None:
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(self._max_busy_retries + 1):
+            try:
+                with closing(self._connect(write=True)) as connection:
+                    try:
+                        operation(connection)
+                        connection.commit()
+                    except Exception:
+                        connection.rollback()
+                        raise
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc):
+                    raise
+                last_error = exc
+                if attempt >= self._max_busy_retries:
+                    break
+                time.sleep(self._busy_retry_sleep_seconds * (attempt + 1))
+        raise ShadowStorageBusy("STORAGE_BUSY:shadow_evidence_write") from last_error
+
+    def _read_all(
+        self, query: str, params: tuple[object, ...] = ()
+    ) -> list[tuple[object, ...]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [tuple(row) for row in rows]
+
+    def _read_one(
+        self, query: str, params: tuple[object, ...] = ()
+    ) -> tuple[object, ...] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(query, params).fetchone()
+        return None if row is None else tuple(row)
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
 
 
 def _encode(payload: Mapping[str, object]) -> str:

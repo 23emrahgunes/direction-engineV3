@@ -6,7 +6,7 @@ from typing import Any
 
 from direction_engine_v3.app.dashboard import build_paper_performance, runtime_data_dir
 from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS
-from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteShadowRepository
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 
 
@@ -86,10 +86,9 @@ def _payload() -> dict[str, Any]:
     data_dir = runtime_data_dir()
     paper = SQLitePaperRepository(data_dir / "paper.sqlite3")
     corpus = SQLiteDirectionalCorpusRepository(data_dir / "directional_corpus.sqlite3")
-    shadow = SQLiteShadowRepository(data_dir / "shadow.sqlite3")
+    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3", read_only=True)
     paper.initialize()
     corpus.initialize()
-    shadow.initialize()
     counts: dict[str, dict[str, int]] = {
         f"{bucket.asset.value}-{bucket.horizon.value}": corpus.corpus_counts(
             asset=bucket.asset, horizon=bucket.horizon
@@ -100,11 +99,18 @@ def _payload() -> dict[str, Any]:
         "label": "PAPER / SHADOW — NO REAL ORDER",
         "performance": build_paper_performance(strategy="DIRECTIONAL_EDGE"),
         "corpus": counts,
-        "recent_settlement_scans": shadow.latest_events(
-            event_type="PAPER_SETTLEMENT_SCAN", limit=5
-        ),
+        "recent_settlement_scans": _recent_settlement_scans(shadow),
         "real_order_submission": False,
     }
+
+
+def _recent_settlement_scans(
+    shadow: SQLiteShadowRepository,
+) -> tuple[dict[str, object], ...]:
+    try:
+        return shadow.latest_events(event_type="PAPER_SETTLEMENT_SCAN", limit=5)
+    except ShadowStorageUnavailable:
+        return ()
 
 
 if __name__ == "__main__":
