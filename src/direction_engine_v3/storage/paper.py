@@ -56,7 +56,8 @@ class PaperTradeSettlement:
     selected_side: str
     settlement_source_kind: str
     settlement_source: str
-    official_resolved_at: datetime
+    official_resolved_at: datetime | None
+    official_resolution_observed_at: datetime
     settled_at: datetime
     filled_shares: Decimal
     cost_basis_usdc: Decimal
@@ -96,6 +97,18 @@ class PaperSettlementConditionAttempt:
     last_reason: str | None
     last_error: str | None
     last_successful_settlement_at: datetime | None
+    payload: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class PaperCorpusLabelTask:
+    condition_id: str
+    evidence_hash: str
+    state: str
+    last_attempt_at: datetime | None
+    next_attempt_at: datetime | None
+    attempt_count: int
+    last_reason: str | None
     payload: Mapping[str, object]
 
 
@@ -154,7 +167,8 @@ class SQLitePaperRepository:
                     selected_side TEXT NOT NULL,
                     settlement_source_kind TEXT NOT NULL,
                     settlement_source TEXT NOT NULL,
-                    official_resolved_at TEXT NOT NULL,
+                    official_resolved_at TEXT,
+                    official_resolution_observed_at TEXT NOT NULL,
                     settled_at TEXT NOT NULL,
                     filled_shares TEXT NOT NULL,
                     cost_basis_usdc TEXT NOT NULL,
@@ -192,8 +206,20 @@ class SQLitePaperRepository:
                     last_successful_settlement_at TEXT,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS paper_corpus_label_tasks (
+                    condition_id TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    last_attempt_at TEXT,
+                    next_attempt_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_reason TEXT,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(condition_id,evidence_hash)
+                );
                 """
             )
+            _migrate_paper_trade_settlements(connection)
 
     def get(self, idempotency_key: str) -> StoredExecution | None:
         require_text("idempotency_key", idempotency_key)
@@ -356,7 +382,8 @@ class SQLitePaperRepository:
         selected_side: str,
         settlement_source_kind: str,
         settlement_source: str,
-        official_resolved_at: datetime,
+        official_resolved_at: datetime | None,
+        official_resolution_observed_at: datetime,
         settled_at: datetime,
         filled_shares: Decimal,
         cost_basis_usdc: Decimal,
@@ -378,7 +405,9 @@ class SQLitePaperRepository:
             ("evidence_hash", evidence_hash),
         ):
             require_text(name, value)
-        require_utc("official_resolved_at", official_resolved_at)
+        if official_resolved_at is not None:
+            require_utc("official_resolved_at", official_resolved_at)
+        require_utc("official_resolution_observed_at", official_resolution_observed_at)
         require_utc("settled_at", settled_at)
         require_decimal("filled_shares", filled_shares, minimum=Decimal("0"))
         require_decimal("cost_basis_usdc", cost_basis_usdc, minimum=Decimal("0"))
@@ -393,7 +422,8 @@ class SQLitePaperRepository:
             selected_side,
             settlement_source_kind,
             settlement_source,
-            official_resolved_at.isoformat(),
+            official_resolved_at.isoformat() if official_resolved_at is not None else None,
+            official_resolution_observed_at.isoformat(),
             settled_at.isoformat(),
             str(filled_shares),
             str(cost_basis_usdc),
@@ -407,8 +437,9 @@ class SQLitePaperRepository:
             existing = connection.execute(
                 "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
                 "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
-                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
-                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "official_resolution_observed_at,settled_at,filled_shares,cost_basis_usdc,"
+                "payout_usdc,realized_paper_pnl,win_loss,evidence_hash,payload_json "
+                "FROM paper_trade_settlements "
                 "WHERE trade_id=?",
                 (trade_id,),
             ).fetchone()
@@ -426,7 +457,7 @@ class SQLitePaperRepository:
             connection.execute(
                 """
                 INSERT INTO paper_trade_settlements
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 values,
             )
@@ -451,8 +482,9 @@ class SQLitePaperRepository:
             row = connection.execute(
                 "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
                 "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
-                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
-                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "official_resolution_observed_at,settled_at,filled_shares,cost_basis_usdc,"
+                "payout_usdc,realized_paper_pnl,win_loss,evidence_hash,payload_json "
+                "FROM paper_trade_settlements "
                 "WHERE trade_id=?",
                 (trade_id,),
             ).fetchone()
@@ -463,11 +495,80 @@ class SQLitePaperRepository:
             rows = connection.execute(
                 "SELECT settlement_id,trade_id,condition_id,official_winning_side,"
                 "selected_side,settlement_source_kind,settlement_source,official_resolved_at,"
-                "settled_at,filled_shares,cost_basis_usdc,payout_usdc,realized_paper_pnl,"
-                "win_loss,evidence_hash,payload_json FROM paper_trade_settlements "
+                "official_resolution_observed_at,settled_at,filled_shares,cost_basis_usdc,"
+                "payout_usdc,realized_paper_pnl,win_loss,evidence_hash,payload_json "
+                "FROM paper_trade_settlements "
                 "ORDER BY settled_at DESC"
             ).fetchall()
         return tuple(_settlement_from_row(row) for row in rows)
+
+    def save_corpus_label_task(
+        self,
+        *,
+        condition_id: str,
+        evidence_hash: str,
+        state: str,
+        attempted_at: datetime,
+        next_attempt_at: datetime | None,
+        reason: str,
+        payload: Mapping[str, object],
+    ) -> PaperCorpusLabelTask:
+        require_text("condition_id", condition_id)
+        require_text("evidence_hash", evidence_hash)
+        require_text("state", state)
+        require_text("reason", reason)
+        require_utc("attempted_at", attempted_at)
+        if next_attempt_at is not None:
+            require_utc("next_attempt_at", next_attempt_at)
+        encoded = json.dumps(
+            _jsonable(dict(payload) | {"reason": reason}),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT INTO paper_corpus_label_tasks
+                    (condition_id,evidence_hash,state,last_attempt_at,next_attempt_at,
+                     attempt_count,last_reason,payload_json)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(condition_id,evidence_hash) DO UPDATE SET
+                    state=excluded.state,
+                    last_attempt_at=excluded.last_attempt_at,
+                    next_attempt_at=excluded.next_attempt_at,
+                    attempt_count=paper_corpus_label_tasks.attempt_count + 1,
+                    last_reason=excluded.last_reason,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    condition_id,
+                    evidence_hash,
+                    state,
+                    attempted_at.isoformat(),
+                    next_attempt_at.isoformat() if next_attempt_at is not None else None,
+                    1,
+                    reason,
+                    encoded,
+                ),
+            )
+        stored = self.corpus_label_task(condition_id, evidence_hash)
+        if stored is None:
+            raise RuntimeError("paper corpus label task was not durably recorded")
+        return stored
+
+    def corpus_label_task(
+        self, condition_id: str, evidence_hash: str
+    ) -> PaperCorpusLabelTask | None:
+        require_text("condition_id", condition_id)
+        require_text("evidence_hash", evidence_hash)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT condition_id,evidence_hash,state,last_attempt_at,next_attempt_at,"
+                "attempt_count,last_reason,payload_json FROM paper_corpus_label_tasks "
+                "WHERE condition_id=? AND evidence_hash=?",
+                (condition_id, evidence_hash),
+            ).fetchone()
+        return None if row is None else _corpus_label_task_from_row(row)
 
     def save_identity_overlay_once(
         self,
@@ -662,20 +763,25 @@ class SQLitePaperRepository:
                 unique.append(condition_id)
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(
-                "SELECT condition_id,state,next_attempt_at "
+                "SELECT condition_id,state,next_attempt_at,payload_json "
                 "FROM paper_settlement_condition_attempts "
                 f"WHERE condition_id IN ({','.join('?' for _ in unique)})",
                 tuple(unique),
             ).fetchall()
-        attempts = {str(row[0]): (str(row[1]), row[2]) for row in rows}
+        attempts = {str(row[0]): (str(row[1]), row[2], str(row[3])) for row in rows}
         due: list[str] = []
         for condition_id in unique:
             attempt = attempts.get(condition_id)
             if attempt is None:
                 due.append(condition_id)
                 continue
-            state, raw_next = attempt
+            state, raw_next, raw_payload = attempt
             if state in {"SETTLED", "BLOCKED_PERMANENT"}:
+                continue
+            if state == "BLOCKED_RETRYABLE" and _settlement_resolver_version(raw_payload) != (
+                "POLYMARKET_SETTLEMENT_V2"
+            ):
+                due.append(condition_id)
                 continue
             if raw_next is None:
                 due.append(condition_id)
@@ -1036,7 +1142,12 @@ class SQLitePaperRepository:
                 "official_winning_side": settlement.official_winning_side,
                 "settlement_source_kind": settlement.settlement_source_kind,
                 "settlement_source": settlement.settlement_source,
-                "official_resolved_at": settlement.official_resolved_at.isoformat(),
+                "official_resolved_at": settlement.official_resolved_at.isoformat()
+                if settlement.official_resolved_at is not None
+                else None,
+                "official_resolution_observed_at": (
+                    settlement.official_resolution_observed_at.isoformat()
+                ),
                 "settled_at": settlement.settled_at.isoformat(),
                 "filled_shares": str(settlement.filled_shares),
                 "cost_basis_usdc": str(settlement.cost_basis_usdc),
@@ -1102,7 +1213,7 @@ def _abstain_from_row(row: tuple[object, ...]) -> PaperAbstainRecord:
 
 
 def _settlement_from_row(row: tuple[object, ...]) -> PaperTradeSettlement:
-    payload = json.loads(str(row[15]))
+    payload = json.loads(str(row[16]))
     if not isinstance(payload, dict):
         raise RuntimeError("paper settlement payload is not an object")
     return PaperTradeSettlement(
@@ -1113,14 +1224,15 @@ def _settlement_from_row(row: tuple[object, ...]) -> PaperTradeSettlement:
         str(row[4]),
         str(row[5]),
         str(row[6]),
-        datetime.fromisoformat(str(row[7])),
+        None if row[7] is None else datetime.fromisoformat(str(row[7])),
         datetime.fromisoformat(str(row[8])),
-        Decimal(str(row[9])),
+        datetime.fromisoformat(str(row[9])),
         Decimal(str(row[10])),
         Decimal(str(row[11])),
         Decimal(str(row[12])),
-        str(row[13]),
+        Decimal(str(row[13])),
         str(row[14]),
+        str(row[15]),
         payload,
     )
 
@@ -1168,6 +1280,90 @@ def _settlement_attempt_from_row(
         else datetime.fromisoformat(str(row[7])),
         payload=payload,
     )
+
+
+def _settlement_resolver_version(raw_payload: str) -> str | None:
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("resolver_version")
+    return value if isinstance(value, str) else None
+
+
+def _corpus_label_task_from_row(row: tuple[object, ...]) -> PaperCorpusLabelTask:
+    payload = json.loads(str(row[7]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("paper corpus label task payload is not an object")
+    return PaperCorpusLabelTask(
+        condition_id=str(row[0]),
+        evidence_hash=str(row[1]),
+        state=str(row[2]),
+        last_attempt_at=None if row[3] is None else datetime.fromisoformat(str(row[3])),
+        next_attempt_at=None if row[4] is None else datetime.fromisoformat(str(row[4])),
+        attempt_count=int(str(row[5])),
+        last_reason=None if row[6] is None else str(row[6]),
+        payload=payload,
+    )
+
+
+def _migrate_paper_trade_settlements(connection: sqlite3.Connection) -> None:
+    columns = connection.execute("PRAGMA table_info(paper_trade_settlements)").fetchall()
+    by_name = {str(row[1]): row for row in columns}
+    if not by_name:
+        return
+    resolved_at_notnull = int(by_name["official_resolved_at"][3])
+    if "official_resolution_observed_at" in by_name and resolved_at_notnull == 0:
+        return
+    connection.execute("ALTER TABLE paper_trade_settlements RENAME TO paper_trade_settlements_old")
+    connection.execute(
+        """
+        CREATE TABLE paper_trade_settlements (
+            settlement_id TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL UNIQUE,
+            condition_id TEXT NOT NULL,
+            official_winning_side TEXT NOT NULL,
+            selected_side TEXT NOT NULL,
+            settlement_source_kind TEXT NOT NULL,
+            settlement_source TEXT NOT NULL,
+            official_resolved_at TEXT,
+            official_resolution_observed_at TEXT NOT NULL,
+            settled_at TEXT NOT NULL,
+            filled_shares TEXT NOT NULL,
+            cost_basis_usdc TEXT NOT NULL,
+            payout_usdc TEXT NOT NULL,
+            realized_paper_pnl TEXT NOT NULL,
+            win_loss TEXT NOT NULL,
+            evidence_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    if "official_resolution_observed_at" in by_name:
+        connection.execute(
+            """
+            INSERT INTO paper_trade_settlements
+            SELECT settlement_id,trade_id,condition_id,official_winning_side,selected_side,
+                   settlement_source_kind,settlement_source,official_resolved_at,
+                   official_resolution_observed_at,settled_at,filled_shares,cost_basis_usdc,
+                   payout_usdc,realized_paper_pnl,win_loss,evidence_hash,payload_json
+            FROM paper_trade_settlements_old
+            """
+        )
+    else:
+        connection.execute(
+            """
+            INSERT INTO paper_trade_settlements
+            SELECT settlement_id,trade_id,condition_id,official_winning_side,selected_side,
+                   settlement_source_kind,settlement_source,official_resolved_at,
+                   official_resolved_at,settled_at,filled_shares,cost_basis_usdc,
+                   payout_usdc,realized_paper_pnl,win_loss,evidence_hash,payload_json
+            FROM paper_trade_settlements_old
+            """
+        )
+    connection.execute("DROP TABLE paper_trade_settlements_old")
 
 
 def _current_losing_streak(trades: tuple[PaperTradeSnapshot, ...]) -> int:

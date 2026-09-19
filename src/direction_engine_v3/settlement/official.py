@@ -17,6 +17,10 @@ from direction_engine_v3.market_data import MarketDataSchemaError
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 from direction_engine_v3.storage.paper import PaperTradeSnapshot
 
+GAMMA_MARKET_BY_ID_URL = "https://gamma-api.polymarket.com/markets/{market_id}"
+CLOB_MARKET_BY_CONDITION_URL = "https://clob.polymarket.com/markets/{condition_id}"
+SETTLEMENT_RESOLVER_VERSION = "POLYMARKET_SETTLEMENT_V2"
+
 
 class _Clock(Protocol):
     def utc_now(self) -> datetime:
@@ -55,7 +59,7 @@ class OfficialSettlementResult:
 
 
 class GammaOfficialSettlementResolver:
-    """Read-only resolver that uses official Gamma metadata only."""
+    """Read-only resolver that verifies Gamma identity and CLOB official winner."""
 
     def __init__(self, transport: _Transport, clock: _Clock) -> None:
         self._transport = transport
@@ -72,6 +76,20 @@ class GammaOfficialSettlementResolver:
             return None
         return items[0]
 
+    async def market_metadata_by_id(self, market_id: str) -> Mapping[str, object] | None:
+        require_text("market_id", market_id)
+        payload = await self._transport.get_json(
+            GAMMA_MARKET_BY_ID_URL.format(market_id=market_id)
+        )
+        return payload if isinstance(payload, Mapping) else None
+
+    async def clob_market_by_condition(self, condition_id: str) -> Mapping[str, object] | None:
+        require_text("condition_id", condition_id)
+        payload = await self._transport.get_json(
+            CLOB_MARKET_BY_CONDITION_URL.format(condition_id=condition_id)
+        )
+        return payload if isinstance(payload, Mapping) else None
+
     async def resolve(
         self,
         *,
@@ -81,11 +99,23 @@ class GammaOfficialSettlementResolver:
         expected_market_id: str | None = None,
     ) -> OfficialSettlementResult:
         require_text("condition_id", condition_id)
-        item = await self.market_metadata(condition_id)
-        if item is None:
-            return _blocked(condition_id, asset, horizon, "MARKET_METADATA_NOT_FOUND", self._now())
-        return parse_gamma_official_settlement(
-            item,
+        if not expected_market_id:
+            return _blocked(
+                condition_id,
+                asset,
+                horizon,
+                "MARKET_ID_REQUIRED_FOR_SETTLEMENT_V2",
+                self._now(),
+            )
+        gamma = await self.market_metadata_by_id(expected_market_id)
+        if gamma is None:
+            return _blocked(condition_id, asset, horizon, "GAMMA_MARKET_ID_NOT_FOUND", self._now())
+        clob = await self.clob_market_by_condition(condition_id)
+        if clob is None:
+            return _blocked(condition_id, asset, horizon, "CLOB_CONDITION_NOT_FOUND", self._now())
+        return parse_polymarket_official_settlement(
+            gamma,
+            clob,
             asset=asset,
             horizon=horizon,
             condition_id=condition_id,
@@ -95,6 +125,9 @@ class GammaOfficialSettlementResolver:
 
     def _now(self) -> datetime:
         return self._clock.utc_now()
+
+
+PolymarketOfficialSettlementResolver = GammaOfficialSettlementResolver
 
 
 class PaperSettlementService:
@@ -279,6 +312,7 @@ class PaperSettlementService:
                 "state": state,
                 "reason": reason,
                 "matching_trade_count": matching_count,
+                "resolver_version": SETTLEMENT_RESOLVER_VERSION,
                 "real_order_submission": False,
             },
         )
@@ -444,8 +478,8 @@ class PaperSettlementService:
     def _settle_trade(
         self, trade: PaperTradeSnapshot, result: OfficialSettlementResult, settled_at: datetime
     ) -> None:
-        if result.winning_side is None or result.resolved_at is None:
-            raise RuntimeError("settled result requires winning side and resolved_at")
+        if result.winning_side is None:
+            raise RuntimeError("settled result requires winning side")
         shares = _decimal_from_payload(trade, "shares")
         cost_basis = _cost_basis(trade)
         win_loss = "WIN" if trade.side == result.winning_side.value else "LOSS"
@@ -458,6 +492,10 @@ class PaperSettlementService:
             "selected_side": trade.side,
             "win_loss": win_loss,
             "evidence_hash": result.evidence_hash,
+            "official_resolved_at": result.resolved_at.isoformat()
+            if result.resolved_at is not None
+            else None,
+            "official_resolution_observed_at": result.observed_at.isoformat(),
             "real_order_submission": False,
         }
         self._paper.save_settlement_once(
@@ -469,6 +507,7 @@ class PaperSettlementService:
             settlement_source_kind=result.settlement_source_kind,
             settlement_source=result.source,
             official_resolved_at=result.resolved_at,
+            official_resolution_observed_at=result.observed_at,
             settled_at=settled_at,
             filled_shares=shares,
             cost_basis_usdc=cost_basis,
@@ -480,24 +519,65 @@ class PaperSettlementService:
         )
 
     def _label_corpus(self, result: OfficialSettlementResult, attached_at: datetime) -> None:
-        if self._corpus is None or result.winning_side is None or result.resolved_at is None:
+        if result.winning_side is None:
             return
-        self._corpus.attach_verified_outcome_to_condition_once(
-            condition_id=result.condition_id,
-            official_resolved_at=result.resolved_at,
-            attached_at=attached_at,
-            outcome={
-                "settlement_source_kind": "OFFICIAL",
-                "source": result.source,
-                "condition_id": result.condition_id,
-                "market_id": result.market_id,
-                "outcome_up": result.winning_side is OutcomeSide.UP,
-                "winning_side": result.winning_side.value,
-                "official_resolved_at": result.resolved_at.isoformat(),
-                "attached_at": attached_at.isoformat(),
-                "evidence_hash": result.evidence_hash,
-            },
-        )
+        if result.resolved_at is None:
+            self._paper.save_corpus_label_task(
+                condition_id=result.condition_id,
+                evidence_hash=result.evidence_hash,
+                state="BLOCKED_RETRYABLE",
+                attempted_at=attached_at,
+                next_attempt_at=attached_at + timedelta(minutes=5),
+                reason="CORPUS_LABEL_BLOCKED:RESOLUTION_TIME_UNAVAILABLE",
+                payload={
+                    "condition_id": result.condition_id,
+                    "market_id": result.market_id,
+                    "winning_side": result.winning_side.value,
+                    "settlement_source_kind": result.settlement_source_kind,
+                    "source": result.source,
+                    "official_resolution_observed_at": result.observed_at.isoformat(),
+                    "real_order_submission": False,
+                },
+            )
+            return
+        if self._corpus is None:
+            return
+        try:
+            self._corpus.attach_verified_outcome_to_condition_once(
+                condition_id=result.condition_id,
+                official_resolved_at=result.resolved_at,
+                attached_at=attached_at,
+                outcome={
+                    "settlement_source_kind": "OFFICIAL",
+                    "source": result.source,
+                    "condition_id": result.condition_id,
+                    "market_id": result.market_id,
+                    "outcome_up": result.winning_side is OutcomeSide.UP,
+                    "winning_side": result.winning_side.value,
+                    "official_resolved_at": result.resolved_at.isoformat(),
+                    "attached_at": attached_at.isoformat(),
+                    "evidence_hash": result.evidence_hash,
+                },
+            )
+            self._paper.save_corpus_label_task(
+                condition_id=result.condition_id,
+                evidence_hash=result.evidence_hash,
+                state="LABELED",
+                attempted_at=attached_at,
+                next_attempt_at=None,
+                reason="CORPUS_LABEL_ATTACHED",
+                payload={"condition_id": result.condition_id, "real_order_submission": False},
+            )
+        except Exception as exc:
+            self._paper.save_corpus_label_task(
+                condition_id=result.condition_id,
+                evidence_hash=result.evidence_hash,
+                state="BLOCKED_RETRYABLE",
+                attempted_at=attached_at,
+                next_attempt_at=attached_at + timedelta(minutes=5),
+                reason=f"CORPUS_LABEL_BLOCKED:{type(exc).__name__}",
+                payload={"error": _safe_error_text(exc), "real_order_submission": False},
+            )
 
 
 def parse_gamma_official_settlement(
@@ -590,6 +670,94 @@ def parse_gamma_official_settlement(
     )
 
 
+def parse_polymarket_official_settlement(
+    gamma_raw: object,
+    clob_raw: object,
+    *,
+    asset: Asset,
+    horizon: Horizon,
+    condition_id: str,
+    expected_market_id: str,
+    observed_at: datetime,
+) -> OfficialSettlementResult:
+    require_text("condition_id", condition_id)
+    require_text("expected_market_id", expected_market_id)
+    require_utc("observed_at", observed_at)
+    if not isinstance(gamma_raw, Mapping):
+        return _blocked(condition_id, asset, horizon, "GAMMA_MARKET_NOT_OBJECT", observed_at)
+    if not isinstance(clob_raw, Mapping):
+        return _blocked(condition_id, asset, horizon, "CLOB_MARKET_NOT_OBJECT", observed_at)
+    gamma_market_id = str(gamma_raw.get("id", ""))
+    gamma_condition = str(gamma_raw.get("conditionId", ""))
+    if gamma_market_id != expected_market_id:
+        return _blocked(
+            condition_id,
+            asset,
+            horizon,
+            "GAMMA_MARKET_ID_MISMATCH",
+            observed_at,
+            _settlement_evidence(gamma_raw, clob_raw),
+        )
+    if gamma_condition != condition_id:
+        return _blocked(
+            condition_id,
+            asset,
+            horizon,
+            "GAMMA_CONDITION_ID_MISMATCH",
+            observed_at,
+            _settlement_evidence(gamma_raw, clob_raw),
+        )
+    clob_condition = str(clob_raw.get("condition_id", clob_raw.get("conditionId", "")))
+    if clob_condition != condition_id:
+        return _blocked(
+            condition_id,
+            asset,
+            horizon,
+            "CLOB_CONDITION_ID_MISMATCH",
+            observed_at,
+            _settlement_evidence(gamma_raw, clob_raw),
+        )
+    if not bool(gamma_raw.get("closed")) or not bool(clob_raw.get("closed")):
+        evidence = _settlement_evidence(gamma_raw, clob_raw)
+        return OfficialSettlementResult(
+            OfficialSettlementStatus.SETTLEMENT_PENDING,
+            gamma_market_id,
+            condition_id,
+            asset,
+            horizon,
+            None,
+            "OFFICIAL",
+            "POLYMARKET_GAMMA_MARKET_ID_AND_CLOB_CONDITION",
+            None,
+            observed_at,
+            _evidence_hash(evidence),
+            "MARKET_NOT_FINAL",
+            evidence,
+        )
+    winner, winner_reason = _winner_from_clob_tokens(clob_raw)
+    evidence = _settlement_evidence(gamma_raw, clob_raw)
+    if winner is None:
+        return _blocked(condition_id, asset, horizon, winner_reason, observed_at, evidence)
+    resolved_at = _resolved_at(gamma_raw)
+    return OfficialSettlementResult(
+        OfficialSettlementStatus.SETTLED,
+        gamma_market_id,
+        condition_id,
+        asset,
+        horizon,
+        winner,
+        "OFFICIAL",
+        "POLYMARKET_GAMMA_MARKET_ID_AND_CLOB_CONDITION",
+        resolved_at,
+        observed_at,
+        _evidence_hash(evidence),
+        "OFFICIAL_FINAL"
+        if resolved_at is not None
+        else "OFFICIAL_FINAL_RESOLUTION_TIME_UNAVAILABLE",
+        evidence,
+    )
+
+
 def _winner(raw: Mapping[str, object]) -> OutcomeSide | None:
     for key in ("winningOutcome", "winning_outcome", "resolutionOutcome", "winner"):
         value = raw.get(key)
@@ -615,6 +783,37 @@ def _winner(raw: Mapping[str, object]) -> OutcomeSide | None:
             if normalized in {"UP", "DOWN"}:
                 return OutcomeSide(normalized)
     return None
+
+
+def _winner_from_clob_tokens(raw: Mapping[str, object]) -> tuple[OutcomeSide | None, str]:
+    tokens = raw.get("tokens")
+    if not isinstance(tokens, list):
+        return None, "CLOB_TOKENS_MISSING"
+    by_outcome: dict[OutcomeSide, Mapping[str, object]] = {}
+    winners: list[OutcomeSide] = []
+    for item in tokens:
+        if not isinstance(item, Mapping):
+            return None, "CLOB_TOKEN_NOT_OBJECT"
+        raw_outcome = item.get("outcome")
+        if not isinstance(raw_outcome, str):
+            return None, "CLOB_TOKEN_OUTCOME_MISSING"
+        normalized = raw_outcome.strip().upper()
+        if normalized not in {"UP", "DOWN"}:
+            return None, "CLOB_TOKEN_OUTCOME_UNKNOWN"
+        outcome = OutcomeSide(normalized)
+        if outcome in by_outcome:
+            return None, "CLOB_TOKEN_OUTCOME_DUPLICATE"
+        by_outcome[outcome] = item
+        winner = item.get("winner")
+        if not isinstance(winner, bool):
+            return None, "CLOB_TOKEN_WINNER_NOT_BOOL"
+        if winner:
+            winners.append(outcome)
+    if set(by_outcome) != {OutcomeSide.UP, OutcomeSide.DOWN}:
+        return None, "CLOB_UP_DOWN_TOKEN_SET_INVALID"
+    if len(winners) != 1:
+        return None, "CLOB_WINNER_CARDINALITY_INVALID"
+    return winners[0], "OFFICIAL_CLOB_WINNER"
 
 
 def _json_array(value: object) -> tuple[object, ...]:
@@ -647,6 +846,33 @@ def _sanitized_evidence(raw: Mapping[str, object]) -> dict[str, object]:
         "updatedAt",
     )
     return {key: raw[key] for key in keys if key in raw}
+
+
+def _settlement_evidence(
+    gamma_raw: Mapping[str, object], clob_raw: Mapping[str, object]
+) -> dict[str, object]:
+    clob_tokens = []
+    raw_tokens = clob_raw.get("tokens")
+    if isinstance(raw_tokens, list):
+        for item in raw_tokens:
+            if isinstance(item, Mapping):
+                clob_tokens.append(
+                    {
+                        key: item[key]
+                        for key in ("outcome", "winner", "token_id", "tokenId")
+                        if key in item
+                    }
+                )
+    return {
+        "resolver_version": SETTLEMENT_RESOLVER_VERSION,
+        "gamma": _sanitized_evidence(gamma_raw),
+        "clob": {
+            key: clob_raw[key]
+            for key in ("condition_id", "conditionId", "closed", "active", "archived")
+            if key in clob_raw
+        }
+        | {"tokens": clob_tokens},
+    }
 
 
 def _evidence_hash(evidence: Mapping[str, object]) -> str:

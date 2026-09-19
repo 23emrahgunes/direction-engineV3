@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -6,13 +7,17 @@ import pytest
 
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.settlement import (
+    GammaOfficialSettlementResolver,
     OfficialSettlementStatus,
     PaperSettlementService,
     parse_gamma_official_settlement,
+    parse_polymarket_official_settlement,
 )
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+KNOWN_CONDITION_ID = "0xfb51a138e396ddb791dfbc95965af7ab80b4359e790cc19c6c057b4ff76f197e"
+KNOWN_MARKET_ID = "4633348"
 
 
 class Clock:
@@ -45,6 +50,66 @@ class Resolver:
             expected_market_id=expected_market_id,
             observed_at=NOW,
         )
+
+
+class DirectTransport:
+    def __init__(self, gamma: dict[str, object], clob: dict[str, object]) -> None:
+        self.gamma = gamma
+        self.clob = clob
+        self.urls: list[str] = []
+
+    async def get_json(self, url, *, params=None):
+        self.urls.append(url)
+        if "/markets/" in url and "gamma-api.polymarket.com" in url:
+            return self.gamma
+        if "/markets/" in url and "clob.polymarket.com" in url:
+            return self.clob
+        if params and "condition_ids" in params:
+            return []
+        raise AssertionError(f"unexpected URL {url}")
+
+
+def _gamma_direct_market(
+    *,
+    condition_id: str = "condition-1",
+    market_id: str = "market-1",
+    closed: bool = True,
+    include_resolved_at: bool = True,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": market_id,
+        "conditionId": condition_id,
+        "closed": closed,
+        "active": not closed,
+        "archived": False,
+        "outcomes": '["Up", "Down"]',
+        "clobTokenIds": '["up-token", "down-token"]',
+        "eventStartTime": (NOW - timedelta(minutes=15)).isoformat(),
+        "endDate": (NOW - timedelta(minutes=1)).isoformat(),
+        "resolutionSource": "Polymarket official market metadata",
+        "description": "Sanitized crypto directional market",
+        "updatedAt": NOW.isoformat(),
+    }
+    if include_resolved_at:
+        payload["closedTime"] = NOW.isoformat()
+    return payload
+
+
+def _clob_direct_condition(
+    *,
+    condition_id: str = "condition-1",
+    closed: bool = True,
+    up_winner: bool = False,
+    down_winner: bool = True,
+) -> dict[str, object]:
+    return {
+        "condition_id": condition_id,
+        "closed": closed,
+        "tokens": [
+            {"outcome": "Up", "token_id": "up-token", "winner": up_winner},
+            {"outcome": "Down", "token_id": "down-token", "winner": down_winner},
+        ],
+    }
 
 
 def test_official_up_settlement_settles_up_trade_as_win_and_no_fee_double_count(tmp_path):
@@ -87,6 +152,269 @@ def test_official_down_settlement_settles_up_trade_as_loss(tmp_path):
     assert trade.payload["win_loss"] == "LOSS"
     assert trade.payload["payout_usdc"] == "0"
     assert trade.payload["realized_paper_pnl"] == "-3.04150"
+
+
+def test_direct_market_id_and_clob_condition_settle_known_condition_down(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    _trade(
+        paper,
+        trade_id="known-trade",
+        condition_id=KNOWN_CONDITION_ID,
+        market_id=KNOWN_MARKET_ID,
+        side="UP",
+        stake="2",
+        shares="3",
+    )
+    transport = DirectTransport(
+        _gamma_direct_market(condition_id=KNOWN_CONDITION_ID, market_id=KNOWN_MARKET_ID),
+        _clob_direct_condition(condition_id=KNOWN_CONDITION_ID, up_winner=False, down_winner=True),
+    )
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=GammaOfficialSettlementResolver(transport, Clock()),
+        clock=Clock(),
+    )
+
+    result = asyncio.run(service.run_once())
+    trade = paper.trade_by_id("known-trade")
+
+    assert result["settlement_completed"] == 1
+    assert trade is not None
+    assert trade.status == "SETTLED"
+    assert trade.payload["official_winning_side"] == "DOWN"
+    assert trade.payload["win_loss"] == "LOSS"
+    assert trade.payload["payout_usdc"] == "0"
+    assert trade.payload["realized_paper_pnl"] == "-2"
+    assert trade.payload["settlement_source_kind"] == "OFFICIAL"
+    assert trade.payload["settlement_source"] == "POLYMARKET_GAMMA_MARKET_ID_AND_CLOB_CONDITION"
+    assert trade.payload["real_order_submission"] is False
+    assert any(url.endswith(f"/markets/{KNOWN_MARKET_ID}") for url in transport.urls)
+    assert any(url.endswith(f"/markets/{KNOWN_CONDITION_ID}") for url in transport.urls)
+
+
+def test_clob_up_winner_path_settles_up():
+    result = parse_polymarket_official_settlement(
+        _gamma_direct_market(),
+        _clob_direct_condition(up_winner=True, down_winner=False),
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition-1",
+        expected_market_id="market-1",
+        observed_at=NOW,
+    )
+
+    assert result.status is OfficialSettlementStatus.SETTLED
+    assert result.winning_side is not None
+    assert result.winning_side.value == "UP"
+    assert result.source == "POLYMARKET_GAMMA_MARKET_ID_AND_CLOB_CONDITION"
+
+
+@pytest.mark.parametrize(
+    ("gamma", "clob", "reason", "status"),
+    (
+        (
+            _gamma_direct_market(),
+            _clob_direct_condition(up_winner=False, down_winner=False),
+            "CLOB_WINNER_CARDINALITY_INVALID",
+            OfficialSettlementStatus.SETTLEMENT_BLOCKED,
+        ),
+        (
+            _gamma_direct_market(),
+            _clob_direct_condition(up_winner=True, down_winner=True),
+            "CLOB_WINNER_CARDINALITY_INVALID",
+            OfficialSettlementStatus.SETTLEMENT_BLOCKED,
+        ),
+        (
+            _gamma_direct_market(),
+            {
+                "condition_id": "condition-1",
+                "closed": True,
+                "tokens": [
+                    {"outcome": "Moon", "winner": True},
+                    {"outcome": "Down", "winner": False},
+                ],
+            },
+            "CLOB_TOKEN_OUTCOME_UNKNOWN",
+            OfficialSettlementStatus.SETTLEMENT_BLOCKED,
+        ),
+        (
+            _gamma_direct_market(),
+            _clob_direct_condition(condition_id="condition-other"),
+            "CLOB_CONDITION_ID_MISMATCH",
+            OfficialSettlementStatus.SETTLEMENT_BLOCKED,
+        ),
+        (
+            _gamma_direct_market(market_id="market-other"),
+            _clob_direct_condition(),
+            "GAMMA_MARKET_ID_MISMATCH",
+            OfficialSettlementStatus.SETTLEMENT_BLOCKED,
+        ),
+        (
+            _gamma_direct_market(closed=False),
+            _clob_direct_condition(),
+            "MARKET_NOT_FINAL",
+            OfficialSettlementStatus.SETTLEMENT_PENDING,
+        ),
+    ),
+)
+def test_direct_gamma_clob_settlement_fail_closed(
+    gamma: dict[str, object],
+    clob: dict[str, object],
+    reason: str,
+    status: OfficialSettlementStatus,
+):
+    result = parse_polymarket_official_settlement(
+        gamma,
+        clob,
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition-1",
+        expected_market_id="market-1",
+        observed_at=NOW,
+    )
+
+    assert result.status is status
+    assert result.reason == reason
+
+
+def test_clob_prices_are_never_used_to_infer_winner():
+    clob = _clob_direct_condition(up_winner=False, down_winner=False)
+    clob["tokens"] = [
+        {"outcome": "Up", "winner": False, "price": "0.99"},
+        {"outcome": "Down", "winner": False, "price": "0.01"},
+    ]
+
+    result = parse_polymarket_official_settlement(
+        _gamma_direct_market(),
+        clob,
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition-1",
+        expected_market_id="market-1",
+        observed_at=NOW,
+    )
+
+    assert result.status is OfficialSettlementStatus.SETTLEMENT_BLOCKED
+    assert result.reason == "CLOB_WINNER_CARDINALITY_INVALID"
+    assert result.winning_side is None
+
+
+def test_settlement_persists_when_corpus_label_blocked_by_missing_resolution_time(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    _trade(paper, condition_id="condition-1", market_id="market-1", side="DOWN")
+    transport = DirectTransport(
+        _gamma_direct_market(include_resolved_at=False),
+        _clob_direct_condition(up_winner=False, down_winner=True),
+    )
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=GammaOfficialSettlementResolver(transport, Clock()),
+        clock=Clock(),
+    )
+
+    result = asyncio.run(service.run_once())
+    trade = paper.trade_by_id("trade-1")
+    settlement = paper.settlement_for_trade("trade-1")
+
+    assert result["settlement_completed"] == 1
+    assert trade is not None and trade.status == "SETTLED"
+    assert settlement is not None
+    assert settlement.official_resolved_at is None
+    assert settlement.official_resolution_observed_at == NOW
+    task = paper.corpus_label_task("condition-1", settlement.evidence_hash)
+    assert task is not None
+    assert task.state == "BLOCKED_RETRYABLE"
+    assert task.last_reason == "CORPUS_LABEL_BLOCKED:RESOLUTION_TIME_UNAVAILABLE"
+
+
+def test_old_retryable_market_metadata_not_found_is_due_under_v2(tmp_path):
+    paper = _paper(tmp_path)
+    paper.save_settlement_condition_attempt(
+        condition_id="condition-legacy",
+        state="BLOCKED_RETRYABLE",
+        attempted_at=NOW,
+        next_attempt_at=NOW + timedelta(hours=6),
+        reason="MARKET_METADATA_NOT_FOUND",
+        error=None,
+        successful_at=None,
+        payload={
+            "condition_id": "condition-legacy",
+            "resolver_version": "POLYMARKET_SETTLEMENT_V1",
+            "reason": "MARKET_METADATA_NOT_FOUND",
+        },
+    )
+
+    due = paper.due_settlement_conditions(("condition-legacy",), now=NOW)
+
+    assert due == ("condition-legacy",)
+
+
+def test_paper_settlement_schema_migration_keeps_old_rows_and_adds_observed_at(tmp_path):
+    path = tmp_path / "paper.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE paper_trade_settlements (
+                settlement_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL UNIQUE,
+                condition_id TEXT NOT NULL,
+                official_winning_side TEXT NOT NULL,
+                selected_side TEXT NOT NULL,
+                settlement_source_kind TEXT NOT NULL,
+                settlement_source TEXT NOT NULL,
+                official_resolved_at TEXT NOT NULL,
+                settled_at TEXT NOT NULL,
+                filled_shares TEXT NOT NULL,
+                cost_basis_usdc TEXT NOT NULL,
+                payout_usdc TEXT NOT NULL,
+                realized_paper_pnl TEXT NOT NULL,
+                win_loss TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO paper_trade_settlements
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "settlement:old",
+                "trade-old",
+                "condition-old",
+                "DOWN",
+                "UP",
+                "OFFICIAL",
+                "POLYMARKET_OFFICIAL_METADATA",
+                NOW.isoformat(),
+                NOW.isoformat(),
+                "1",
+                "0.5",
+                "0",
+                "-0.5",
+                "LOSS",
+                "old-hash",
+                '{"settlement_source_kind":"OFFICIAL"}',
+            ),
+        )
+
+    repo = SQLitePaperRepository(path)
+    repo.initialize()
+    settlement = repo.settlement_for_trade("trade-old")
+
+    assert settlement is not None
+    assert settlement.official_resolved_at == NOW
+    assert settlement.official_resolution_observed_at == NOW
+    with sqlite3.connect(path) as connection:
+        columns = connection.execute("PRAGMA table_info(paper_trade_settlements)").fetchall()
+    by_name = {str(row[1]): row for row in columns}
+    assert "official_resolution_observed_at" in by_name
+    assert int(by_name["official_resolved_at"][3]) == 0
 
 
 def test_paper_summary_preserves_negative_raw_capital_and_accounting_buckets(tmp_path):
@@ -332,6 +660,7 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
         settlement_source_kind="OFFICIAL",
         settlement_source="POLYMARKET_OFFICIAL_METADATA",
         official_resolved_at=NOW,
+        official_resolution_observed_at=NOW,
         settled_at=NOW,
         filled_shares=Decimal("1"),
         cost_basis_usdc=Decimal("0.5"),
@@ -350,6 +679,7 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
         settlement_source_kind="OFFICIAL",
         settlement_source="POLYMARKET_OFFICIAL_METADATA",
         official_resolved_at=NOW,
+        official_resolution_observed_at=NOW,
         settled_at=NOW,
         filled_shares=Decimal("1"),
         cost_basis_usdc=Decimal("0.5"),
@@ -368,6 +698,7 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
         settlement_source_kind="OFFICIAL",
         settlement_source="POLYMARKET_OFFICIAL_METADATA",
         official_resolved_at=NOW,
+        official_resolution_observed_at=NOW,
         settled_at=NOW,
         filled_shares=Decimal("1"),
         cost_basis_usdc=Decimal("0.5"),
@@ -387,6 +718,7 @@ def test_pending_ambiguous_void_and_conflict_fail_closed(tmp_path):
             settlement_source_kind="OFFICIAL",
             settlement_source="POLYMARKET_OFFICIAL_METADATA",
             official_resolved_at=NOW,
+            official_resolution_observed_at=NOW,
             settled_at=NOW,
             filled_shares=Decimal("1"),
             cost_basis_usdc=Decimal("0.5"),
@@ -579,6 +911,7 @@ def _trade(
             "cost_basis_usdc": stake,
             "shares": shares,
             "fee": fee,
+            "window_start": (NOW - timedelta(minutes=6)).isoformat(),
             "window_end": (NOW - timedelta(minutes=1)).isoformat(),
             "real_order_submission": False,
         },

@@ -5,7 +5,9 @@ from direction_engine_v3.settlement.official import (
     OfficialSettlementResult,
     OfficialSettlementStatus,
     PaperSettlementService,
+    PolymarketOfficialSettlementResolver,
     parse_gamma_official_settlement,
+    parse_polymarket_official_settlement,
 )
 
 __all__ = [
@@ -13,5 +15,7 @@ __all__ = [
     "OfficialSettlementResult",
     "OfficialSettlementStatus",
     "PaperSettlementService",
+    "PolymarketOfficialSettlementResolver",
     "parse_gamma_official_settlement",
+    "parse_polymarket_official_settlement",
 ]
