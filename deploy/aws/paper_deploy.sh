@@ -8,6 +8,7 @@ DEPLOY_STATE_DIR="/var/lib/direction-engine-v3/deploy"
 LEGACY_DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"
 DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"
 STAGE="start"
+DEPLOY_STARTED_AT="$(date -u +%FT%TZ)"
 
 PROJECT_UNITS=(
   "direction-engine-v3-shadow.service"
@@ -30,10 +31,11 @@ run_ubuntu_python() {
 
 dump_failure_context() {
   local exit_code="$1"
-  log "DEPLOY_FAILED stage=$STAGE exit_code=$exit_code expected_sha=$EXPECTED_SHA"
-  for unit in direction-engine-v3-shadow.service direction-engine-v3-dashboard.service; do
+  log "DEPLOY_FAILED stage=$STAGE exit_code=$exit_code expected_sha=$EXPECTED_SHA deploy_started_at=$DEPLOY_STARTED_AT"
+  for unit in "${PROJECT_UNITS[@]}"; do
+    systemctl show -p Id -p ActiveState -p SubState -p MainPID -p NRestarts -p InvocationID "$unit" || true
     systemctl --no-pager --full status "$unit" || true
-    journalctl -u "$unit" --no-pager -n 80 || true
+    journalctl -u "$unit" --since "$DEPLOY_STARTED_AT" --no-pager -n 120 || true
   done
 }
 
@@ -141,9 +143,108 @@ install_project_units() {
   systemctl enable direction-engine-v3-dashboard.service
   systemctl enable direction-engine-v3-shadow.service
   systemctl enable direction-engine-v3-shadow-report.timer
-  systemctl restart direction-engine-v3-dashboard.service
+}
+
+stop_project_runtime_units() {
+  STAGE="systemd-stop-project"
+  systemctl stop direction-engine-v3-shadow-report.timer || true
+  systemctl stop direction-engine-v3-shadow-report.service || true
+  systemctl stop direction-engine-v3-dashboard.service || true
+  systemctl stop direction-engine-v3-shadow.service || true
+}
+
+start_shadow_and_wait_ready() {
+  STAGE="shadow-startup"
+  local shadow_started_at
+  shadow_started_at="$(date -u +%FT%TZ)"
   systemctl restart direction-engine-v3-shadow.service
+  wait_shadow_startup_ready "$shadow_started_at"
+}
+
+start_dashboard_and_report() {
+  STAGE="dashboard-report-start"
+  systemctl restart direction-engine-v3-dashboard.service
   systemctl restart direction-engine-v3-shadow-report.timer
+}
+
+shadow_startup_ready() {
+  local started_after="$1"
+  sudo -H -u ubuntu bash -lc "cd '$PROJECT_DIR' && '$PY' - '$EXPECTED_SHA' '$started_after'" <<'PY'
+import json
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+expected_sha, started_after_raw = sys.argv[1:]
+db_path = Path("runtime/data/shadow_evidence.sqlite3")
+
+def parse_ts(raw: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+started_after = parse_ts(started_after_raw)
+if started_after is None:
+    print(json.dumps({"status": "INVALID_DEPLOY_START", "value": started_after_raw}))
+    raise SystemExit(2)
+if not db_path.exists():
+    print(json.dumps({"status": "WAITING_FOR_SHADOW_DB", "path": str(db_path)}))
+    raise SystemExit(1)
+with sqlite3.connect(db_path, timeout=1.0) as connection:
+    row = connection.execute(
+        "SELECT window_id, started_at, payload_json FROM evidence_windows "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+if row is None:
+    print(json.dumps({"status": "WAITING_FOR_EVIDENCE_WINDOW"}))
+    raise SystemExit(1)
+window_id, started_at_raw, payload_json = row
+started_at = parse_ts(str(started_at_raw))
+payload = json.loads(str(payload_json))
+fingerprint = payload.get("fingerprint", {}) if isinstance(payload, dict) else {}
+code_commit = fingerprint.get("code_commit") if isinstance(fingerprint, dict) else None
+result = {
+    "status": "SHADOW_STARTUP_READY",
+    "window_id": window_id,
+    "started_at": started_at_raw,
+    "code_commit": code_commit,
+}
+if started_at is None or started_at < started_after:
+    result["status"] = "WAITING_FOR_CURRENT_EVIDENCE_WINDOW"
+    print(json.dumps(result, sort_keys=True))
+    raise SystemExit(1)
+if code_commit != expected_sha:
+    result["status"] = "WAITING_FOR_EXPECTED_SHA_EVIDENCE_WINDOW"
+    print(json.dumps(result, sort_keys=True))
+    raise SystemExit(1)
+print(json.dumps(result, sort_keys=True))
+PY
+}
+
+wait_shadow_startup_ready() {
+  local started_after="$1"
+  local deadline=$((SECONDS + 75))
+  local last_result=""
+  while [ "$SECONDS" -le "$deadline" ]; do
+    if last_result="$(shadow_startup_ready "$started_after")"; then
+      log "shadow startup readiness committed: $last_result"
+      systemctl is-active --quiet direction-engine-v3-shadow.service
+      return 0
+    fi
+    log "waiting for shadow startup evidence: $last_result"
+    if ! systemctl is-active --quiet direction-engine-v3-shadow.service; then
+      echo "Shadow service stopped before startup evidence was committed" >&2
+      exit 23
+    fi
+    sleep 3
+  done
+  echo "Shadow startup evidence was not committed within bounded wait: $last_result" >&2
+  exit 23
 }
 
 cycle_count() {
@@ -409,7 +510,10 @@ main() {
   checkout_exact_sha
   install_dependencies_if_needed
   validate_on_vps
+  stop_project_runtime_units
   install_project_units
+  start_shadow_and_wait_ready
+  start_dashboard_and_report
   smoke_check
   log "DEPLOY_PAPER_ACCEPTED expected_sha=$EXPECTED_SHA"
 }

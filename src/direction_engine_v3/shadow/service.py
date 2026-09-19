@@ -5,8 +5,10 @@ arms LIVE, or submits orders.
 """
 
 import argparse
+import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -74,11 +76,39 @@ def run_once(
         started_at=started_at,
     )
     repository = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3")
-    repository.initialize()
-    repository.save_window_once(
+    schema_diagnostic = repository.initialize_for_startup()
+    print(
+        "shadow_startup_storage="
+        + json.dumps(
+            schema_diagnostic.as_dict()
+            | {
+                "status": "STORAGE_SCHEMA_READY",
+                "process_name": "shadow-service",
+                "pid": os.getpid(),
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    window_diagnostic = repository.save_window_once_for_startup(
         window_id=evidence_window.window_id,
         payload=evidence_window.as_dict(),
         started_at=evidence_window.started_at,
+    )
+    print(
+        "shadow_startup_storage="
+        + json.dumps(
+            window_diagnostic.as_dict()
+            | {
+                "status": "STORAGE_READY",
+                "process_name": "shadow-service",
+                "pid": os.getpid(),
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
     )
     repository.append_event(
         event_id=f"{evidence_window.window_id}:collector_started",

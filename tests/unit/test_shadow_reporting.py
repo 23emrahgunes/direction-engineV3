@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime
 
 from direction_engine_v3.app import dashboard
@@ -150,6 +151,171 @@ def test_shadow_repository_reports_storage_busy_without_fake_success(tmp_path) -
         connection.rollback()
         connection.close()
     assert repository.latest_window_payload() is None
+
+
+def test_shadow_startup_waits_out_reader_commit_contention_once(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(
+        db_path,
+        busy_timeout_ms=100,
+        max_busy_retries=0,
+        busy_retry_sleep_seconds=0.05,
+    )
+    repository.initialize()
+    reader = sqlite3.connect(db_path, check_same_thread=False)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM evidence_windows").fetchall()
+    timer = threading.Timer(2.0, lambda: (reader.rollback(), reader.close()))
+    timer.start()
+    started = time.monotonic()
+    try:
+        diagnostic = repository.save_window_once_for_startup(
+            window_id="startup-window",
+            payload={"app_mode": "PAPER"},
+            started_at=datetime(2026, 1, 1, tzinfo=UTC),
+            deadline_seconds=5.0,
+        )
+    finally:
+        timer.join()
+
+    assert time.monotonic() - started >= 1.5
+    assert diagnostic.attempt_count > 1
+    assert diagnostic.operation == "shadow_evidence_window"
+    assert repository.window_exists("startup-window")
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM evidence_windows WHERE window_id='startup-window'"
+        ).fetchone()
+    assert row == (1,)
+
+
+def test_shadow_startup_waits_out_writer_contention(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(
+        db_path,
+        busy_timeout_ms=50,
+        max_busy_retries=0,
+        busy_retry_sleep_seconds=0.05,
+    )
+    repository.initialize()
+    writer = sqlite3.connect(db_path, check_same_thread=False)
+    writer.execute("BEGIN EXCLUSIVE")
+    timer = threading.Timer(0.4, lambda: (writer.rollback(), writer.close()))
+    timer.start()
+    try:
+        diagnostic = repository.save_window_once_for_startup(
+            window_id="writer-window",
+            payload={"app_mode": "PAPER"},
+            started_at=datetime(2026, 1, 1, tzinfo=UTC),
+            deadline_seconds=3.0,
+        )
+    finally:
+        timer.join()
+
+    assert diagnostic.attempt_count > 1
+    assert repository.window_exists("writer-window")
+
+
+def test_shadow_startup_busy_budget_exhaustion_has_no_fake_ready_window(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(
+        db_path,
+        busy_timeout_ms=50,
+        max_busy_retries=0,
+        busy_retry_sleep_seconds=0.05,
+    )
+    repository.initialize()
+    reader = sqlite3.connect(db_path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM evidence_windows").fetchall()
+    try:
+        try:
+            repository.save_window_once_for_startup(
+                window_id="blocked-window",
+                payload={"app_mode": "PAPER"},
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                deadline_seconds=0.2,
+            )
+        except ShadowStorageBusy as exc:
+            assert "STORAGE_BUSY:shadow_evidence_startup" in str(exc)
+        else:
+            raise AssertionError("expected startup storage busy failure")
+    finally:
+        reader.rollback()
+        reader.close()
+
+    assert not repository.window_exists("blocked-window")
+
+
+def test_shadow_startup_retry_failure_closes_connections_for_later_success(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(
+        db_path,
+        busy_timeout_ms=50,
+        max_busy_retries=0,
+        busy_retry_sleep_seconds=0.05,
+    )
+    repository.initialize()
+    writer = sqlite3.connect(db_path)
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        try:
+            repository.save_window_once_for_startup(
+                window_id="retry-window",
+                payload={"app_mode": "PAPER"},
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                deadline_seconds=0.2,
+            )
+        except ShadowStorageBusy:
+            pass
+        else:
+            raise AssertionError("expected startup storage busy failure")
+    finally:
+        writer.rollback()
+        writer.close()
+
+    repository.save_window_once_for_startup(
+        window_id="retry-window",
+        payload={"app_mode": "PAPER"},
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deadline_seconds=1.0,
+    )
+
+    assert repository.window_exists("retry-window")
+
+
+def test_runtime_append_event_keeps_short_busy_policy(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(
+        db_path,
+        busy_timeout_ms=50,
+        max_busy_retries=0,
+        busy_retry_sleep_seconds=0.05,
+    )
+    repository.initialize()
+    reader = sqlite3.connect(db_path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM shadow_events").fetchall()
+    started = time.monotonic()
+    try:
+        try:
+            repository.append_event(
+                event_id="event",
+                window_id="window",
+                event_type="REAL_SHADOW_CYCLE",
+                bucket_key=None,
+                payload={"app_mode": "PAPER"},
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        except ShadowStorageBusy:
+            pass
+        else:
+            raise AssertionError("expected short runtime storage busy failure")
+    finally:
+        reader.rollback()
+        reader.close()
+
+    assert time.monotonic() - started < 1.0
 
 
 def test_shadow_read_only_paths_do_not_create_or_initialize_database(tmp_path, monkeypatch) -> None:

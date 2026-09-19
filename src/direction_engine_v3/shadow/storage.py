@@ -5,6 +5,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,34 @@ class ShadowStorageUnavailable(RuntimeError):
 
 class ShadowStorageBusy(RuntimeError):
     """Raised when bounded SQLite lock contention retry is exhausted."""
+
+
+@dataclass(frozen=True)
+class ShadowStartupStorageDiagnostic:
+    """Safe startup storage diagnostic suitable for journals and deploy logs."""
+
+    db_path: str
+    sqlite_version: str
+    journal_mode: str
+    operation: str
+    attempt_count: int
+    elapsed_seconds: float
+    last_sqlite_error_code: int | None = None
+    last_sqlite_error_name: str | None = None
+    last_error_message: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "db_path": self.db_path,
+            "sqlite_version": self.sqlite_version,
+            "journal_mode": self.journal_mode,
+            "operation": self.operation,
+            "attempt_count": self.attempt_count,
+            "elapsed_seconds": round(self.elapsed_seconds, 6),
+            "last_sqlite_error_code": self.last_sqlite_error_code,
+            "last_sqlite_error_name": self.last_sqlite_error_name,
+            "last_error_message": self.last_error_message,
+        }
 
 
 class SQLiteShadowRepository:
@@ -61,6 +90,39 @@ class SQLiteShadowRepository:
             )
             connection.commit()
 
+    def initialize_for_startup(
+        self, *, deadline_seconds: float = 30.0
+    ) -> ShadowStartupStorageDiagnostic:
+        """Initialize schema with a startup-only contention budget."""
+
+        if self._read_only:
+            raise ShadowStorageUnavailable("read-only shadow repository cannot initialize schema")
+        if deadline_seconds <= 0:
+            raise ValueError("deadline_seconds must be positive")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+        return self._write_with_startup_retry(
+            operation_name="shadow_evidence_schema",
+            deadline_seconds=deadline_seconds,
+            operation=lambda connection: connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS evidence_windows (
+                    window_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS shadow_events (
+                    event_id TEXT PRIMARY KEY,
+                    window_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    bucket_key TEXT,
+                    payload_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+                """
+            ),
+        )
+
     def save_window_once(
         self, *, window_id: str, payload: Mapping[str, object], started_at: datetime
     ) -> None:
@@ -73,6 +135,34 @@ class SQLiteShadowRepository:
                 (window_id, encoded, started_at.isoformat()),
             )
         )
+
+    def save_window_once_for_startup(
+        self,
+        *,
+        window_id: str,
+        payload: Mapping[str, object],
+        started_at: datetime,
+        deadline_seconds: float = 30.0,
+    ) -> ShadowStartupStorageDiagnostic:
+        """Persist the startup evidence window under a bounded startup wait budget."""
+
+        require_text("window_id", window_id)
+        require_utc("started_at", started_at)
+        if deadline_seconds <= 0:
+            raise ValueError("deadline_seconds must be positive")
+        encoded = _encode(payload)
+
+        diagnostic = self._write_with_startup_retry(
+            operation_name="shadow_evidence_window",
+            deadline_seconds=deadline_seconds,
+            operation=lambda connection: connection.execute(
+                "INSERT OR IGNORE INTO evidence_windows VALUES (?,?,?)",
+                (window_id, encoded, started_at.isoformat()),
+            ),
+        )
+        if not self.window_exists(window_id):
+            raise ShadowStorageBusy("STORAGE_BUSY:shadow_evidence_startup_unverified")
+        return diagnostic
 
     def append_event(
         self,
@@ -117,6 +207,13 @@ class SQLiteShadowRepository:
         if not isinstance(payload, dict):
             raise RuntimeError("stored evidence window payload is not an object")
         return payload
+
+    def window_exists(self, window_id: str) -> bool:
+        require_text("window_id", window_id)
+        row = self._read_one(
+            "SELECT 1 FROM evidence_windows WHERE window_id=? LIMIT 1", (window_id,)
+        )
+        return row is not None
 
     def event_counts(self) -> dict[str, int]:
         rows = self._read_all(
@@ -213,6 +310,83 @@ class SQLiteShadowRepository:
                 time.sleep(self._busy_retry_sleep_seconds * (attempt + 1))
         raise ShadowStorageBusy("STORAGE_BUSY:shadow_evidence_write") from last_error
 
+    def _write_with_startup_retry(
+        self,
+        *,
+        operation_name: str,
+        deadline_seconds: float,
+        operation: Callable[[sqlite3.Connection], object],
+    ) -> ShadowStartupStorageDiagnostic:
+        started = time.monotonic()
+        deadline = started + deadline_seconds
+        attempt_count = 0
+        last_error: sqlite3.OperationalError | None = None
+        while True:
+            attempt_count += 1
+            try:
+                with closing(self._connect(write=True)) as connection:
+                    try:
+                        operation(connection)
+                        connection.commit()
+                    except Exception:
+                        connection.rollback()
+                        raise
+                return self._startup_diagnostic(
+                    operation=operation_name,
+                    attempt_count=attempt_count,
+                    elapsed_seconds=time.monotonic() - started,
+                    last_error=last_error,
+                )
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc):
+                    raise
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(self._busy_retry_sleep_seconds * attempt_count, 0.5, remaining))
+        diagnostic = self._startup_diagnostic(
+            operation=operation_name,
+            attempt_count=attempt_count,
+            elapsed_seconds=time.monotonic() - started,
+            last_error=last_error,
+        )
+        encoded_diagnostic = json.dumps(diagnostic.as_dict(), sort_keys=True)
+        raise ShadowStorageBusy(
+            f"STORAGE_BUSY:shadow_evidence_startup:{encoded_diagnostic}"
+        ) from last_error
+
+    def _startup_diagnostic(
+        self,
+        *,
+        operation: str,
+        attempt_count: int,
+        elapsed_seconds: float,
+        last_error: sqlite3.OperationalError | None,
+    ) -> ShadowStartupStorageDiagnostic:
+        error_message = None if last_error is None else _safe_sqlite_error_message(last_error)
+        return ShadowStartupStorageDiagnostic(
+            db_path=str(self._path.resolve()),
+            sqlite_version=sqlite3.sqlite_version,
+            journal_mode=self._safe_journal_mode(),
+            operation=operation,
+            attempt_count=attempt_count,
+            elapsed_seconds=elapsed_seconds,
+            last_sqlite_error_code=(
+                None if last_error is None else getattr(last_error, "sqlite_errorcode", None)
+            ),
+            last_sqlite_error_name=(
+                None if last_error is None else getattr(last_error, "sqlite_errorname", None)
+            ),
+            last_error_message=error_message,
+        )
+
+    def _safe_journal_mode(self) -> str:
+        try:
+            return self.journal_mode()
+        except Exception:
+            return "UNAVAILABLE"
+
     def _read_all(
         self, query: str, params: tuple[object, ...] = ()
     ) -> list[tuple[object, ...]]:
@@ -229,8 +403,15 @@ class SQLiteShadowRepository:
 
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    error_name = str(getattr(exc, "sqlite_errorname", "")).upper()
+    if error_name in {"SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_SNAPSHOT"}:
+        return True
     message = str(exc).lower()
     return "database is locked" in message or "database is busy" in message
+
+
+def _safe_sqlite_error_message(exc: sqlite3.OperationalError) -> str:
+    return str(exc).replace("\r", " ").replace("\n", " ").strip()[:240]
 
 
 def _encode(payload: Mapping[str, object]) -> str:

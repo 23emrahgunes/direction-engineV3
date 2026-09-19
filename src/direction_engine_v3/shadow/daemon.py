@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -111,7 +112,11 @@ from direction_engine_v3.shadow.evidence import (
     EvidenceWindow,
 )
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
-from direction_engine_v3.shadow.storage import ShadowStorageBusy, SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import (
+    ShadowStartupStorageDiagnostic,
+    ShadowStorageBusy,
+    SQLiteShadowRepository,
+)
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 from direction_engine_v3.strategies.directional import (
     DirectionalAssessment,
@@ -2067,6 +2072,48 @@ def new_evidence_window(
     )
 
 
+def _shadow_startup_log(
+    *, status: str, diagnostic: ShadowStartupStorageDiagnostic, process_name: str
+) -> None:
+    payload = diagnostic.as_dict() | {
+        "status": status,
+        "process_name": process_name,
+        "pid": os.getpid(),
+    }
+    print(
+        f"shadow_startup_storage={json.dumps(payload, sort_keys=True)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _prepare_shadow_evidence_startup(
+    *,
+    shadow: SQLiteShadowRepository,
+    evidence_window: EvidenceWindow,
+    payload: Mapping[str, object],
+    deadline_seconds: float = 30.0,
+    process_name: str = "shadow-daemon",
+) -> None:
+    schema_diagnostic = shadow.initialize_for_startup(deadline_seconds=deadline_seconds)
+    _shadow_startup_log(
+        status="STORAGE_SCHEMA_READY",
+        diagnostic=schema_diagnostic,
+        process_name=process_name,
+    )
+    window_diagnostic = shadow.save_window_once_for_startup(
+        window_id=evidence_window.window_id,
+        payload=payload,
+        started_at=evidence_window.started_at,
+        deadline_seconds=deadline_seconds,
+    )
+    _shadow_startup_log(
+        status="STORAGE_READY",
+        diagnostic=window_diagnostic,
+        process_name=process_name,
+    )
+
+
 async def run_daemon(
     *,
     data_dir: Path,
@@ -2098,14 +2145,13 @@ async def run_daemon(
     directional_corpus = SQLiteDirectionalCorpusRepository(data_dir / "directional_corpus.sqlite3")
     ptb_repository = SQLitePriceToBeatRepository(data_dir / "price_to_beat.sqlite3")
     paper.initialize()
-    shadow.initialize()
     directional_corpus.initialize()
     ptb_repository.initialize()
-    shadow.save_window_once(
-        window_id=evidence_window.window_id,
+    _prepare_shadow_evidence_startup(
+        shadow=shadow,
+        evidence_window=evidence_window,
         payload=evidence_window.as_dict()
         | {"previous_report_only_window_invalid_for_strategy_burn_in": True},
-        started_at=evidence_window.started_at,
     )
     async with PublicTransport(timeout_seconds=15) as transport:
         chainlink = ChainlinkTwapCollector(transport, clock)

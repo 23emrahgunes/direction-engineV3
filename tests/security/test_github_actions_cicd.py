@@ -72,6 +72,8 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "direction-engine-v3-shadow.service" in source
     assert "direction-engine-v3-dashboard.service" in source
     assert "systemctl restart" in source
+    assert "wait_shadow_startup_ready" in source
+    assert "SHADOW_STARTUP_READY" in source
     assert "CHAINLINK_RUNTIME_BLOCKED" in source
     assert "CHAINLINK_ACCEPTED" in source
     assert "WAITING_FOR_FRESH_PIPELINE_EVIDENCE" in source
@@ -99,6 +101,41 @@ def test_deploy_chainlink_gate_requires_fresh_current_schema_evidence() -> None:
     assert "last_frame_class" in source
     assert "subscription_snapshot_count') or 0) < 1" in source
     assert "not state.get('last_frame_class')" in source
+
+
+def test_deploy_starts_shadow_before_dashboard_and_report_smoke() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "stop_project_runtime_units" in source
+    assert "start_shadow_and_wait_ready" in source
+    assert "start_dashboard_and_report" in source
+    assert "shadow_started_at=\"$(date -u +%FT%TZ)\"" in source
+    assert "wait_shadow_startup_ready \"$shadow_started_at\"" in source
+    assert "sqlite3.connect(db_path, timeout=1.0)" in source
+    assert "FROM evidence_windows" in source
+    assert "ORDER BY started_at DESC LIMIT 1" in source
+
+    shadow_start = source.index("start_shadow_and_wait_ready")
+    dashboard_start = source.index("start_dashboard_and_report")
+    smoke = source.index("smoke_check")
+    assert shadow_start < dashboard_start < smoke
+
+    function_start = source.index("start_shadow_and_wait_ready()")
+    function_end = source.index("start_dashboard_and_report()")
+    shadow_function = source[function_start:function_end]
+    assert "systemctl restart direction-engine-v3-shadow.service" in shadow_function
+    assert "systemctl restart direction-engine-v3-dashboard.service" not in shadow_function
+
+
+def test_deploy_failure_diagnostics_include_current_journal_and_preserve_stage() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "DEPLOY_STARTED_AT=\"$(date -u +%FT%TZ)\"" in source
+    assert "DEPLOY_FAILED stage=$STAGE exit_code=$exit_code" in source
+    assert "InvocationID" in source
+    assert "NRestarts" in source
+    assert "journalctl -u \"$unit\" --since \"$DEPLOY_STARTED_AT\"" in source
+    assert "trap 'dump_failure_context \"$?\"' ERR" in source
 
 
 def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:
