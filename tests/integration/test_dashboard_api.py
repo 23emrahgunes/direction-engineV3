@@ -76,7 +76,13 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert snapshot["execution"]["real_order_submission"] is False
 
 
-def test_directional_status_api_is_read_only_and_paper_labeled() -> None:
+def test_directional_status_api_is_read_only_and_paper_labeled(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+
     asyncio.run(_assert_directional_status_api_is_read_only_and_paper_labeled())
 
 
@@ -95,6 +101,38 @@ async def _assert_directional_status_api_is_read_only_and_paper_labeled() -> Non
     assert payload["real_order_submission"] is False
     assert len(payload["buckets"]) == 12
     assert {item["asset"] for item in payload["buckets"]} == {"BTC", "ETH", "SOL", "XRP"}
+    assert not any(item["last_paper_trade"] for item in payload["buckets"])
+    assert {item["label"] for item in payload["buckets"]} == {
+        "PAPER / SHADOW — NO REAL ORDER"
+    }
+
+
+def test_directional_status_missing_runtime_is_explicit_and_side_effect_free(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+
+    asyncio.run(_assert_directional_status_missing_runtime_is_explicit(tmp_path))
+
+
+async def _assert_directional_status_missing_runtime_is_explicit(tmp_path) -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    assert payload["label"] == "PAPER / SHADOW — NO REAL ORDER"
+    assert payload["status"] == "DATABASE_NOT_INITIALIZED"
+    assert payload["real_order_submission"] is False
+    assert payload["buckets"] == []
+    assert not (tmp_path / "shadow_evidence.sqlite3").exists()
+    assert not (tmp_path / "paper.sqlite3").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_directional_status_api_exposes_official_proxy_ptb_health(

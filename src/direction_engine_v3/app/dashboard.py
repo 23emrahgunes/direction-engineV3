@@ -235,7 +235,6 @@ def build_shadow_status() -> dict[str, object]:
 def build_directional_runtime_status() -> dict[str, object]:
     data_dir = runtime_data_dir()
     shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3", read_only=True)
-    paper = _paper_repository()
     try:
         directional_events = shadow.latest_events(event_type="STRATEGY_EVALUATION", limit=500)
         pipeline_events = shadow.latest_events(event_type="MARKET_DATA_PIPELINE", limit=500)
@@ -288,12 +287,7 @@ def build_directional_runtime_status() -> dict[str, object]:
             latest_pipeline["observed_at"] if latest_pipeline is not None else None
         )
         latest_observed_at = pipeline_payload.get("latest_observed_at", pipeline_observed_at)
-        trades = paper.trades(
-            asset=bucket.asset.value,
-            horizon=bucket.horizon.value,
-            strategy="DIRECTIONAL_EDGE",
-            limit=1,
-        )
+        trades = _paper_trades_for_directional_bucket(data_dir, bucket)
         buckets.append(
             {
                 "asset": bucket.asset.value,
@@ -362,6 +356,28 @@ def build_directional_runtime_status() -> dict[str, object]:
         "real_order_submission": False,
         "buckets": buckets,
     }
+
+
+def _paper_trades_for_directional_bucket(
+    data_dir: Path, bucket: object
+) -> tuple[object, ...]:
+    from direction_engine_v3.market_data import MarketBucket
+
+    if not isinstance(bucket, MarketBucket):
+        raise TypeError("bucket must be MarketBucket")
+    paper_path = data_dir / "paper.sqlite3"
+    if not paper_path.exists():
+        return ()
+    repository = SQLitePaperRepository(paper_path)
+    try:
+        return repository.trades(
+            asset=bucket.asset.value,
+            horizon=bucket.horizon.value,
+            strategy="DIRECTIONAL_EDGE",
+            limit=1,
+        )
+    except Exception:
+        return ()
 
 
 def _paper_repository() -> SQLitePaperRepository:
