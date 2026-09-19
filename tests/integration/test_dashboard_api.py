@@ -62,10 +62,37 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
 
     assert response.status == 200
     assert response.content_type == "text/html"
-    assert "direction-engineV3 Dashboard" in body
+    assert "Direction Engine V3" in body
     assert "PAPER / SHADOW" in body
+    assert "NO REAL ORDER" in body
+    assert "APP_MODE=PAPER" in body
+    assert "LIVE_TRADING_ENABLED=false" in body
+    assert "real_order_submission=false" in body
+    assert "Last updated" in body
+    assert "Overview" in body
+    assert "Settlement / Data Health" in body
+    assert "12 Bucket Performance" in body
     assert "PAPER TRADES" in body
     assert "ABSTAINS / REJECTIONS" in body
+    assert "DIRECTIONAL EDGE" in body
+    assert "STRUCTURAL ARB" in body
+    assert "DATA / LATENCY" in body
+    assert "Raw JSON" in body
+    assert "<pre id=\"overview\"" not in body
+    assert "Loading..." not in body
+    assert 'method:"POST"' not in body
+    assert 'method: "POST"' not in body
+    assert "submit_order" not in body
+    assert "create_order" not in body
+    assert "wallet" not in body.lower()
+    assert "signing" not in body.lower()
+    assert "/api/paper/summary" in body
+    assert "/api/paper/performance?strategy=DIRECTIONAL_EDGE" in body
+    assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=500" in body
+    assert "/api/paper/abstains" in body
+    assert "/api/directional/status" in body
+    assert "/api/shadow/status" in body
+    assert "/api/dashboard" in body
 
     snapshot = build_dashboard_snapshot().as_dict()
     assert snapshot["mode"] == {
