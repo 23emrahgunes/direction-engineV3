@@ -18,6 +18,8 @@ from direction_engine_v3.app.dashboard import (
     list_paper_trades,
 )
 
+DASHBOARD_INDEX_HTML = web.AppKey("dashboard_index_html", str)
+
 
 def dashboard_index_path() -> Path:
     for parent in Path(__file__).resolve().parents:
@@ -27,8 +29,20 @@ def dashboard_index_path() -> Path:
     raise FileNotFoundError("dashboard/web/index.html was not found")
 
 
-async def dashboard_index(_request: web.Request) -> web.FileResponse:
-    return web.FileResponse(dashboard_index_path())
+def dashboard_index_html() -> str:
+    """Load the small dashboard shell once per request without aiohttp sendfile.
+
+    The SSM-forwarded dashboard is a single static HTML shell. Returning it as an
+    in-memory response avoids a per-refresh FileResponse/sendfile path that can
+    block the single aiohttp event loop if the VPS filesystem is under I/O
+    pressure.
+    """
+
+    return dashboard_index_path().read_text(encoding="utf-8")
+
+
+async def dashboard_index(request: web.Request) -> web.Response:
+    return web.Response(text=request.app[DASHBOARD_INDEX_HTML], content_type="text/html")
 
 
 async def live(_request: web.Request) -> web.Response:
@@ -120,6 +134,7 @@ async def directional_status(_request: web.Request) -> web.Response:
 
 def create_app() -> web.Application:
     app = web.Application()
+    app[DASHBOARD_INDEX_HTML] = dashboard_index_html()
     app.router.add_get("/", dashboard_index, allow_head=False)
     app.router.add_get("/health/live", live, allow_head=False)
     app.router.add_get("/health/ready", ready, allow_head=False)
