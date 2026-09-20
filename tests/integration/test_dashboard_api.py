@@ -83,6 +83,10 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "Raw JSON" in body
     assert "<pre id=\"overview\"" not in body
     assert "Loading..." not in body
+    assert "AbortController" in body
+    assert "timeout" in body
+    assert "state.refreshing" in body
+    assert "render();refresh();setInterval(refresh,5000)" in body
     assert 'method:"POST"' not in body
     assert 'method: "POST"' not in body
     assert "submit_order" not in body
