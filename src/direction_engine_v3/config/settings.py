@@ -13,6 +13,7 @@ SUPPORTED_HORIZONS: Final[tuple[str, ...]] = tuple(horizon.value for horizon in 
 APP_MODE: Final[str] = TradingMode.PAPER.value
 LIVE_TRADING_ENABLED: Final[bool] = False
 LIVE_AUTO_ARM: Final[bool] = False
+PAPER_INITIAL_EQUITY_USDC: Final[str] = "40.00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,3 +25,4 @@ class BootstrapSettings:
     app_mode: str = APP_MODE
     live_trading_enabled: bool = LIVE_TRADING_ENABLED
     live_auto_arm: bool = LIVE_AUTO_ARM
+    paper_initial_equity_usdc: str = PAPER_INITIAL_EQUITY_USDC

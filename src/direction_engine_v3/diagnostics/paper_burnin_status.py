@@ -22,6 +22,10 @@ def main() -> None:
     print("-----------------")
     summary = payload["performance"]["summary"]
     for key in (
+        "paper_run_id",
+        "paper_run_label",
+        "paper_run_started_at",
+        "paper_run_archive_path",
         "initial_equity",
         "raw_available_capital",
         "spendable_capital",

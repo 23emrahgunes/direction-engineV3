@@ -27,7 +27,12 @@ from direction_engine_v3.adapters.polymarket import (
     parse_gamma_market_discovery,
 )
 from direction_engine_v3.adapters.public_transport import PublicTransport
-from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENABLED
+from direction_engine_v3.config import (
+    APP_MODE,
+    LIVE_AUTO_ARM,
+    LIVE_TRADING_ENABLED,
+    PAPER_INITIAL_EQUITY_USDC,
+)
 from direction_engine_v3.domain import (
     Asset,
     DecisionAction,
@@ -2252,6 +2257,7 @@ def _risk_decision(
     portfolio_state: PortfolioState | None = None,
     approved_id: str,
 ) -> RiskDecision:
+    paper_equity = Decimal(PAPER_INITIAL_EQUITY_USDC)
     liquidity = None
     if (
         state.up_book is not None
@@ -2280,18 +2286,18 @@ def _risk_decision(
         liquidity=liquidity,
         state=portfolio_state
         or PortfolioState(
-            Decimal("1000"), (), Decimal("0"), Decimal("0"), 0, None, False, True, state.observed_at
+            paper_equity, (), Decimal("0"), Decimal("0"), 0, None, False, True, state.observed_at
         ),
         policy=RiskPolicy(
             20,
-            Decimal("1000"),
-            Decimal("1000"),
-            Decimal("1000"),
-            Decimal("1000"),
+            paper_equity,
+            paper_equity,
+            paper_equity,
+            paper_equity,
             20,
             Decimal("5"),
-            Decimal("1000"),
-            Decimal("1000"),
+            paper_equity,
+            paper_equity,
             10,
             timedelta(seconds=60),
             timedelta(seconds=60),

@@ -7,6 +7,7 @@ from direction_engine_v3.storage.directional_corpus import (
 )
 from direction_engine_v3.storage.paper import (
     PaperAbstainRecord,
+    PaperRunMetadata,
     PaperSettlementConditionAttempt,
     PaperTradeSettlement,
     PaperTradeSnapshot,
@@ -18,6 +19,7 @@ __all__ = [
     "DirectionalCorpusRecord",
     "DirectionalTrainingRecord",
     "PaperAbstainRecord",
+    "PaperRunMetadata",
     "PaperSettlementConditionAttempt",
     "PaperTradeSettlement",
     "PaperTradeSnapshot",

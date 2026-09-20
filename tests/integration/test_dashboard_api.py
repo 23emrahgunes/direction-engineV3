@@ -70,6 +70,9 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "real_order_submission=false" in body
     assert "Last updated" in body
     assert "Overview" in body
+    assert "PAPER RUN" in body
+    assert "40 USDC CLEAN BURN-IN" in body
+    assert "Run ID" in body
     assert "Settlement / Data Health" in body
     assert "12 Bucket Performance" in body
     assert "PAPER TRADES" in body

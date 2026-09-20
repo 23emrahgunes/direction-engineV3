@@ -188,7 +188,7 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     capital_abstain = next(
         item for item in paper.abstains() if item.reason == "PAPER_CAPITAL_DEFICIT"
     )
-    assert capital_abstain.payload["raw_available_capital"] == "-200"
+    assert capital_abstain.payload["raw_available_capital"] == "-1160.00"
     assert capital_abstain.payload["spendable_capital"] == "0"
     directional_trades = paper.trades(strategy="DIRECTIONAL_EDGE", limit=100)
     assert len(directional_trades) == 1
@@ -199,7 +199,7 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
         for item in paper.abstains()
     )
     summary = paper.summary(now=NOW)
-    assert summary["raw_available_capital"] == "-200"
+    assert summary["raw_available_capital"] == "-1160.00"
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
@@ -327,7 +327,7 @@ def test_router_snapshot_does_not_reserve_filled_positions_twice(tmp_path) -> No
     portfolio = daemon._portfolio_state_from_paper(NOW)
 
     assert snapshot.claims == ()
-    assert portfolio.bankroll_available == Decimal("990")
+    assert portfolio.bankroll_available == Decimal("30.00")
     assert tuple(item.capital_at_risk for item in portfolio.exposures) == (Decimal("10"),)
 
 

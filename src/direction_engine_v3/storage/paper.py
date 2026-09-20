@@ -9,6 +9,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 
+from direction_engine_v3.config import PAPER_INITIAL_EQUITY_USDC
 from direction_engine_v3.domain._validation import require_decimal, require_text, require_utc
 
 
@@ -109,6 +110,15 @@ class PaperCorpusLabelTask:
     next_attempt_at: datetime | None
     attempt_count: int
     last_reason: str | None
+    payload: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class PaperRunMetadata:
+    paper_run_id: str
+    initial_equity_usdc: Decimal
+    started_at: datetime
+    archive_path: str | None
     payload: Mapping[str, object]
 
 
@@ -217,9 +227,101 @@ class SQLitePaperRepository:
                     payload_json TEXT NOT NULL,
                     PRIMARY KEY(condition_id,evidence_hash)
                 );
+                CREATE TABLE IF NOT EXISTS paper_run_metadata (
+                    paper_run_id TEXT PRIMARY KEY,
+                    initial_equity_usdc TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    archive_path TEXT,
+                    payload_json TEXT NOT NULL
+                );
                 """
             )
             _migrate_paper_trade_settlements(connection)
+
+    def save_run_metadata_once(
+        self,
+        *,
+        paper_run_id: str,
+        initial_equity_usdc: Decimal,
+        started_at: datetime,
+        archive_path: str | None,
+        payload: Mapping[str, object],
+    ) -> PaperRunMetadata:
+        require_text("paper_run_id", paper_run_id)
+        require_decimal("initial_equity_usdc", initial_equity_usdc, minimum=Decimal("0"))
+        require_utc("started_at", started_at)
+        encoded = json.dumps(
+            _jsonable(
+                dict(payload)
+                | {
+                    "paper_run_id": paper_run_id,
+                    "initial_equity_usdc": str(initial_equity_usdc),
+                    "archive_path": archive_path,
+                }
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with sqlite3.connect(self._path) as connection:
+            existing = connection.execute(
+                "SELECT paper_run_id,initial_equity_usdc,started_at,archive_path,payload_json "
+                "FROM paper_run_metadata ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if existing is not None and str(existing[0]) != paper_run_id:
+                raise RuntimeError("paper run metadata already exists for a different run")
+            connection.execute(
+                "INSERT OR IGNORE INTO paper_run_metadata VALUES (?,?,?,?,?)",
+                (
+                    paper_run_id,
+                    str(initial_equity_usdc),
+                    started_at.isoformat(),
+                    archive_path,
+                    encoded,
+                ),
+            )
+        stored = self.run_metadata()
+        if stored is None:
+            raise RuntimeError("paper run metadata was not durably recorded")
+        return stored
+
+    def run_metadata(self) -> PaperRunMetadata | None:
+        if not self._path.exists():
+            return None
+        with sqlite3.connect(self._path) as connection:
+            try:
+                row = connection.execute(
+                    "SELECT paper_run_id,initial_equity_usdc,started_at,archive_path,payload_json "
+                    "FROM paper_run_metadata ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return None if row is None else _run_metadata_from_row(row)
+
+    def paper_initial_equity(self) -> Decimal:
+        metadata = self.run_metadata()
+        if metadata is not None:
+            return metadata.initial_equity_usdc
+        return Decimal(PAPER_INITIAL_EQUITY_USDC)
+
+    def paper_run_id(self) -> str | None:
+        metadata = self.run_metadata()
+        return None if metadata is None else metadata.paper_run_id
+
+    def paper_table_counts(self) -> dict[str, int]:
+        tables = (
+            "paper_executions",
+            "paper_trade_snapshots",
+            "paper_trade_settlements",
+            "paper_settlement_condition_attempts",
+            "paper_trade_identity_overlays",
+            "paper_corpus_label_tasks",
+            "paper_abstains",
+        )
+        with sqlite3.connect(self._path) as connection:
+            return {
+                table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in tables
+            }
 
     def get(self, idempotency_key: str) -> StoredExecution | None:
         require_text("idempotency_key", idempotency_key)
@@ -247,7 +349,10 @@ class SQLitePaperRepository:
         require_text("idempotency_key", idempotency_key)
         require_text("plan_id", plan_id)
         require_utc("recorded_at", recorded_at)
-        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        encoded_payload = dict(payload)
+        if (paper_run_id := self.paper_run_id()) is not None:
+            encoded_payload.setdefault("paper_run_id", paper_run_id)
+        encoded = json.dumps(_jsonable(encoded_payload), sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self._path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -301,7 +406,10 @@ class SQLitePaperRepository:
         require_text("status", status)
         require_utc("observed_at", observed_at)
         label = "PAPER / SHADOW — NO REAL ORDER"
-        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        encoded_payload = dict(payload)
+        if (paper_run_id := self.paper_run_id()) is not None:
+            encoded_payload.setdefault("paper_run_id", paper_run_id)
+        encoded = json.dumps(_jsonable(encoded_payload), sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self._path) as connection:
             connection.execute(
                 """
@@ -346,7 +454,10 @@ class SQLitePaperRepository:
         require_text("condition_id", condition_id)
         require_text("reason", reason)
         require_utc("observed_at", observed_at)
-        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        encoded_payload = dict(payload)
+        if (paper_run_id := self.paper_run_id()) is not None:
+            encoded_payload.setdefault("paper_run_id", paper_run_id)
+        encoded = json.dumps(_jsonable(encoded_payload), sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self._path) as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO paper_abstains VALUES (?,?,?,?,?,?,?,?)",
@@ -413,7 +524,10 @@ class SQLitePaperRepository:
         require_decimal("cost_basis_usdc", cost_basis_usdc, minimum=Decimal("0"))
         require_decimal("payout_usdc", payout_usdc, minimum=Decimal("0"))
         require_decimal("realized_paper_pnl", realized_paper_pnl)
-        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        encoded_payload = dict(payload)
+        if (paper_run_id := self.paper_run_id()) is not None:
+            encoded_payload.setdefault("paper_run_id", paper_run_id)
+        encoded = json.dumps(_jsonable(encoded_payload), sort_keys=True, separators=(",", ":"))
         values = (
             settlement_id,
             trade_id,
@@ -963,9 +1077,11 @@ class SQLitePaperRepository:
     def summary(
         self,
         *,
-        initial_equity: Decimal = Decimal("1000"),
+        initial_equity: Decimal | None = None,
         now: datetime | None = None,
     ) -> dict[str, object]:
+        if initial_equity is None:
+            initial_equity = self.paper_initial_equity()
         require_decimal("initial_equity", initial_equity, minimum=Decimal("0"))
         if now is None:
             now = datetime.now(UTC)
@@ -1052,8 +1168,19 @@ class SQLitePaperRepository:
             initial_equity + realized_pnl - open_cost_basis - unfilled_reservations
         )
         spendable_capital = max(Decimal("0"), raw_available_capital)
+        run_metadata = self.run_metadata()
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",
+            "paper_run_id": run_metadata.paper_run_id if run_metadata is not None else None,
+            "paper_run_started_at": (
+                run_metadata.started_at.isoformat() if run_metadata is not None else None
+            ),
+            "paper_run_archive_path": (
+                run_metadata.archive_path if run_metadata is not None else None
+            ),
+            "paper_run_label": "40 USDC CLEAN BURN-IN"
+            if initial_equity == Decimal("40.00")
+            else "PAPER RUN",
             "initial_equity": str(initial_equity),
             "paper_initial_equity": str(initial_equity),
             "paper_current_equity": str(initial_equity + realized_pnl),
@@ -1305,6 +1432,19 @@ def _corpus_label_task_from_row(row: tuple[object, ...]) -> PaperCorpusLabelTask
         next_attempt_at=None if row[4] is None else datetime.fromisoformat(str(row[4])),
         attempt_count=int(str(row[5])),
         last_reason=None if row[6] is None else str(row[6]),
+        payload=payload,
+    )
+
+
+def _run_metadata_from_row(row: tuple[object, ...]) -> PaperRunMetadata:
+    payload = json.loads(str(row[4]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("paper run metadata payload is not an object")
+    return PaperRunMetadata(
+        paper_run_id=str(row[0]),
+        initial_equity_usdc=Decimal(str(row[1])),
+        started_at=datetime.fromisoformat(str(row[2])),
+        archive_path=None if row[3] is None else str(row[3]),
         payload=payload,
     )
 

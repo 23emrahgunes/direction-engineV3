@@ -430,9 +430,9 @@ def test_paper_summary_preserves_negative_raw_capital_and_accounting_buckets(tmp
 
     summary = paper.summary(now=NOW)
 
-    assert summary["initial_equity"] == "1000"
-    assert summary["raw_available_capital"] == "-200"
-    assert summary["available_capital"] == "-200"
+    assert summary["initial_equity"] == "40.00"
+    assert summary["raw_available_capital"] == "-1160.00"
+    assert summary["available_capital"] == "-1160.00"
     assert summary["spendable_capital"] == "0"
     assert summary["open_cost_basis"] == "1200"
     assert summary["expired_but_unsettled_cost_basis"] == "1200"
