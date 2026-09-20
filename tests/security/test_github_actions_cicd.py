@@ -142,14 +142,18 @@ def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:
     source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
     assert 'DEPLOY_STATE_DIR="/var/lib/direction-engine-v3/deploy"' in source
     assert 'LEGACY_DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"' in source
+    assert 'PAPER_ARCHIVE_DIR="$PROJECT_DIR/runtime/archive"' in source
     assert 'DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"' in source
     assert '\nDEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"' not in source
     assert 'mkdir -p "$DEPLOY_STATE_DIR"' in source
     assert 'rm -rf -- "$legacy_real"' in source
+    assert "deploy_git_status()" in source
+    assert "git status --short -- . ':(exclude)runtime/archive'" in source
     status_check = source.index('git status --short')
     state_creation = source.index('mkdir -p "$DEPLOY_STATE_DIR"')
     assert status_check < state_creation
-    assert 'if [ "$(run_ubuntu "git status --short")" != "" ]; then' in source
+    assert 'dirty_status="$(deploy_git_status)"' in source
+    assert 'if [ "$dirty_status" != "" ]; then' in source
     assert 'exit 11' in source
 
 
@@ -163,6 +167,25 @@ def test_legacy_cleanup_is_canonical_and_protects_runtime_evidence() -> None:
     assert '[ "$legacy_real" = "$runtime_real" ]' in source
     assert 'rm -rf -- "$PROJECT_DIR/runtime"' not in source
     assert 'rm -rf -- "$project_real/runtime"' not in source
+    assert 'rm -rf -- "$PAPER_ARCHIVE_DIR"' not in source
+    assert 'rm -rf -- "$PROJECT_DIR/runtime/archive"' not in source
+    assert 'rm -rf -- "$project_real/runtime/archive"' not in source
+    assert "git status --short -- . ':(exclude)runtime/archive'" in source
+
+
+def test_runtime_archive_is_gitignored_but_not_deleted_by_deploy() -> None:
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "runtime/archive/*" in gitignore
+    assert "!runtime/archive/.gitkeep" in gitignore
+    assert (ROOT / "runtime" / "archive" / ".gitkeep").exists()
+    assert 'PAPER_ARCHIVE_DIR="$PROJECT_DIR/runtime/archive"' in source
+    assert "git status --short -- . ':(exclude)runtime/archive'" in source
+    assert 'rm -rf -- "$legacy_real"' in source
+    assert "runtime/deploy" in source
+    assert 'rm -rf -- "$PAPER_ARCHIVE_DIR"' not in source
+    assert 'reset_paper_run.py' not in source
 
 
 def test_iam_trust_policy_restricts_repo_branch_and_audience() -> None:

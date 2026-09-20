@@ -6,6 +6,7 @@ PROJECT_DIR="${2:-/home/ubuntu/direction-engine-v3}"
 PY="$PROJECT_DIR/.venv/bin/python"
 DEPLOY_STATE_DIR="/var/lib/direction-engine-v3/deploy"
 LEGACY_DEPLOY_STATE_DIR="$PROJECT_DIR/runtime/deploy"
+PAPER_ARCHIVE_DIR="$PROJECT_DIR/runtime/archive"
 DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"
 STAGE="start"
 DEPLOY_STARTED_AT="$(date -u +%FT%TZ)"
@@ -27,6 +28,10 @@ run_ubuntu() {
 
 run_ubuntu_python() {
   sudo -H -u ubuntu bash -lc "cd '$PROJECT_DIR' && '$PY' -"
+}
+
+deploy_git_status() {
+  run_ubuntu "git status --short -- . ':(exclude)runtime/archive'"
 }
 
 dump_failure_context() {
@@ -51,9 +56,11 @@ require_safe_environment() {
 
   cleanup_legacy_deploy_state
   cd "$PROJECT_DIR"
-  if [ "$(run_ubuntu "git status --short")" != "" ]; then
+  local dirty_status
+  dirty_status="$(deploy_git_status)"
+  if [ "$dirty_status" != "" ]; then
     echo "Project working tree is dirty; refusing exact-SHA deploy" >&2
-    run_ubuntu "git status --short"
+    printf '%s\n' "$dirty_status"
     exit 11
   fi
   mkdir -p "$DEPLOY_STATE_DIR"
