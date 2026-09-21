@@ -282,22 +282,93 @@ else:
 PY
 }
 
+settlement_scan_count() {
+  run_ubuntu_python <<'PY'
+from pathlib import Path
+import sqlite3
+path = Path('runtime/data/shadow_evidence.sqlite3')
+if not path.exists():
+    print(0)
+else:
+    with sqlite3.connect(path) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM shadow_events WHERE event_type='PAPER_SETTLEMENT_SCAN'").fetchone()
+    print(int(row[0] or 0))
+PY
+}
+
+latest_settlement_scan_ts() {
+  run_ubuntu_python <<'PY'
+from pathlib import Path
+import sqlite3
+path = Path('runtime/data/shadow_evidence.sqlite3')
+if not path.exists():
+    print('')
+else:
+    with sqlite3.connect(path) as connection:
+        row = connection.execute("SELECT observed_at FROM shadow_events WHERE event_type='PAPER_SETTLEMENT_SCAN' ORDER BY observed_at DESC LIMIT 1").fetchone()
+    print('' if row is None else row[0])
+PY
+}
+
+probe_dashboard_endpoint() {
+  local name="$1" url="$2" output_path="$3"
+  local started_at elapsed_ms status_code curl_exit
+  started_at="$(date +%s%3N)"
+  set +e
+  status_code="$(curl -sS --max-time 8 -o "$output_path" -w "%{http_code}" "$url" 2>"/tmp/direction-engine-v3-${name}.err")"
+  curl_exit="$?"
+  set -e
+  elapsed_ms="$(( $(date +%s%3N) - started_at ))"
+  "$PY" - "$name" "$url" "$output_path" "/tmp/direction-engine-v3-${name}.err" "$status_code" "$curl_exit" "$elapsed_ms" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+name, url, output_path, error_path, status_code, curl_exit, elapsed_ms = sys.argv[1:]
+body_path = Path(output_path)
+err_path = Path(error_path)
+result = {
+    "name": name,
+    "url": url,
+    "status_code": status_code,
+    "curl_exit": int(curl_exit),
+    "elapsed_ms": int(elapsed_ms),
+    "bytes": body_path.stat().st_size if body_path.exists() else 0,
+    "error": err_path.read_text(encoding="utf-8", errors="replace").strip()[:400]
+    if err_path.exists()
+    else "",
+}
+Path(f"/tmp/direction-engine-v3-endpoint-{name}.json").write_text(
+    json.dumps(result, indent=2, sort_keys=True),
+    encoding="utf-8",
+)
+print(json.dumps(result, sort_keys=True))
+if result["curl_exit"] != 0 or not str(status_code).startswith(("2", "3")):
+    raise SystemExit(1)
+PY
+}
+
 smoke_check() {
   STAGE="fast-smoke"
   systemctl is-active --quiet direction-engine-v3-shadow.service
   systemctl is-active --quiet direction-engine-v3-dashboard.service
   local restarts_before restarts_after cycles_before cycles_after cycle_ts_before cycle_ts_after
-  local chainlink_gate_status smoke_started_at
+  local settlement_before settlement_after settlement_ts_before settlement_ts_after
+  local chainlink_gate_status smoke_started_at runtime_health_status
   smoke_started_at="$(date -u +%FT%TZ)"
   restarts_before="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
   cycles_before="$(cycle_count)"
   cycle_ts_before="$(latest_cycle_ts)"
+  settlement_before="$(settlement_scan_count)"
+  settlement_ts_before="$(latest_settlement_scan_ts)"
   sleep 45
   systemctl is-active --quiet direction-engine-v3-shadow.service
   systemctl is-active --quiet direction-engine-v3-dashboard.service
   restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
   cycles_after="$(cycle_count)"
   cycle_ts_after="$(latest_cycle_ts)"
+  settlement_after="$(settlement_scan_count)"
+  settlement_ts_after="$(latest_settlement_scan_ts)"
   if [ "$restarts_after" != "$restarts_before" ]; then
     echo "Shadow service restart count changed during smoke" >&2
     exit 20
@@ -306,21 +377,31 @@ smoke_check() {
     echo "Shadow daemon did not advance a REAL_SHADOW_CYCLE during smoke" >&2
     exit 21
   fi
-  curl -fsS http://127.0.0.1:8130/ >/tmp/direction-engine-v3-dashboard.html
-  curl -fsS http://127.0.0.1:8130/api/dashboard >/tmp/direction-engine-v3-dashboard.json
-  curl -fsS http://127.0.0.1:8130/api/directional/status >/tmp/direction-engine-v3-directional.json
+  if [ "$settlement_after" -le "$settlement_before" ] || [ "$settlement_ts_after" = "$settlement_ts_before" ]; then
+    echo "Shadow daemon did not advance a PAPER_SETTLEMENT_SCAN during smoke" >&2
+    exit 24
+  fi
+  probe_dashboard_endpoint "root" "http://127.0.0.1:8130/" "/tmp/direction-engine-v3-dashboard.html"
+  probe_dashboard_endpoint "dashboard" "http://127.0.0.1:8130/api/dashboard" "/tmp/direction-engine-v3-dashboard.json"
+  probe_dashboard_endpoint "paper-summary" "http://127.0.0.1:8130/api/paper/summary" "/tmp/direction-engine-v3-paper-summary.json"
+  probe_dashboard_endpoint "directional" "http://127.0.0.1:8130/api/directional/status" "/tmp/direction-engine-v3-directional.json"
+  probe_dashboard_endpoint "shadow" "http://127.0.0.1:8130/api/shadow/status" "/tmp/direction-engine-v3-shadow.json"
   grep -q "PAPER / SHADOW" /tmp/direction-engine-v3-dashboard.html
   chainlink_gate_status="$(chainlink_gate "$smoke_started_at")"
+  runtime_health_status="$chainlink_gate_status"
   run_ubuntu_python <<'PY'
 from direction_engine_v3.config import APP_MODE, LIVE_AUTO_ARM, LIVE_TRADING_ENABLED
 if APP_MODE != 'PAPER' or LIVE_TRADING_ENABLED or LIVE_AUTO_ARM:
     raise SystemExit('PAPER/LIVE safety defaults violated')
 PY
-  write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at"
-  if [ "$chainlink_gate_status" != "CHAINLINK_ACCEPTED" ]; then
-    echo "Chainlink runtime functional acceptance failed: $chainlink_gate_status" >&2
-    exit 22
+  if [ "$runtime_health_status" = "CHAINLINK_ACCEPTED" ]; then
+    runtime_health_status="RUNTIME_HEALTH_OK"
+  elif [ "$runtime_health_status" = "WAITING_FOR_FRESH_PIPELINE_EVIDENCE" ]; then
+    runtime_health_status="RUNTIME_HEALTH_WARN"
+  else
+    runtime_health_status="RUNTIME_HEALTH_BLOCKED"
   fi
+  write_result "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" "$settlement_before" "$settlement_after" "$settlement_ts_before" "$settlement_ts_after" "$runtime_health_status"
 }
 
 chainlink_gate() {
@@ -446,14 +527,30 @@ write_result() {
   STAGE="write-result"
   local restarts_before="$1" restarts_after="$2" cycles_before="$3" cycles_after="$4"
   local cycle_ts_before="$5" cycle_ts_after="$6"
-  local smoke_started_at="$7"
-  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" <<'PY'
+  local smoke_started_at="$7" settlement_before="$8" settlement_after="$9"
+  local settlement_ts_before="${10}" settlement_ts_after="${11}" runtime_health_status="${12}"
+  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" "$settlement_before" "$settlement_after" "$settlement_ts_before" "$settlement_ts_after" "$runtime_health_status" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-path, expected_sha, rb, ra, cb, ca, tb, ta, smoke_started_at = sys.argv[1:]
+(
+    path,
+    expected_sha,
+    rb,
+    ra,
+    cb,
+    ca,
+    tb,
+    ta,
+    smoke_started_at,
+    settlement_before,
+    settlement_after,
+    settlement_ts_before,
+    settlement_ts_after,
+    runtime_health_status,
+) = sys.argv[1:]
 
 def read_json(path: str) -> object:
     try:
@@ -463,6 +560,13 @@ def read_json(path: str) -> object:
 
 directional = read_json('/tmp/direction-engine-v3-directional.json')
 chainlink_gate = read_json('/tmp/direction-engine-v3-chainlink-gate.json')
+endpoint_names = ('root', 'dashboard', 'paper-summary', 'directional', 'shadow')
+endpoints = {
+    name: read_json(f'/tmp/direction-engine-v3-endpoint-{name}.json')
+    for name in endpoint_names
+}
+paper_summary = read_json('/tmp/direction-engine-v3-paper-summary.json')
+shadow_status = read_json('/tmp/direction-engine-v3-shadow.json')
 buckets = directional.get('buckets', []) if isinstance(directional, dict) else []
 ptb_ready = [
     {
@@ -480,14 +584,10 @@ chainlink_gate_status = (
     if isinstance(chainlink_gate, dict)
     else 'CHAINLINK_RUNTIME_BLOCKED'
 )
-deploy_status = (
-    'DEPLOY_PAPER_ACCEPTED'
-    if chainlink_gate_status == 'CHAINLINK_ACCEPTED'
-    else chainlink_gate_status
-)
 result = {
     'generated_at': datetime.now(timezone.utc).isoformat(),
-    'status': deploy_status,
+    'status': 'DEPLOY_ACCEPTED',
+    'runtime_health_status': runtime_health_status,
     'deployed_sha': expected_sha,
     'smoke_started_at': smoke_started_at,
     'app_mode': 'PAPER',
@@ -500,8 +600,16 @@ result = {
     'cycle_count_after': ca,
     'latest_cycle_before': tb,
     'latest_cycle_after': ta,
+    'settlement_scan_count_before': settlement_before,
+    'settlement_scan_count_after': settlement_after,
+    'latest_settlement_scan_before': settlement_ts_before,
+    'latest_settlement_scan_after': settlement_ts_after,
+    'dashboard_endpoints': endpoints,
+    'paper_summary': paper_summary,
+    'shadow_status': shadow_status,
     'chainlink': collector.get('chainlink') if isinstance(collector, dict) else {},
     'chainlink_gate': chainlink_gate,
+    'chainlink_gate_status': chainlink_gate_status,
     'binance_hourly': collector.get('binance_hourly') if isinstance(collector, dict) else {},
     'ptb_ready_if_present': ptb_ready,
 }

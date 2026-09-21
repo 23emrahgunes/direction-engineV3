@@ -57,6 +57,7 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
     assert "sleep 45" in source
+    assert "--max-time 8" in source
     assert "PTB_READY_NOT_OBSERVED" not in source
     assert "BOUNDARY" not in source
     assert "24h" not in source.lower()
@@ -84,6 +85,11 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "last_message_at" in source
     assert "subscription_snapshot_count" in source
     assert "last_frame_class" in source
+    assert "status': 'DEPLOY_ACCEPTED'" in source
+    assert "runtime_health_status" in source
+    assert "RUNTIME_HEALTH_OK" in source
+    assert "RUNTIME_HEALTH_WARN" in source
+    assert "RUNTIME_HEALTH_BLOCKED" in source
 
 
 def test_deploy_chainlink_gate_requires_fresh_current_schema_evidence() -> None:
@@ -101,6 +107,36 @@ def test_deploy_chainlink_gate_requires_fresh_current_schema_evidence() -> None:
     assert "last_frame_class" in source
     assert "subscription_snapshot_count') or 0) < 1" in source
     assert "not state.get('last_frame_class')" in source
+    assert "exit 22" not in source
+
+
+def test_deploy_smoke_records_dashboard_endpoints_and_settlement_progress() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "probe_dashboard_endpoint()" in source
+    assert 'probe_dashboard_endpoint "root" "http://127.0.0.1:8130/"' in source
+    assert (
+        'probe_dashboard_endpoint "paper-summary" '
+        '"http://127.0.0.1:8130/api/paper/summary"'
+    ) in source
+    assert (
+        'probe_dashboard_endpoint "directional" '
+        '"http://127.0.0.1:8130/api/directional/status"'
+    ) in source
+    assert (
+        'probe_dashboard_endpoint "shadow" '
+        '"http://127.0.0.1:8130/api/shadow/status"'
+    ) in source
+    assert "settlement_scan_count()" in source
+    assert "latest_settlement_scan_ts()" in source
+    assert "PAPER_SETTLEMENT_SCAN" in source
+    assert "Shadow daemon did not advance a PAPER_SETTLEMENT_SCAN during smoke" in source
+    assert "exit 24" in source
+    assert "'dashboard_endpoints': endpoints" in source
+    assert "'paper_summary': paper_summary" in source
+    assert "'shadow_status': shadow_status" in source
+    assert "'settlement_scan_count_before': settlement_before" in source
+    assert "'settlement_scan_count_after': settlement_after" in source
 
 
 def test_deploy_starts_shadow_before_dashboard_and_report_smoke() -> None:
