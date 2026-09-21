@@ -86,6 +86,10 @@ class SQLiteShadowRepository:
                     payload_json TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_shadow_events_type_observed
+                    ON shadow_events(event_type, observed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_shadow_events_type_bucket_observed
+                    ON shadow_events(event_type, bucket_key, observed_at DESC);
                 """
             )
             connection.commit()
@@ -119,6 +123,10 @@ class SQLiteShadowRepository:
                     payload_json TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_shadow_events_type_observed
+                    ON shadow_events(event_type, observed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_shadow_events_type_bucket_observed
+                    ON shadow_events(event_type, bucket_key, observed_at DESC);
                 """
             ),
         )

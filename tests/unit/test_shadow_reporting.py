@@ -102,6 +102,24 @@ def test_shadow_repository_latest_events_returns_newest_first(tmp_path) -> None:
     assert [event["event_id"] for event in events] == ["new", "old"]
 
 
+def test_shadow_repository_initializes_latest_event_indexes(tmp_path) -> None:
+    db_path = tmp_path / "shadow.sqlite3"
+    repository = SQLiteShadowRepository(db_path)
+    repository.initialize()
+    repository.initialize()
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='shadow_events'"
+            ).fetchall()
+        }
+
+    assert "idx_shadow_events_type_observed" in indexes
+    assert "idx_shadow_events_type_bucket_observed" in indexes
+
+
 def test_shadow_repository_retries_temporary_writer_lock_once(tmp_path) -> None:
     repository = SQLiteShadowRepository(
         tmp_path / "shadow.sqlite3",
