@@ -1,9 +1,11 @@
 import asyncio
+import time
 from datetime import UTC, datetime
 
 from aiohttp.test_utils import TestClient, TestServer
 
 from direction_engine_v3.app import build_dashboard_snapshot, create_app
+from direction_engine_v3.app import server as dashboard_server
 from direction_engine_v3.shadow.storage import SQLiteShadowRepository
 
 
@@ -48,6 +50,18 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
 
 def test_dashboard_root_serves_existing_read_only_html() -> None:
     asyncio.run(_assert_dashboard_root_serves_existing_read_only_html())
+
+
+def test_dashboard_root_survives_blocked_api_builder(monkeypatch) -> None:
+    monkeypatch.setattr(dashboard_server, "API_RESPONSE_TIMEOUT_SECONDS", 0.1)
+
+    def blocked_summary() -> dict[str, object]:
+        time.sleep(0.5)
+        return {"status": "TOO_LATE"}
+
+    monkeypatch.setattr(dashboard_server, "build_paper_summary", blocked_summary)
+
+    asyncio.run(_assert_dashboard_root_survives_blocked_api_builder())
 
 
 async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
@@ -112,6 +126,30 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
         "live_auto_arm": False,
     }
     assert snapshot["execution"]["real_order_submission"] is False
+
+
+async def _assert_dashboard_root_survives_blocked_api_builder() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        blocked_task = asyncio.create_task(client.get("/api/paper/summary"))
+        await asyncio.sleep(0.02)
+        root_response = await client.get("/")
+        root_body = await root_response.text()
+        blocked_response = await blocked_task
+        blocked_payload = await blocked_response.json()
+    finally:
+        await client.close()
+
+    assert root_response.status == 200
+    assert "Direction Engine V3" in root_body
+    assert blocked_response.status == 503
+    assert blocked_payload == {
+        "status": "API_TIMEOUT",
+        "reason": "dashboard read-only data builder exceeded timeout",
+        "real_order_submission": False,
+    }
 
 
 def test_directional_status_api_is_read_only_and_paper_labeled(

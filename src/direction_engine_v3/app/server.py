@@ -3,6 +3,10 @@
 No network sockets are opened during import; callers explicitly run the app.
 """
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from aiohttp import web
@@ -19,6 +23,8 @@ from direction_engine_v3.app.dashboard import (
 )
 
 DASHBOARD_INDEX_HTML = web.AppKey("dashboard_index_html", str)
+DASHBOARD_API_EXECUTOR = web.AppKey("dashboard_api_executor", ThreadPoolExecutor)
+API_RESPONSE_TIMEOUT_SECONDS = 5.0
 
 
 def dashboard_index_path() -> Path:
@@ -43,6 +49,62 @@ def dashboard_index_html() -> str:
 
 async def dashboard_index(request: web.Request) -> web.Response:
     return web.Response(text=request.app[DASHBOARD_INDEX_HTML], content_type="text/html")
+
+
+async def dashboard_api_executor(app: web.Application) -> AsyncIterator[None]:
+    """Run blocking SQLite snapshot builders outside the aiohttp event loop.
+
+    The dashboard is accessed through SSM port forwarding and browser refreshes.
+    If a synchronous SQLite/file read blocks in the main event loop, even
+    ``GET /`` and ``/health/live`` become unreachable.  Keep the HTML and health
+    surface responsive by isolating read-only snapshot builders in a bounded
+    executor and returning an explicit timeout response when the data path is
+    unhealthy.
+    """
+
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dashboard-api")
+    app[DASHBOARD_API_EXECUTOR] = executor
+    try:
+        yield
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+async def _json_from_builder(
+    request: web.Request,
+    builder: Callable[..., object],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> web.Response:
+    if DASHBOARD_API_EXECUTOR not in request.app:
+        return web.json_response(builder(*args, **kwargs))
+    loop = asyncio.get_running_loop()
+    call = partial(builder, *args, **kwargs)
+    try:
+        payload = await asyncio.wait_for(
+            loop.run_in_executor(request.app[DASHBOARD_API_EXECUTOR], call),
+            timeout=API_RESPONSE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return web.json_response(
+            {
+                "status": "API_TIMEOUT",
+                "reason": "dashboard read-only data builder exceeded timeout",
+                "real_order_submission": False,
+            },
+            status=503,
+        )
+    except Exception as exc:
+        return web.json_response(
+            {
+                "status": "API_UNAVAILABLE",
+                "reason": type(exc).__name__,
+                "real_order_submission": False,
+            },
+            status=503,
+        )
+    return web.json_response(payload)
 
 
 async def live(_request: web.Request) -> web.Response:
@@ -75,65 +137,82 @@ async def metrics(_request: web.Request) -> web.Response:
     return web.json_response(build_dashboard_snapshot().metrics.as_dict())
 
 
-async def dashboard(_request: web.Request) -> web.Response:
-    return web.json_response(build_dashboard_snapshot().as_dict())
+async def dashboard(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, lambda: build_dashboard_snapshot().as_dict())
 
 
-async def paper_summary(_request: web.Request) -> web.Response:
-    return web.json_response(build_paper_summary())
+async def paper_summary(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, build_paper_summary)
 
 
 async def paper_performance(request: web.Request) -> web.Response:
-    return web.json_response(
-        build_paper_performance(strategy=request.query.get("strategy", "DIRECTIONAL_EDGE"))
+    return await _json_from_builder(
+        request,
+        build_paper_performance,
+        strategy=request.query.get("strategy", "DIRECTIONAL_EDGE"),
     )
 
 
 async def paper_trades(request: web.Request) -> web.Response:
-    return web.json_response(
-        list_paper_trades(
-            asset=request.query.get("asset"),
-            horizon=request.query.get("horizon"),
-            strategy=request.query.get("strategy"),
-            side=request.query.get("side"),
-            status=request.query.get("status"),
-            win_loss=request.query.get("win_loss"),
-            limit=request.query.get("limit"),
-            offset=request.query.get("offset"),
-        )
+    return await _json_from_builder(
+        request,
+        list_paper_trades,
+        asset=request.query.get("asset"),
+        horizon=request.query.get("horizon"),
+        strategy=request.query.get("strategy"),
+        side=request.query.get("side"),
+        status=request.query.get("status"),
+        win_loss=request.query.get("win_loss"),
+        limit=request.query.get("limit"),
+        offset=request.query.get("offset"),
     )
 
 
 async def paper_trade_detail(request: web.Request) -> web.Response:
-    trade = get_paper_trade(request.match_info["id"])
-    if trade is None:
+    response = await _json_from_builder(
+        request,
+        _paper_trade_detail_payload,
+        request.match_info["id"],
+    )
+    if response.status != 200:
+        return response
+    trade = response.text
+    if trade == "null":
         return web.json_response({"error": "paper trade not found"}, status=404)
-    return web.json_response(trade)
+    return response
+
+
+def _paper_trade_detail_payload(trade_id: str) -> dict[str, object] | None:
+    trade = get_paper_trade(trade_id)
+    if trade is None:
+        return None
+    return trade
 
 
 async def paper_abstains(request: web.Request) -> web.Response:
-    return web.json_response(
-        list_paper_abstains(
-            reason=request.query.get("reason"),
-            strategy=request.query.get("strategy"),
-            asset=request.query.get("asset"),
-            horizon=request.query.get("horizon"),
-            limit=request.query.get("limit"),
-            offset=request.query.get("offset"),
-        )
+    return await _json_from_builder(
+        request,
+        list_paper_abstains,
+        reason=request.query.get("reason"),
+        strategy=request.query.get("strategy"),
+        asset=request.query.get("asset"),
+        horizon=request.query.get("horizon"),
+        limit=request.query.get("limit"),
+        offset=request.query.get("offset"),
     )
 
 
-async def shadow_status(_request: web.Request) -> web.Response:
-    return web.json_response(build_shadow_status())
+async def shadow_status(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, build_shadow_status)
 
 
-async def directional_status(_request: web.Request) -> web.Response:
-    return web.json_response(build_directional_runtime_status())
+async def directional_status(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, build_directional_runtime_status)
 
 
 def create_app() -> web.Application:
     app = web.Application()
+    app.cleanup_ctx.append(dashboard_api_executor)
     app[DASHBOARD_INDEX_HTML] = dashboard_index_html()
     app.router.add_get("/", dashboard_index, allow_head=False)
     app.router.add_get("/health/live", live, allow_head=False)
