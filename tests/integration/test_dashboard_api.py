@@ -100,7 +100,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "AbortController" in body
     assert "timeout" in body
     assert "state.refreshing" in body
-    assert "batch=3" in body
+    assert "batch=1" in body
     assert "names.slice(i,i+batch)" in body
     assert 'url.startsWith("/health/")' in body
     assert "j.not_ready=true" in body
@@ -113,7 +113,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "signing" not in body.lower()
     assert "/api/paper/summary" in body
     assert "/api/paper/performance?strategy=DIRECTIONAL_EDGE" in body
-    assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=500" in body
+    assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=100" in body
     assert "/api/paper/abstains" in body
     assert "/api/directional/status" in body
     assert "/api/shadow/status" in body
