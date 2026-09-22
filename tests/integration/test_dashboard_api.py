@@ -83,17 +83,23 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "LIVE_TRADING_ENABLED=false" in body
     assert "real_order_submission=false" in body
     assert "Last updated" in body
-    assert "Overview" in body
-    assert "PAPER RUN" in body
-    assert "40 USDC CLEAN BURN-IN" in body
-    assert "Run ID" in body
+    assert "Command Center" in body
+    assert "PAPER ledger, risk and runtime status at a glance" in body
+    assert "Active PAPER Positions" in body
+    assert "Latest Settlements" in body
+    assert "Risk / Cooldown" in body
+    assert "PAPER Trades" in body
+    assert "Open Exposure" in body
+    assert "Open Trades" in body
+    assert "Realized PnL" in body
+    assert "Available Capital" in body
+    assert "PAPER Trade Health" in body
+    assert "TRADE_FLOW_ACTIVE" in body
+    assert "RISK_BLOCKED" in body
     assert "Settlement / Data Health" in body
-    assert "12 Bucket Performance" in body
-    assert "PAPER TRADES" in body
-    assert "ABSTAINS / REJECTIONS" in body
-    assert "DIRECTIONAL EDGE" in body
-    assert "STRUCTURAL ARB" in body
-    assert "DATA / LATENCY" in body
+    assert "12 Bucket Live Status / Performance" in body
+    assert "Abstains / Rejections" in body
+    assert "Structural Arb / Data / Read-only API Status" in body
     assert "Raw JSON" in body
     assert "<pre id=\"overview\"" not in body
     assert "Loading..." not in body
@@ -113,7 +119,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "signing" not in body.lower()
     assert "/api/paper/summary" in body
     assert "/api/paper/performance?strategy=DIRECTIONAL_EDGE" in body
-    assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=100" in body
+    assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=25" in body
     assert "/api/paper/abstains" in body
     assert "/api/directional/status" in body
     assert "/api/shadow/status" in body
