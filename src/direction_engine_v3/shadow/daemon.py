@@ -141,6 +141,15 @@ _BINANCE_TRADES_URL = "https://api.binance.com/api/v3/aggTrades"
 _PAPER_LABEL = "PAPER / SHADOW — NO REAL ORDER"
 _DIRECTIONAL_CONSECUTIVE_LOSS_LIMIT = 10
 _PAPER_CONSECUTIVE_LOSS_COOLDOWN = timedelta(hours=1)
+_PAPER_DRAWDOWN_BRAKE_RATIO = Decimal("0.15")
+_PAPER_MAX_OPEN_EXPOSURE_RATIO = Decimal("0.30")
+_PAPER_MAX_OPEN_DIRECTIONAL_POSITIONS = 4
+_PAPER_MAX_OPEN_DIRECTIONAL_POSITIONS_PER_ASSET = 1
+_PAPER_BASELINE_MAX_STAKE_USDC = Decimal("1.50")
+_PAPER_RECENT_PERFORMANCE_SAMPLE = 10
+_PAPER_RECENT_PERFORMANCE_LIMIT = 20
+_PAPER_RECENT_MIN_WIN_RATE = Decimal("0.35")
+_PAPER_RECENT_MAX_LOSS_USDC = Decimal("-5.00")
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -1215,6 +1224,46 @@ class ShadowDaemon:
                 payload=payload,
             )
             return False, {"router_status": capital.status, **payload}, abstains
+        open_directional_trades = self._paper_repository.trades(
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            status="OPEN",
+            limit=100_000,
+        )
+        recent_directional_trades = self._paper_repository.trades(
+            strategy=StrategyKind.DIRECTIONAL_EDGE.value,
+            limit=100_000,
+        )
+        brake = _paper_directional_entry_brake(
+            paper_summary,
+            open_trades=open_directional_trades,
+            recent_trades=recent_directional_trades,
+            candidate=candidate,
+            market=market,
+            forecast=forecast,
+        )
+        if brake.active:
+            payload = {
+                "candidate_id": candidate.candidate_id,
+                "label": _PAPER_LABEL,
+                **brake.payload(),
+            }
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason=brake.reason,
+                payload=payload,
+            )
+            return (
+                False,
+                {
+                    "router_status": brake.reason,
+                    "risk_approved": False,
+                    "risk_reasons": list(brake.reasons),
+                    **brake.payload(),
+                },
+                abstains,
+            )
         routing = route_opportunities(
             (
                 RoutingOpportunity(
@@ -2454,6 +2503,162 @@ def _paper_capital_gate(
             max(Decimal("0"), raw_available),
         )
     return _PaperCapitalGate("PAPER_CAPITAL_OK", raw_available, raw_available)
+
+
+@dataclass(frozen=True, slots=True)
+class _PaperDirectionalEntryBrake:
+    reasons: tuple[str, ...]
+    initial_equity: Decimal | None
+    paper_current_equity: Decimal | None
+    open_cost_basis: Decimal | None
+    open_trade_count: int | None
+    same_asset_open_count: int
+    recent_settled_count: int
+    recent_win_rate: Decimal | None
+    recent_realized_pnl: Decimal
+    baseline_stake_cap: Decimal
+
+    @property
+    def active(self) -> bool:
+        return bool(self.reasons)
+
+    @property
+    def reason(self) -> str:
+        if not self.reasons:
+            return "PAPER_RISK_BRAKE_CLEAR"
+        return self.reasons[0]
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "risk_brake_active": self.active,
+            "risk_brake_reason": self.reason if self.active else None,
+            "risk_reasons": list(self.reasons),
+            "initial_equity": str(self.initial_equity)
+            if self.initial_equity is not None
+            else None,
+            "paper_current_equity": str(self.paper_current_equity)
+            if self.paper_current_equity is not None
+            else None,
+            "open_cost_basis": str(self.open_cost_basis)
+            if self.open_cost_basis is not None
+            else None,
+            "open_trade_count": self.open_trade_count,
+            "same_asset_open_count": self.same_asset_open_count,
+            "recent_directional_settled_count": self.recent_settled_count,
+            "recent_directional_win_rate": str(self.recent_win_rate)
+            if self.recent_win_rate is not None
+            else None,
+            "recent_directional_pnl": str(self.recent_realized_pnl),
+            "baseline_stake_cap_usdc": str(self.baseline_stake_cap),
+        }
+
+
+def _paper_directional_entry_brake(
+    paper_summary: Mapping[str, object],
+    *,
+    open_trades: Sequence[object],
+    recent_trades: Sequence[object],
+    candidate: StrategyCandidate,
+    market: Market,
+    forecast: ProbabilityForecast | None,
+) -> _PaperDirectionalEntryBrake:
+    initial_equity = _safe_decimal(paper_summary.get("initial_equity"))
+    paper_current_equity = _safe_decimal(paper_summary.get("paper_current_equity"))
+    open_cost_basis = _safe_decimal(paper_summary.get("open_cost_basis"))
+    open_trade_count = len(open_trades)
+    same_asset_open_count = sum(
+        1 for item in open_trades if str(getattr(item, "asset", "")) == market.asset.value
+    )
+    recent_settled = tuple(
+        item
+        for item in recent_trades
+        if str(getattr(item, "status", "")).upper() == "SETTLED"
+    )[:_PAPER_RECENT_PERFORMANCE_LIMIT]
+    recent_wins = sum(1 for item in recent_settled if _trade_win_loss(item) == "WIN")
+    recent_realized_pnl = sum(
+        (_trade_realized_pnl(item) for item in recent_settled), Decimal("0")
+    )
+    recent_win_rate = (
+        Decimal(recent_wins) / Decimal(len(recent_settled)) if recent_settled else None
+    )
+    reasons: list[str] = []
+    if initial_equity is None or paper_current_equity is None or open_cost_basis is None:
+        reasons.append("PAPER_CAPITAL_STATE_INVALID")
+    else:
+        if paper_current_equity <= initial_equity * (
+            Decimal("1") - _PAPER_DRAWDOWN_BRAKE_RATIO
+        ):
+            reasons.append("PAPER_DRAWDOWN_BRAKE_ACTIVE")
+        if (
+            paper_current_equity > Decimal("0")
+            and open_cost_basis >= paper_current_equity * _PAPER_MAX_OPEN_EXPOSURE_RATIO
+        ):
+            reasons.append("OPEN_EXPOSURE_LIMIT")
+    if (
+        open_trade_count is not None
+        and open_trade_count >= _PAPER_MAX_OPEN_DIRECTIONAL_POSITIONS
+    ):
+        reasons.append("MAXIMUM_PAPER_POSITIONS")
+    if same_asset_open_count >= _PAPER_MAX_OPEN_DIRECTIONAL_POSITIONS_PER_ASSET:
+        reasons.append("OVERLAPPING_ASSET_LIMIT")
+    if (
+        len(recent_settled) >= _PAPER_RECENT_PERFORMANCE_SAMPLE
+        and (
+            (recent_win_rate is not None and recent_win_rate < _PAPER_RECENT_MIN_WIN_RATE)
+            or recent_realized_pnl <= _PAPER_RECENT_MAX_LOSS_USDC
+        )
+    ):
+        reasons.append("POOR_RECENT_PAPER_PERFORMANCE")
+    if (
+        forecast is not None
+        and forecast.model_version == PAPER_RESEARCH_BASELINE_MODEL_VERSION
+        and candidate.required_capital > _PAPER_BASELINE_MAX_STAKE_USDC
+    ):
+        reasons.append("BASELINE_RESEARCH_STAKE_CAP")
+    return _PaperDirectionalEntryBrake(
+        tuple(dict.fromkeys(reasons)),
+        initial_equity,
+        paper_current_equity,
+        open_cost_basis,
+        open_trade_count,
+        same_asset_open_count,
+        len(recent_settled),
+        recent_win_rate,
+        recent_realized_pnl,
+        _PAPER_BASELINE_MAX_STAKE_USDC,
+    )
+
+
+def _safe_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(str(value))
+    except Exception:
+        return None
+
+
+def _trade_win_loss(item: object) -> str | None:
+    payload = getattr(item, "payload", {})
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("win_loss")
+    return str(value).upper() if value is not None else None
+
+
+def _trade_realized_pnl(item: object) -> Decimal:
+    payload = getattr(item, "payload", {})
+    if not isinstance(payload, Mapping):
+        return Decimal("0")
+    return _safe_decimal(payload.get("realized_paper_pnl")) or Decimal("0")
 
 
 def _slug(bucket: MarketBucket, start: datetime) -> str:

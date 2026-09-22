@@ -353,6 +353,22 @@ def build_directional_runtime_status() -> dict[str, object]:
                     payload, "last_successful_settlement_at"
                 ),
                 "risk_reasons": _execution_field(payload, "risk_reasons", ()),
+                "risk_brake_active": _execution_field(
+                    payload, "risk_brake_active", False
+                ),
+                "risk_brake_reason": _execution_field(payload, "risk_brake_reason"),
+                "paper_current_equity": _execution_field(payload, "paper_current_equity"),
+                "open_cost_basis": _execution_field(payload, "open_cost_basis"),
+                "open_trade_count": _execution_field(payload, "open_trade_count"),
+                "same_asset_open_count": _execution_field(
+                    payload, "same_asset_open_count"
+                ),
+                "recent_directional_win_rate": _execution_field(
+                    payload, "recent_directional_win_rate"
+                ),
+                "recent_directional_pnl": _execution_field(
+                    payload, "recent_directional_pnl"
+                ),
                 "last_observed_at": latest_observed_at or strategy_observed_at,
                 "last_paper_trade": _trade_as_dict(trades[0]) if trades else None,
                 "evidence_sample_count": payload.get("corpus_sample_count", 0),
@@ -435,6 +451,19 @@ def _directional_bucket_state(payload: dict[str, object]) -> str:
     execution_payload = execution if isinstance(execution, dict) else {}
     if execution_payload.get("risk_approved") is False:
         reasons = execution_payload.get("risk_reasons")
+        if isinstance(reasons, (list, tuple)) and any(
+            str(item)
+            in {
+                "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+                "OPEN_EXPOSURE_LIMIT",
+                "MAXIMUM_PAPER_POSITIONS",
+                "OVERLAPPING_ASSET_LIMIT",
+                "POOR_RECENT_PAPER_PERFORMANCE",
+                "BASELINE_RESEARCH_STAKE_CAP",
+            }
+            for item in reasons
+        ):
+            return "RISK_BRAKE_ACTIVE"
         if (
             isinstance(reasons, (list, tuple))
             and "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE" in reasons

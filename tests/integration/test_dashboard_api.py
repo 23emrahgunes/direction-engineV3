@@ -439,6 +439,42 @@ def test_directional_status_does_not_show_risk_reject_as_open_position(
     asyncio.run(_assert_risk_reject_is_not_open_position())
 
 
+def test_directional_status_exposes_paper_risk_brake(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="strategy-risk-brake",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "TRADE",
+            "reason": "TRADE",
+            "directional_execution": {
+                "router_status": "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+                "risk_approved": False,
+                "risk_reasons": [
+                    "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+                    "OPEN_EXPOSURE_LIMIT",
+                ],
+                "risk_brake_active": True,
+                "risk_brake_reason": "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+                "paper_current_equity": "30.00",
+                "open_cost_basis": "12.00",
+                "open_trade_count": 4,
+                "same_asset_open_count": 1,
+                "recent_directional_win_rate": "0.10",
+                "recent_directional_pnl": "-6.00",
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 30, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_paper_risk_brake_is_visible())
+
+
 def test_directional_status_shows_open_only_after_paper_fill(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
     repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
@@ -521,6 +557,32 @@ async def _assert_risk_reject_is_not_open_position() -> None:
     assert bucket["cooldown_active"] is True
     assert bucket["current_losing_streak"] == 27
     assert bucket["risk_reasons"] == ["CONSECUTIVE_LOSS_COOLDOWN_ACTIVE"]
+
+
+async def _assert_paper_risk_brake_is_visible() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["state"] == "RISK_BRAKE_ACTIVE"
+    assert bucket["state"] != "PAPER_POSITION_OPEN"
+    assert bucket["risk_brake_active"] is True
+    assert bucket["risk_brake_reason"] == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
+    assert bucket["paper_current_equity"] == "30.00"
+    assert bucket["open_cost_basis"] == "12.00"
+    assert bucket["open_trade_count"] == 4
+    assert bucket["same_asset_open_count"] == 1
+    assert bucket["recent_directional_win_rate"] == "0.10"
+    assert bucket["recent_directional_pnl"] == "-6.00"
+    assert bucket["risk_reasons"] == [
+        "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+        "OPEN_EXPOSURE_LIMIT",
+    ]
 
 
 async def _assert_filled_trade_is_open_position() -> None:

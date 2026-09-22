@@ -10,7 +10,9 @@ from direction_engine_v3.domain import (
     MarketToken,
     OfficialReference,
     OutcomeSide,
+    ProbabilityForecast,
     ProxyReference,
+    StrategyCandidate,
     StrategyKind,
 )
 from direction_engine_v3.features import ExternalDirectionalSnapshot, build_directional_features
@@ -27,7 +29,12 @@ from direction_engine_v3.market_data import (
     SettlementMetadata,
     SettlementMethod,
 )
-from direction_engine_v3.shadow.daemon import ShadowDaemon, ShadowMarketState, new_evidence_window
+from direction_engine_v3.shadow.daemon import (
+    ShadowDaemon,
+    ShadowMarketState,
+    _paper_directional_entry_brake,
+    new_evidence_window,
+)
 from direction_engine_v3.shadow.storage import SQLiteShadowRepository
 from direction_engine_v3.storage import SQLitePaperRepository
 
@@ -203,6 +210,332 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_paper_drawdown_brake_blocks_new_directional_fill_without_stopping_cycle(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    paper.save_trade_snapshot(
+        trade_id="settled-drawdown-loss",
+        decision_id="decision:drawdown-loss",
+        strategy="DIRECTIONAL_EDGE",
+        asset="ETH",
+        horizon="5m",
+        condition_id="condition-drawdown-loss",
+        side="UP",
+        status="SETTLED",
+        observed_at=NOW - timedelta(minutes=20),
+        payload={
+            "stake": "10",
+            "cost_basis_usdc": "10",
+            "realized_paper_pnl": "-10",
+            "win_loss": "LOSS",
+            "real_order_submission": False,
+        },
+    )
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    result = asyncio.run(daemon.run_once())
+
+    assert result.markets_discovered == 1
+    assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+    assert paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN") == ()
+    abstain = next(
+        item for item in paper.abstains() if item.reason == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
+    )
+    assert abstain.payload["risk_brake_active"] is True
+    assert abstain.payload["paper_current_equity"] == "30.00"
+
+
+def test_paper_open_exposure_brake_blocks_new_directional_fill(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    paper.save_trade_snapshot(
+        trade_id="open-exposure",
+        decision_id="decision:open-exposure",
+        strategy="DIRECTIONAL_EDGE",
+        asset="SOL",
+        horizon="5m",
+        condition_id="condition-open-exposure",
+        side="UP",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=1),
+        payload={
+            "stake": "12",
+            "cost_basis_usdc": "12",
+            "window_end": (NOW + timedelta(minutes=5)).isoformat(),
+            "fill_status": "FILLED",
+            "real_order_submission": False,
+        },
+    )
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-open-exposure",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN"),
+        recent_trades=paper.trades(strategy="DIRECTIONAL_EDGE"),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert brake.active is True
+    assert "OPEN_EXPOSURE_LIMIT" in brake.reasons
+
+
+def test_paper_open_position_count_brake_blocks_new_directional_fill(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    for index in range(4):
+        paper.save_trade_snapshot(
+            trade_id=f"open-{index}",
+            decision_id=f"decision:open-{index}",
+            strategy="DIRECTIONAL_EDGE",
+            asset=("ETH", "SOL", "XRP", "ETH")[index],
+            horizon="5m",
+            condition_id=f"condition-open-{index}",
+            side="UP",
+            status="OPEN",
+            observed_at=NOW - timedelta(minutes=index + 1),
+            payload={
+                "stake": "0.01",
+                "cost_basis_usdc": "0.01",
+                "window_end": (NOW + timedelta(minutes=5)).isoformat(),
+                "fill_status": "FILLED",
+                "real_order_submission": False,
+            },
+        )
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-open-count",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN"),
+        recent_trades=paper.trades(strategy="DIRECTIONAL_EDGE"),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert brake.active is True
+    assert "MAXIMUM_PAPER_POSITIONS" in brake.reasons
+
+
+def test_paper_recent_poor_performance_brake_blocks_new_directional_fill(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    for index in range(10):
+        paper.save_trade_snapshot(
+            trade_id=f"recent-loss-{index}",
+            decision_id=f"decision:recent-loss-{index}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-recent-loss-{index}",
+            side="UP",
+            status="SETTLED",
+            observed_at=NOW - timedelta(minutes=index + 1),
+            payload={
+                "stake": "0.10",
+                "cost_basis_usdc": "0.10",
+                "realized_paper_pnl": "-0.10",
+                "win_loss": "LOSS",
+                "real_order_submission": False,
+            },
+        )
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-recent-losses",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN"),
+        recent_trades=paper.trades(strategy="DIRECTIONAL_EDGE"),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert brake.active is True
+    assert "POOR_RECENT_PAPER_PERFORMANCE" in brake.reasons
+    assert brake.recent_win_rate == Decimal("0")
+
+
+def test_paper_baseline_stake_cap_blocks_large_research_baseline_candidate(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-large-baseline",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1.51"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "PAPER_RESEARCH_BASELINE",
+        "PAPER_RESEARCH_BASELINE_UNPROMOTABLE",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=(),
+        recent_trades=(),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert brake.active is True
+    assert brake.reason == "BASELINE_RESEARCH_STAKE_CAP"
+
+
+def test_paper_entry_brake_allows_healthy_small_candidate(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-healthy",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1.00"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=(),
+        recent_trades=(),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert brake.active is False
+    assert brake.payload()["risk_brake_active"] is False
 
 
 def test_shadow_daemon_uses_post_settlement_time_for_market_selection(tmp_path) -> None:
@@ -479,7 +812,7 @@ def _market_state(bucket: MarketBucket) -> ShadowMarketState:
         (PolymarketLevel(Decimal("0.39"), Decimal("10")),),
         (PolymarketLevel(Decimal("0.40"), Decimal("10")),),
         "hash-up",
-        Decimal("5"),
+        Decimal("2"),
         Decimal("0.01"),
         lineage,
     )
@@ -489,7 +822,7 @@ def _market_state(bucket: MarketBucket) -> ShadowMarketState:
         (PolymarketLevel(Decimal("0.39"), Decimal("10")),),
         (PolymarketLevel(Decimal("0.40"), Decimal("10")),),
         "hash-down",
-        Decimal("5"),
+        Decimal("2"),
         Decimal("0.01"),
         lineage,
     )
