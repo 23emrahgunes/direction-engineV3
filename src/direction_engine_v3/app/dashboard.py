@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from direction_engine_v3.config import (
     APP_MODE,
@@ -340,6 +341,18 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "executable_cost": payload.get("executable_cost"),
                 "net_edge": payload.get("net_edge"),
                 "directional_execution": payload.get("directional_execution", {}),
+                "current_losing_streak": _execution_field(
+                    payload, "current_losing_streak"
+                ),
+                "cooldown_active": _execution_field(payload, "cooldown_active"),
+                "cooldown_until": _execution_field(payload, "cooldown_until"),
+                "cooldown_remaining_seconds": _execution_field(
+                    payload, "cooldown_remaining_seconds"
+                ),
+                "last_successful_settlement_at": _execution_field(
+                    payload, "last_successful_settlement_at"
+                ),
+                "risk_reasons": _execution_field(payload, "risk_reasons", ()),
                 "last_observed_at": latest_observed_at or strategy_observed_at,
                 "last_paper_trade": _trade_as_dict(trades[0]) if trades else None,
                 "evidence_sample_count": payload.get("corpus_sample_count", 0),
@@ -418,11 +431,34 @@ def _directional_bucket_state(payload: dict[str, object]) -> str:
         return "FEATURE_HISTORY_WARMING"
     if reason in {"MODEL_UNAVAILABLE", "CALIBRATION_NOT_READY"}:
         return str(payload.get("model_state", "TRAINING_CORPUS_REQUIRED"))
+    execution = payload.get("directional_execution")
+    execution_payload = execution if isinstance(execution, dict) else {}
+    if execution_payload.get("risk_approved") is False:
+        reasons = execution_payload.get("risk_reasons")
+        if (
+            isinstance(reasons, (list, tuple))
+            and "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE" in reasons
+        ):
+            return "COOLDOWN_ACTIVE"
+        return "RISK_REJECTED"
     if payload.get("action") == "TRADE":
-        return "PAPER_POSITION_OPEN"
+        fill_status = execution_payload.get("paper_fill_status")
+        paper_trade_id = execution_payload.get("paper_trade_id")
+        if paper_trade_id is not None or fill_status in {"FILLED", "ACKNOWLEDGED"}:
+            return "PAPER_POSITION_OPEN"
+        return "TRADE_PENDING_EXECUTION"
     if payload:
         return "ABSTAIN"
     return "WAITING_FOR_BOUNDARY"
+
+
+def _execution_field(
+    payload: dict[str, object], key: str, default: object | None = None
+) -> object | None:
+    execution = payload.get("directional_execution")
+    if isinstance(execution, dict) and key in execution:
+        return cast(object, execution[key])
+    return payload.get(key, default)
 
 
 def _trade_as_dict(item: object) -> dict[str, object]:

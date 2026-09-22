@@ -331,6 +331,114 @@ def test_router_snapshot_does_not_reserve_filled_positions_twice(tmp_path) -> No
     assert tuple(item.capital_at_risk for item in portfolio.exposures) == (Decimal("10"),)
 
 
+def test_paper_loss_cooldown_is_derived_from_ledger_settlement_time(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    for index in range(10):
+        paper.save_trade_snapshot(
+            trade_id=f"settled-loss-{index}",
+            decision_id=f"decision:settled-loss-{index}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-loss-{index}",
+            side="UP",
+            status="SETTLED",
+            observed_at=NOW - timedelta(hours=2, minutes=index),
+            payload={
+                "stake": "1",
+                "cost_basis_usdc": "1",
+                "win_loss": "LOSS",
+                "real_order_submission": False,
+            },
+        )
+    paper.save_settlement_condition_attempt(
+        condition_id="condition-loss-0",
+        state="SETTLED",
+        attempted_at=NOW - timedelta(hours=2),
+        next_attempt_at=None,
+        reason="SETTLED",
+        successful_at=NOW - timedelta(hours=2),
+    )
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    portfolio = daemon._portfolio_state_from_paper(NOW)
+
+    assert portfolio.consecutive_losses == 10
+    assert portfolio.cooldown_until == NOW - timedelta(hours=1)
+
+
+def test_paper_loss_cooldown_can_be_active_from_recent_settlement(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    for index in range(10):
+        paper.save_trade_snapshot(
+            trade_id=f"recent-loss-{index}",
+            decision_id=f"decision:recent-loss-{index}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-recent-loss-{index}",
+            side="UP",
+            status="SETTLED",
+            observed_at=NOW - timedelta(minutes=30, seconds=index),
+            payload={
+                "stake": "1",
+                "cost_basis_usdc": "1",
+                "win_loss": "LOSS",
+                "real_order_submission": False,
+            },
+        )
+    paper.save_settlement_condition_attempt(
+        condition_id="condition-recent-loss-0",
+        state="SETTLED",
+        attempted_at=NOW - timedelta(minutes=30),
+        next_attempt_at=None,
+        reason="SETTLED",
+        successful_at=NOW - timedelta(minutes=30),
+    )
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    portfolio = daemon._portfolio_state_from_paper(NOW)
+
+    assert portfolio.consecutive_losses == 10
+    assert portfolio.cooldown_until == NOW + timedelta(minutes=30)
+
+
 def _market_state(bucket: MarketBucket) -> ShadowMarketState:
     market = Market(
         "market-btc-5m",

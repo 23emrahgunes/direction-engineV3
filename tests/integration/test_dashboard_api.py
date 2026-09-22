@@ -401,6 +401,64 @@ def test_directional_status_preserves_newest_strategy_event(tmp_path, monkeypatc
     asyncio.run(_assert_newest_strategy_event_is_visible())
 
 
+def test_directional_status_does_not_show_risk_reject_as_open_position(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="strategy-risk-reject",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "TRADE",
+            "reason": "TRADE",
+            "directional_execution": {
+                "router_status": "ROUTED",
+                "risk_approved": False,
+                "risk_reasons": ["CONSECUTIVE_LOSS_COOLDOWN_ACTIVE"],
+                "current_losing_streak": 27,
+                "cooldown_active": True,
+                "cooldown_until": "2026-09-15T13:00:00+00:00",
+                "cooldown_remaining_seconds": 1800,
+                "last_successful_settlement_at": "2026-09-15T12:00:00+00:00",
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 30, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_risk_reject_is_not_open_position())
+
+
+def test_directional_status_shows_open_only_after_paper_fill(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="strategy-filled",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "TRADE",
+            "reason": "TRADE",
+            "directional_execution": {
+                "router_status": "ROUTED",
+                "risk_approved": True,
+                "paper_trade_id": "paper-trade-1",
+                "paper_fill_status": "FILLED",
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 30, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_filled_trade_is_open_position())
+
+
 async def _assert_newest_pipeline_event_is_visible() -> None:
     app = create_app()
     client = TestClient(TestServer(app))
@@ -439,6 +497,37 @@ async def _assert_newest_strategy_event_is_visible() -> None:
     assert bucket["p_down"] == "0.38"
     assert bucket["selected_side"] == "UP"
     assert bucket["net_edge"] == "0.21"
+    assert bucket["directional_execution"]["risk_approved"] is True
+
+
+async def _assert_risk_reject_is_not_open_position() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["state"] == "COOLDOWN_ACTIVE"
+    assert bucket["state"] != "PAPER_POSITION_OPEN"
+    assert bucket["cooldown_active"] is True
+    assert bucket["current_losing_streak"] == 27
+    assert bucket["risk_reasons"] == ["CONSECUTIVE_LOSS_COOLDOWN_ACTIVE"]
+
+
+async def _assert_filled_trade_is_open_position() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["state"] == "PAPER_POSITION_OPEN"
     assert bucket["directional_execution"]["risk_approved"] is True
 
 

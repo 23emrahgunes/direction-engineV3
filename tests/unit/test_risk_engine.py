@@ -186,8 +186,24 @@ def test_loss_drawdown_and_active_cooldown_block_new_risk() -> None:
     assert set(result.reason_codes) >= {
         "DAILY_LOSS_LIMIT",
         "DRAWDOWN_LIMIT",
-        "CONSECUTIVE_LOSS_COOLDOWN",
+        "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE",
     }
+
+
+def test_expired_or_missing_cooldown_does_not_deadlock_after_loss_streak() -> None:
+    expired = replace(
+        state(),
+        consecutive_losses=3,
+        cooldown_until=NOW - timedelta(minutes=1),
+    )
+    missing = replace(state(), consecutive_losses=3, cooldown_until=None)
+
+    assert "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE" not in assess(
+        portfolio=expired
+    ).reason_codes
+    assert "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE" not in assess(
+        portfolio=missing
+    ).reason_codes
 
 
 def test_missing_liquidity_fails_closed() -> None:

@@ -279,10 +279,12 @@ def _portfolio_reasons(
         reasons.append("DAILY_LOSS_LIMIT")
     if state.drawdown >= policy.maximum_drawdown:
         reasons.append("DRAWDOWN_LIMIT")
-    if state.consecutive_losses >= policy.consecutive_loss_limit and (
-        state.cooldown_until is None or assessed_at < state.cooldown_until
+    if (
+        state.consecutive_losses >= policy.consecutive_loss_limit
+        and state.cooldown_until is not None
+        and assessed_at < state.cooldown_until
     ):
-        reasons.append("CONSECUTIVE_LOSS_COOLDOWN")
+        reasons.append("CONSECUTIVE_LOSS_COOLDOWN_ACTIVE")
 
 
 def _liquidity_reasons(

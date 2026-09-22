@@ -139,6 +139,8 @@ _EVENT_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 _BINANCE_DEPTH_URL = "https://api.binance.com/api/v3/depth"
 _BINANCE_TRADES_URL = "https://api.binance.com/api/v3/aggTrades"
 _PAPER_LABEL = "PAPER / SHADOW — NO REAL ORDER"
+_DIRECTIONAL_CONSECUTIVE_LOSS_LIMIT = 10
+_PAPER_CONSECUTIVE_LOSS_COOLDOWN = timedelta(hours=1)
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -1254,6 +1256,11 @@ class ShadowDaemon:
             approved_id=f"risk:{candidate.candidate_id}",
         )
         if not risk.approved:
+            risk_diagnostics = _portfolio_risk_diagnostics(
+                portfolio_state,
+                risk.reason_codes,
+                state.observed_at,
+            )
             abstains = self._record_abstain(
                 state,
                 cycle_id=cycle_id,
@@ -1262,6 +1269,7 @@ class ShadowDaemon:
                 payload={
                     "candidate_id": candidate.candidate_id,
                     "risk_decision_id": risk.risk_decision_id,
+                    **risk_diagnostics,
                     "label": _PAPER_LABEL,
                 },
             )
@@ -1272,6 +1280,7 @@ class ShadowDaemon:
                     "risk_decision_id": risk.risk_decision_id,
                     "risk_approved": False,
                     "risk_reasons": list(risk.reason_codes),
+                    **risk_diagnostics,
                 },
                 abstains,
             )
@@ -1398,6 +1407,8 @@ class ShadowDaemon:
 
     def _portfolio_state_from_paper(self, now: datetime) -> PortfolioState:
         summary = self._paper_repository.summary(now=now)
+        consecutive_losses = int(str(summary["current_losing_streak"]))
+        cooldown_until = _paper_cooldown_until(summary, consecutive_losses)
         exposures = []
         for trade in self._paper_repository.trades(
             strategy=StrategyKind.DIRECTIONAL_EDGE.value,
@@ -1428,8 +1439,8 @@ class ShadowDaemon:
             tuple(exposures),
             Decimal(str(summary["realized_pnl"])),
             Decimal(str(summary["maximum_drawdown"])),
-            int(str(summary["current_losing_streak"])),
-            None,
+            consecutive_losses,
+            cooldown_until,
             False,
             True,
             now,
@@ -2298,7 +2309,7 @@ def _risk_decision(
             Decimal("5"),
             paper_equity,
             paper_equity,
-            10,
+            _DIRECTIONAL_CONSECUTIVE_LOSS_LIMIT,
             timedelta(seconds=60),
             timedelta(seconds=60),
             Decimal("1"),
@@ -2356,6 +2367,47 @@ def _payload_datetime(value: object) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed.astimezone(UTC)
+
+
+def _paper_cooldown_until(
+    summary: Mapping[str, object], consecutive_losses: int
+) -> datetime | None:
+    if consecutive_losses < _DIRECTIONAL_CONSECUTIVE_LOSS_LIMIT:
+        return None
+    last_successful_settlement_at = _payload_datetime(
+        summary.get("last_successful_settlement_at")
+    )
+    if last_successful_settlement_at is None:
+        return None
+    return last_successful_settlement_at + _PAPER_CONSECUTIVE_LOSS_COOLDOWN
+
+
+def _portfolio_risk_diagnostics(
+    portfolio_state: PortfolioState,
+    risk_reasons: tuple[str, ...],
+    observed_at: datetime,
+) -> dict[str, object]:
+    cooldown_until = portfolio_state.cooldown_until
+    cooldown_remaining_seconds = 0
+    last_successful_settlement_at = None
+    if cooldown_until is not None:
+        last_successful_settlement_at = cooldown_until - _PAPER_CONSECUTIVE_LOSS_COOLDOWN
+        if cooldown_until > observed_at:
+            cooldown_remaining_seconds = max(
+                0, int((cooldown_until - observed_at).total_seconds())
+            )
+    return {
+        "current_losing_streak": portfolio_state.consecutive_losses,
+        "cooldown_active": "CONSECUTIVE_LOSS_COOLDOWN_ACTIVE" in risk_reasons,
+        "cooldown_until": cooldown_until.isoformat() if cooldown_until is not None else None,
+        "cooldown_remaining_seconds": cooldown_remaining_seconds,
+        "last_successful_settlement_at": (
+            last_successful_settlement_at.isoformat()
+            if last_successful_settlement_at is not None
+            else None
+        ),
+        "risk_reasons": list(risk_reasons),
+    }
 
 
 def _payload_decimal(payload: Mapping[str, object], primary: str, fallback: str) -> Decimal:
