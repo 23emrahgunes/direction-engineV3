@@ -152,6 +152,18 @@ install_project_units() {
   systemctl enable direction-engine-v3-shadow-report.timer
 }
 
+ensure_runtime_writable_by_service_user() {
+  STAGE="runtime-ownership"
+  local runtime_dir="$PROJECT_DIR/runtime"
+  local data_dir="$runtime_dir/data"
+  local reports_dir="$runtime_dir/reports"
+  local logs_dir="$runtime_dir/logs"
+  install -d -o ubuntu -g ubuntu "$runtime_dir" "$data_dir" "$reports_dir" "$logs_dir" "$PAPER_ARCHIVE_DIR"
+  find "$data_dir" -maxdepth 1 -type f \
+    \( -name '*.sqlite3' -o -name '*.sqlite3-journal' -o -name '*.sqlite3-wal' -o -name '*.sqlite3-shm' \) \
+    -exec chown ubuntu:ubuntu {} +
+}
+
 stop_project_runtime_units() {
   STAGE="systemd-stop-project"
   systemctl stop direction-engine-v3-shadow-report.timer || true
@@ -646,6 +658,7 @@ main() {
   install_dependencies_if_needed
   validate_on_vps
   stop_project_runtime_units
+  ensure_runtime_writable_by_service_user
   install_project_units
   start_shadow_and_wait_ready
   start_dashboard_and_report

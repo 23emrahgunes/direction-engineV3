@@ -224,6 +224,27 @@ def test_runtime_archive_is_gitignored_but_not_deleted_by_deploy() -> None:
     assert 'reset_paper_run.py' not in source
 
 
+def test_deploy_repairs_runtime_sqlite_ownership_without_resetting_paper() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "ensure_runtime_writable_by_service_user()" in source
+    assert 'install -d -o ubuntu -g ubuntu "$runtime_dir" "$data_dir"' in source
+    assert "find \"$data_dir\" -maxdepth 1 -type f" in source
+    assert "-name '*.sqlite3'" in source
+    assert "-name '*.sqlite3-journal'" in source
+    assert "-name '*.sqlite3-wal'" in source
+    assert "-name '*.sqlite3-shm'" in source
+    assert "-exec chown ubuntu:ubuntu {} +" in source
+    main_block = source[source.index("main() {") : source.index("  start_shadow_and_wait_ready")]
+    assert main_block.index("stop_project_runtime_units") < main_block.index(
+        "ensure_runtime_writable_by_service_user"
+    )
+    assert main_block.index("ensure_runtime_writable_by_service_user") < main_block.index(
+        "install_project_units"
+    )
+    assert 'reset_paper_run.py' not in source
+
+
 def test_iam_trust_policy_restricts_repo_branch_and_audience() -> None:
     policy = json.loads(TRUST_POLICY.read_text(encoding="utf-8"))
     statement = policy["Statement"][0]

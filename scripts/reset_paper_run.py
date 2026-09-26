@@ -7,6 +7,7 @@ active PAPER ledger and initializes a fresh PAPER run after explicit confirmatio
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import subprocess
 import sys
@@ -92,6 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = repository.summary(now=started_at)
         counts = repository.paper_table_counts()
         _verify_clean_run(summary, counts, initial_equity)
+        _ensure_paper_db_owned_by_service_user(paper_path)
     except Exception:
         if archive_path is not None and archive_path.exists() and not paper_path.exists():
             archive_path.replace(paper_path)
@@ -172,6 +174,39 @@ def _verify_clean_run(
         raise RuntimeError(f"clean PAPER run contains non-zero ledger rows: {counts}")
     if expected != PAPER_INITIAL_EQUITY_USDC:
         raise RuntimeError("PAPER initial equity config mismatch")
+
+
+def _ensure_paper_db_owned_by_service_user(paper_path: Path) -> None:
+    """Leave reset-created PAPER DB writable by the ubuntu systemd service user.
+
+    The reset command is commonly run as root with --manage-systemd. SQLite creates
+    the new paper.sqlite3 as the invoking user; without this repair the shadow
+    daemon later fails with "attempt to write a readonly database" while recording
+    abstains or fills. Non-POSIX development environments safely no-op.
+    """
+
+    if os.name != "posix":
+        return
+    try:
+        import grp
+        import pwd
+    except ImportError:
+        return
+    try:
+        uid = pwd.getpwnam("ubuntu").pw_uid
+        gid = grp.getgrnam("ubuntu").gr_gid
+    except KeyError:
+        return
+    targets = [
+        paper_path.parent,
+        paper_path,
+        paper_path.with_name(f"{paper_path.name}-journal"),
+        paper_path.with_name(f"{paper_path.name}-wal"),
+        paper_path.with_name(f"{paper_path.name}-shm"),
+    ]
+    for target in targets:
+        if target.exists():
+            os.chown(target, uid, gid)
 
 
 def _stop_project_units() -> None:

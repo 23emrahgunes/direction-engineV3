@@ -204,3 +204,14 @@ def test_normal_deploy_script_does_not_invoke_paper_reset():
     deploy_script = (ROOT / "deploy" / "aws" / "paper_deploy.sh").read_text(encoding="utf-8")
 
     assert "reset_paper_run.py" not in deploy_script
+
+
+def test_reset_script_repairs_paper_db_ownership_for_systemd_service_user():
+    source = RESET_SCRIPT.read_text(encoding="utf-8")
+
+    assert "_ensure_paper_db_owned_by_service_user(paper_path)" in source
+    assert 'pwd.getpwnam("ubuntu").pw_uid' in source
+    assert 'grp.getgrnam("ubuntu").gr_gid' in source
+    assert "os.chown(target, uid, gid)" in source
+    assert "paper.sqlite3-journal" not in source
+    assert "paper_path.with_name(f\"{paper_path.name}-journal\")" in source
