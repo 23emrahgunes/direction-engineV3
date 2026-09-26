@@ -792,8 +792,21 @@ class ShadowDaemon:
     async def run_once(self) -> ShadowCycleResult:
         cycle_started_at = self._clock.utc_now()
         cycle_id = f"shadow-cycle:{int(cycle_started_at.timestamp() * 1000)}"
+        _shadow_runtime_log(
+            "REAL_SHADOW_CYCLE_START",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            cycle_started_at=cycle_started_at.isoformat(),
+        )
         settlement_payload: dict[str, object] = {}
         if self._settlement_service is not None:
+            settlement_started_monotonic = self._clock.monotonic_ns()
+            _shadow_runtime_log(
+                "PAPER_SETTLEMENT_SCAN_START",
+                cycle_id=cycle_id,
+                window_id=self._evidence_window.window_id,
+                timeout_seconds=_PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS,
+            )
             try:
                 settlement_payload = await asyncio.wait_for(
                     self._settlement_service.run_once(),
@@ -810,7 +823,22 @@ class ShadowDaemon:
                     "blocked": 0,
                     "last_error": "PAPER_SETTLEMENT_SCAN_TIMEOUT",
                 }
-            self._append_shadow_event(
+            settlement_elapsed_ms = (
+                self._clock.monotonic_ns() - settlement_started_monotonic
+            ) / 1_000_000
+            _shadow_runtime_log(
+                "PAPER_SETTLEMENT_SCAN_DONE",
+                cycle_id=cycle_id,
+                window_id=self._evidence_window.window_id,
+                elapsed_ms=round(settlement_elapsed_ms, 3),
+                status=settlement_payload.get("status"),
+                checked_trades=settlement_payload.get("checked_trades"),
+                pending=settlement_payload.get("pending"),
+                completed=settlement_payload.get("completed"),
+                blocked=settlement_payload.get("blocked"),
+                last_error=settlement_payload.get("last_error"),
+            )
+            settlement_appended = self._append_shadow_event(
                 event_id=f"{self._evidence_window.window_id}:{cycle_id}:settlement",
                 window_id=self._evidence_window.window_id,
                 event_type="PAPER_SETTLEMENT_SCAN",
@@ -818,7 +846,22 @@ class ShadowDaemon:
                 payload=settlement_payload,
                 observed_at=self._clock.utc_now(),
             )
+            _shadow_runtime_log(
+                "PAPER_SETTLEMENT_SCAN_APPEND_DONE",
+                cycle_id=cycle_id,
+                window_id=self._evidence_window.window_id,
+                appended=settlement_appended,
+            )
         market_selection_at = self._clock.utc_now()
+        bucket_started_monotonic = self._clock.monotonic_ns()
+        _shadow_runtime_log(
+            "BUCKET_COLLECTION_START",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            bucket_count=len(SUPPORTED_MARKET_BUCKETS),
+            timeout_seconds=_BUCKET_COLLECTION_TIMEOUT_SECONDS,
+            market_selection_at=market_selection_at.isoformat(),
+        )
         collected = await asyncio.gather(
             *(
                 asyncio.wait_for(
@@ -828,6 +871,16 @@ class ShadowDaemon:
                 for bucket in SUPPORTED_MARKET_BUCKETS
             ),
             return_exceptions=True,
+        )
+        bucket_elapsed_ms = (self._clock.monotonic_ns() - bucket_started_monotonic) / 1_000_000
+        collection_failures = sum(isinstance(item, Exception) for item in collected)
+        _shadow_runtime_log(
+            "BUCKET_COLLECTION_DONE",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            elapsed_ms=round(bucket_elapsed_ms, 3),
+            bucket_count=len(collected),
+            exception_count=collection_failures,
         )
         states: list[ShadowMarketState] = []
         for bucket, item in zip(SUPPORTED_MARKET_BUCKETS, collected, strict=True):
@@ -864,9 +917,28 @@ class ShadowDaemon:
             if not isinstance(item, ShadowMarketState):
                 raise RuntimeError("collect_bucket returned an invalid shadow market state")
             states.append(item)
+        evaluation_started_monotonic = self._clock.monotonic_ns()
+        _shadow_runtime_log(
+            "REAL_SHADOW_CYCLE_EVALUATION_START",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            state_count=len(states),
+        )
         result = self._evaluate_cycle(cycle_id, cycle_started_at, states)
+        evaluation_elapsed_ms = (
+            self._clock.monotonic_ns() - evaluation_started_monotonic
+        ) / 1_000_000
+        _shadow_runtime_log(
+            "REAL_SHADOW_CYCLE_EVALUATION_DONE",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            elapsed_ms=round(evaluation_elapsed_ms, 3),
+            markets_discovered=result.markets_discovered,
+            strategy_evaluations=result.strategy_evaluations,
+            paper_trades=result.paper_trades,
+        )
         completed_at = self._clock.utc_now()
-        self._append_shadow_event(
+        cycle_appended = self._append_shadow_event(
             event_id=f"{self._evidence_window.window_id}:{cycle_id}",
             window_id=self._evidence_window.window_id,
             event_type="REAL_SHADOW_CYCLE",
@@ -880,11 +952,23 @@ class ShadowDaemon:
             },
             observed_at=completed_at,
         )
+        _shadow_runtime_log(
+            "REAL_SHADOW_CYCLE_APPEND_DONE",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            appended=cycle_appended,
+        )
         write_reports(
             build_shadow_summary(
                 evidence_window=self._evidence_window, generated_at=completed_at
             ),
             self._report_dir,
+        )
+        _shadow_runtime_log(
+            "REAL_SHADOW_CYCLE_DONE",
+            cycle_id=cycle_id,
+            window_id=self._evidence_window.window_id,
+            completed_at=completed_at.isoformat(),
         )
         return result
 
@@ -1025,7 +1109,16 @@ class ShadowDaemon:
                 payload=payload,
                 observed_at=observed_at,
             )
-        except ShadowStorageBusy:
+        except ShadowStorageBusy as exc:
+            _shadow_runtime_log(
+                "SHADOW_EVENT_STORAGE_BUSY",
+                event_type=event_type,
+                event_id=event_id,
+                window_id=window_id,
+                bucket_key=bucket_key,
+                observed_at=observed_at.isoformat(),
+                error=str(exc),
+            )
             return False
         return True
 
@@ -2238,6 +2331,18 @@ def _shadow_startup_log(
     )
 
 
+def _shadow_runtime_log(event: str, **payload: object) -> None:
+    safe_payload = {
+        "event": event,
+        "pid": os.getpid(),
+    } | payload
+    print(
+        f"shadow_runtime={json.dumps(safe_payload, sort_keys=True, default=str)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _prepare_shadow_evidence_startup(
     *,
     shadow: SQLiteShadowRepository,
@@ -2347,6 +2452,11 @@ async def run_daemon(
         collector_task = asyncio.create_task(chainlink.run(collector_stop))
         if once:
             try:
+                _shadow_runtime_log(
+                    "SHADOW_ONCE_CYCLE_STARTING",
+                    window_id=evidence_window.window_id,
+                    code_commit=commit,
+                )
                 return await daemon.run_once()
             finally:
                 collector_stop.set()
@@ -2366,7 +2476,17 @@ async def run_daemon(
         for item in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(item, stop.set)
+        _shadow_runtime_log(
+            "SHADOW_FIRST_CYCLE_STARTING",
+            window_id=evidence_window.window_id,
+            code_commit=commit,
+        )
         await daemon.run_once()
+        _shadow_runtime_log(
+            "SHADOW_FIRST_CYCLE_DONE",
+            window_id=evidence_window.window_id,
+            code_commit=commit,
+        )
         daemon_task = asyncio.create_task(daemon.run_forever(stop), name="shadow-daemon")
         scheduler_task = asyncio.create_task(
             scheduler.run(stop), name="ptb-boundary-scheduler"

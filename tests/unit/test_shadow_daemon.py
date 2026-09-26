@@ -36,7 +36,7 @@ from direction_engine_v3.shadow.daemon import (
     _paper_directional_entry_brake,
     new_evidence_window,
 )
-from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.shadow.storage import ShadowStorageBusy, SQLiteShadowRepository
 from direction_engine_v3.storage import SQLitePaperRepository
 
 NOW = datetime(2026, 9, 15, 22, 0, tzinfo=UTC)
@@ -106,6 +106,11 @@ class HangingBucketClient:
                 self.cancelled += 1
                 raise
         return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
+
+
+class BusyShadowEventRepository:
+    def append_event(self, **_: object) -> None:
+        raise ShadowStorageBusy("STORAGE_BUSY:shadow_evidence_write")
 
 
 class SettlementProbe:
@@ -182,6 +187,42 @@ def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) ->
     assert directional.payload["real_order_submission"] is False
     assert paper.summary()["open_positions"] == 2
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_shadow_event_storage_busy_is_visible_in_stderr(tmp_path, capsys) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=BusyShadowEventRepository(),
+        evidence_window=window,
+        report_dir=tmp_path,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    appended = daemon._append_shadow_event(
+        event_id=f"{window.window_id}:event",
+        window_id=window.window_id,
+        event_type="REAL_SHADOW_CYCLE",
+        bucket_key=None,
+        payload={"ok": True},
+        observed_at=NOW,
+    )
+
+    captured = capsys.readouterr()
+    assert appended is False
+    assert "SHADOW_EVENT_STORAGE_BUSY" in captured.err
+    assert "REAL_SHADOW_CYCLE" in captured.err
+    assert window.window_id in captured.err
 
 
 def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_scan(
