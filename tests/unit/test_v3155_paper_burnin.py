@@ -331,6 +331,67 @@ def test_settlement_persists_when_corpus_label_blocked_by_missing_resolution_tim
     assert task.last_reason == "CORPUS_LABEL_BLOCKED:RESOLUTION_TIME_UNAVAILABLE"
 
 
+def test_settlement_scan_ignores_already_settled_open_snapshots(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    _trade(
+        paper,
+        trade_id="already-settled",
+        condition_id="condition-settled",
+        market_id="market-settled",
+    )
+    paper.save_settlement_once(
+        settlement_id="settlement-existing",
+        trade_id="already-settled",
+        condition_id="condition-settled",
+        official_winning_side="UP",
+        selected_side="UP",
+        settlement_source_kind="OFFICIAL",
+        settlement_source="POLYMARKET_GAMMA_MARKET_ID_AND_CLOB_CONDITION",
+        official_resolved_at=NOW,
+        official_resolution_observed_at=NOW,
+        settled_at=NOW,
+        filled_shares=Decimal("1"),
+        cost_basis_usdc=Decimal("0.5"),
+        payout_usdc=Decimal("1"),
+        realized_paper_pnl=Decimal("0.5"),
+        win_loss="WIN",
+        evidence_hash="settled-hash",
+        payload={"resolver_version": "POLYMARKET_SETTLEMENT_V2"},
+    )
+    _trade(
+        paper,
+        trade_id="still-unsettled",
+        condition_id="condition-live",
+        market_id="market-live",
+    )
+    resolver = Resolver(
+        {
+            "condition-settled": _official(
+                "UP", condition_id="condition-settled", market_id="market-settled"
+            ),
+            "condition-live": _official(
+                "UP", condition_id="condition-live", market_id="market-live"
+            ),
+        }
+    )
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=resolver,
+        clock=Clock(),
+    )
+
+    result = asyncio.run(service.run_once())
+
+    assert resolver.calls == 1
+    assert result["conditions_attempted"] == ("condition-live",)
+    assert result["settlement_checked"] == 1
+    assert result["settlement_completed"] == 1
+    assert paper.trade_by_id("already-settled").status == "SETTLED"
+    assert paper.trade_by_id("still-unsettled").status == "SETTLED"
+
+
 def test_old_retryable_market_metadata_not_found_is_due_under_v2(tmp_path):
     paper = _paper(tmp_path)
     paper.save_settlement_condition_attempt(

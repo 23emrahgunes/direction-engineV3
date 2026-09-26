@@ -1026,6 +1026,41 @@ class SQLitePaperRepository:
             trades = tuple(item for item in trades if item.payload.get("win_loss") == post_win_loss)
         return trades[offset : offset + limit]
 
+    def unsettled_trade_snapshots(
+        self,
+        *,
+        strategy: str,
+        status: str,
+        limit: int = 250,
+    ) -> tuple[PaperTradeSnapshot, ...]:
+        """Return immutable trade snapshots without settlement overlays.
+
+        Settlement scanning needs the append-only execution records that do not already
+        have a settlement row.  The public ``trades()`` reader intentionally overlays
+        settlement state for dashboards; using it here would repeatedly re-read settled
+        legacy OPEN snapshots and perform one settlement lookup per row.
+        """
+
+        require_text("strategy", strategy)
+        require_text("status", status)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT s.trade_id,s.decision_id,s.strategy,s.asset,s.horizon,
+                       s.condition_id,s.side,s.status,s.label,s.payload_json,s.observed_at
+                FROM paper_trade_snapshots AS s
+                LEFT JOIN paper_trade_settlements AS settled
+                    ON settled.trade_id = s.trade_id
+                WHERE s.strategy=? AND s.status=? AND settled.trade_id IS NULL
+                ORDER BY s.observed_at DESC
+                LIMIT ?
+                """,
+                (strategy, status, limit),
+            ).fetchall()
+        return tuple(_trade_from_row(row) for row in rows)
+
     def trade_by_id(self, trade_id: str) -> PaperTradeSnapshot | None:
         require_text("trade_id", trade_id)
         with sqlite3.connect(self._path) as connection:

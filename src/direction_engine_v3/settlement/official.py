@@ -163,7 +163,7 @@ class PaperSettlementService:
         errors: list[str] = []
         attempted_conditions: list[str] = []
         candidates: list[PaperTradeSnapshot] = []
-        for item in self._paper.trades(
+        for item in self._paper.unsettled_trade_snapshots(
             strategy="DIRECTIONAL_EDGE", status="OPEN", limit=100_000
         ):
             window_end = _trade_window_end(item)
