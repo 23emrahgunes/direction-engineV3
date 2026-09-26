@@ -773,12 +773,48 @@ class ShadowDaemon:
                 observed_at=self._clock.utc_now(),
             )
         market_selection_at = self._clock.utc_now()
-        states = await asyncio.gather(
+        collected = await asyncio.gather(
             *(
                 self._data_client.collect_bucket(bucket, now=market_selection_at)
                 for bucket in SUPPORTED_MARKET_BUCKETS
-            )
+            ),
+            return_exceptions=True,
         )
+        states: list[ShadowMarketState] = []
+        for bucket, item in zip(SUPPORTED_MARKET_BUCKETS, collected, strict=True):
+            if isinstance(item, Exception):
+                if not _is_expected_market_data_failure(item):
+                    raise item
+                observed_at = self._clock.utc_now()
+                reason = _stage_failure_reason("COLLECT_BUCKET", item)
+                states.append(
+                    ShadowMarketState(
+                        bucket=bucket,
+                        discovery=None,
+                        up_book=None,
+                        down_book=None,
+                        fee_schedule=None,
+                        proxy_reference=None,
+                        official_reference=None,
+                        observed_at=observed_at,
+                        unavailable_reason=reason,
+                        ptb_status="PTB_UNAVAILABLE",
+                        ptb_reason=reason,
+                        feature_status=reason,
+                        pipeline_stages=(
+                            _stage_record(
+                                "COLLECT_BUCKET",
+                                "FAIL",
+                                observed_at,
+                                error=item,
+                            ),
+                        ),
+                    )
+                )
+                continue
+            if not isinstance(item, ShadowMarketState):
+                raise RuntimeError("collect_bucket returned an invalid shadow market state")
+            states.append(item)
         result = self._evaluate_cycle(cycle_id, cycle_started_at, states)
         completed_at = self._clock.utc_now()
         self._append_shadow_event(

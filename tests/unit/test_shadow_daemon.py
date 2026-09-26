@@ -22,6 +22,7 @@ from direction_engine_v3.market_data import (
     EventLineage,
     FeeSchedule,
     MarketBucket,
+    MarketDataError,
     MarketDiscovery,
     PolymarketBook,
     PolymarketLevel,
@@ -77,6 +78,20 @@ class RecordingClient:
     async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
         self.selection_times.append(now)
         return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
+
+
+class OneBucketMarketDataFailureClient:
+    async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
+        if bucket == MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES):
+            raise MarketDataError("temporary public data timeout")
+        if bucket == MarketBucket(Asset.ETH, Horizon.FIVE_MINUTES):
+            return _market_state(bucket)
+        return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
+
+
+class ProgrammingFailureClient:
+    async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
+        raise RuntimeError("programming defect")
 
 
 class SettlementProbe:
@@ -210,6 +225,84 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_expected_bucket_collection_failure_does_not_stop_cycle_or_other_buckets(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    probe = SettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=OneBucketMarketDataFailureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    result = asyncio.run(daemon.run_once())
+
+    assert probe.calls == 1
+    assert result.markets_discovered >= 1
+    assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
+    assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+    assert any(
+        item.reason == "MARKET_DATA_ERROR:COLLECT_BUCKET"
+        for item in paper.abstains()
+    )
+
+
+def test_unexpected_bucket_collection_failure_still_raises_after_settlement_scan(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    probe = SettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=ProgrammingFailureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    try:
+        asyncio.run(daemon.run_once())
+    except RuntimeError as exc:
+        assert "programming defect" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("programming defect was swallowed")
+
+    assert probe.calls == 1
+    assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
+    assert shadow.event_counts().get("REAL_SHADOW_CYCLE", 0) == 0
 
 
 def test_paper_drawdown_brake_blocks_new_directional_fill_without_stopping_cycle(
