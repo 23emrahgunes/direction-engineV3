@@ -174,6 +174,12 @@ def test_deploy_failure_diagnostics_include_current_journal_and_preserve_stage()
     assert "NRestarts" in source
     assert "journalctl -u \"$unit\" --since \"$DEPLOY_STARTED_AT\"" in source
     assert "trap 'dump_failure_context \"$?\"' ERR" in source
+    assert "dump_shadow_smoke_context()" in source
+    assert "SHADOW_CURRENT_INVOCATION_JOURNAL" in source
+    assert "journalctl _SYSTEMD_INVOCATION_ID=\"$invocation_id\"" in source
+    assert "SHADOW_EVENT_STORAGE_BUSY" in source
+    assert "dump_shadow_smoke_context \"REAL_SHADOW_CYCLE_NOT_ADVANCED\"" in source
+    assert "dump_shadow_smoke_context \"PAPER_SETTLEMENT_SCAN_NOT_ADVANCED\"" in source
 
 
 def test_deploy_precheck_cannot_self_dirty_project_worktree() -> None:

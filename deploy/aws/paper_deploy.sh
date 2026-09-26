@@ -342,6 +342,26 @@ else:
 PY
 }
 
+dump_shadow_smoke_context() {
+  local reason="$1"
+  local invocation_id
+  invocation_id="$(systemctl show -p InvocationID --value direction-engine-v3-shadow.service 2>/dev/null || true)"
+  {
+    echo "SHADOW_SMOKE_FAILURE_CONTEXT reason=$reason expected_sha=$EXPECTED_SHA deploy_started_at=$DEPLOY_STARTED_AT"
+    systemctl show -p Id -p ActiveState -p SubState -p MainPID -p NRestarts -p InvocationID direction-engine-v3-shadow.service || true
+    if [ -n "$invocation_id" ]; then
+      echo "SHADOW_CURRENT_INVOCATION_JOURNAL invocation_id=$invocation_id"
+      journalctl _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager --output=short-iso-precise -n 240 || true
+      echo "SHADOW_CURRENT_INVOCATION_FILTERED invocation_id=$invocation_id"
+      journalctl _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager --output=short-iso-precise -n 500 \
+        | grep -E 'shadow_runtime=|shadow_startup_storage=|Traceback|ERROR|STORAGE_|REAL_SHADOW|PAPER_SETTLEMENT|BUCKET_COLLECTION|SHADOW_EVENT_STORAGE_BUSY' || true
+    else
+      echo "SHADOW_CURRENT_INVOCATION_JOURNAL_UNAVAILABLE"
+      journalctl -u direction-engine-v3-shadow.service --since "$DEPLOY_STARTED_AT" --no-pager --output=short-iso-precise -n 240 || true
+    fi
+  } >&2
+}
+
 wait_for_shadow_cycle_and_settlement_progress() {
   local restarts_before="$1"
   local cycles_before="$2"
@@ -359,6 +379,7 @@ wait_for_shadow_cycle_and_settlement_progress() {
     require_active_unit direction-engine-v3-dashboard.service 31
     restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
     if [ "$restarts_after" != "$restarts_before" ]; then
+      dump_shadow_smoke_context "RESTART_COUNT_CHANGED"
       echo "Shadow service restart count changed during smoke" >&2
       exit 20
     fi
@@ -373,10 +394,12 @@ wait_for_shadow_cycle_and_settlement_progress() {
     log "waiting for shadow cycle smoke evidence: cycles=$cycles_before->$cycles_after settlement=$settlement_before->$settlement_after"
   done
   if [ "$cycles_after" -le "$cycles_before" ] || [ "$cycle_ts_after" = "$cycle_ts_before" ]; then
+    dump_shadow_smoke_context "REAL_SHADOW_CYCLE_NOT_ADVANCED"
     echo "Shadow daemon did not advance a REAL_SHADOW_CYCLE during smoke" >&2
     exit 21
   fi
   if [ "$settlement_after" -le "$settlement_before" ] || [ "$settlement_ts_after" = "$settlement_ts_before" ]; then
+    dump_shadow_smoke_context "PAPER_SETTLEMENT_SCAN_NOT_ADVANCED"
     echo "Shadow daemon did not advance a PAPER_SETTLEMENT_SCAN during smoke" >&2
     exit 24
   fi
