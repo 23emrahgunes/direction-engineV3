@@ -2345,6 +2345,7 @@ async def run_daemon(
         for item in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(item, stop.set)
+        await daemon.run_once()
         daemon_task = asyncio.create_task(daemon.run_forever(stop), name="shadow-daemon")
         scheduler_task = asyncio.create_task(
             scheduler.run(stop), name="ptb-boundary-scheduler"
