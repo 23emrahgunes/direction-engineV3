@@ -10,6 +10,9 @@ PAPER_ARCHIVE_DIR="$PROJECT_DIR/runtime/archive"
 DEPLOY_RESULT="$DEPLOY_STATE_DIR/github-paper-deploy-result.json"
 STAGE="start"
 DEPLOY_STARTED_AT="$(date -u +%FT%TZ)"
+ORPHAN_SHADOW_DAEMON_COUNT=0
+ORPHAN_SHADOW_DAEMON_CLEANED=0
+ORPHAN_SHADOW_DAEMON_KILLED=0
 
 PROJECT_UNITS=(
   "direction-engine-v3-shadow.service"
@@ -170,6 +173,80 @@ stop_project_runtime_units() {
   systemctl stop direction-engine-v3-shadow-report.service || true
   systemctl stop direction-engine-v3-dashboard.service || true
   systemctl stop direction-engine-v3-shadow.service || true
+}
+
+verified_orphan_shadow_pids() {
+  local project_real main_pid proc pid cmdline cwd exe
+  project_real="$(realpath -e "$PROJECT_DIR")"
+  main_pid="$(systemctl show -p MainPID --value direction-engine-v3-shadow.service 2>/dev/null || true)"
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    if [ "$pid" = "$$" ] || [ "$pid" = "${main_pid:-0}" ]; then
+      continue
+    fi
+    if [ ! -r "$proc/cmdline" ]; then
+      continue
+    fi
+    cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+    case "$cmdline" in
+      (*direction_engine_v3.shadow.daemon*) ;;
+      (*) continue ;;
+    esac
+    cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
+    exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
+    if [ "$cwd" = "$project_real" ] \
+      || [[ "$cmdline" == *"$PROJECT_DIR"* ]] \
+      || [[ "$cmdline" == *"$PY"* ]] \
+      || [[ "$exe" == "$project_real/.venv/bin/"* ]]; then
+      printf '%s\n' "$pid"
+    else
+      log "WARN refusing non-project shadow-like process pid=$pid cwd=$cwd exe=$exe cmd=$cmdline"
+    fi
+  done
+}
+
+log_shadow_process_details() {
+  local label="$1"
+  shift || true
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  log "$label count=$#"
+  ps -o pid=,ppid=,user=,etimes=,cmd= -p "$@" || true
+}
+
+cleanup_orphan_shadow_daemons() {
+  STAGE="orphan-shadow-daemon-cleanup"
+  local pids remaining deadline
+  mapfile -t pids < <(verified_orphan_shadow_pids)
+  ORPHAN_SHADOW_DAEMON_COUNT="${#pids[@]}"
+  if [ "${#pids[@]}" -eq 0 ]; then
+    log "NO_ORPHAN_SHADOW_DAEMON"
+    return 0
+  fi
+  log_shadow_process_details "ORPHAN_SHADOW_DAEMON_FOUND" "${pids[@]}"
+  kill -TERM "${pids[@]}" || true
+  deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -le "$deadline" ]; do
+    sleep 1
+    mapfile -t remaining < <(verified_orphan_shadow_pids)
+    if [ "${#remaining[@]}" -eq 0 ]; then
+      ORPHAN_SHADOW_DAEMON_CLEANED="$ORPHAN_SHADOW_DAEMON_COUNT"
+      log "ORPHAN_SHADOW_DAEMON_CLEANED count=$ORPHAN_SHADOW_DAEMON_CLEANED signal=TERM"
+      return 0
+    fi
+  done
+  log_shadow_process_details "ORPHAN_SHADOW_DAEMON_TERM_TIMEOUT" "${remaining[@]}"
+  ORPHAN_SHADOW_DAEMON_KILLED="${#remaining[@]}"
+  kill -KILL "${remaining[@]}" || true
+  sleep 1
+  mapfile -t remaining < <(verified_orphan_shadow_pids)
+  if [ "${#remaining[@]}" -ne 0 ]; then
+    log_shadow_process_details "ORPHAN_SHADOW_DAEMON_CLEANUP_FAILED" "${remaining[@]}"
+    exit 25
+  fi
+  ORPHAN_SHADOW_DAEMON_CLEANED="$ORPHAN_SHADOW_DAEMON_COUNT"
+  log "ORPHAN_SHADOW_DAEMON_CLEANED count=$ORPHAN_SHADOW_DAEMON_CLEANED signal=KILL"
 }
 
 require_active_unit() {
@@ -605,7 +682,10 @@ write_result() {
   local cycle_ts_before="$5" cycle_ts_after="$6"
   local smoke_started_at="$7" settlement_before="$8" settlement_after="$9"
   local settlement_ts_before="${10}" settlement_ts_after="${11}" runtime_health_status="${12}"
-  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" "$settlement_before" "$settlement_after" "$settlement_ts_before" "$settlement_ts_after" "$runtime_health_status" <<'PY'
+  local shadow_main_pid shadow_invocation_id
+  shadow_main_pid="$(systemctl show -p MainPID --value direction-engine-v3-shadow.service 2>/dev/null || true)"
+  shadow_invocation_id="$(systemctl show -p InvocationID --value direction-engine-v3-shadow.service 2>/dev/null || true)"
+  "$PY" - "$DEPLOY_RESULT" "$EXPECTED_SHA" "$restarts_before" "$restarts_after" "$cycles_before" "$cycles_after" "$cycle_ts_before" "$cycle_ts_after" "$smoke_started_at" "$settlement_before" "$settlement_after" "$settlement_ts_before" "$settlement_ts_after" "$runtime_health_status" "$ORPHAN_SHADOW_DAEMON_COUNT" "$ORPHAN_SHADOW_DAEMON_CLEANED" "$ORPHAN_SHADOW_DAEMON_KILLED" "$shadow_main_pid" "$shadow_invocation_id" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -626,6 +706,11 @@ from pathlib import Path
     settlement_ts_before,
     settlement_ts_after,
     runtime_health_status,
+    orphan_shadow_daemon_count,
+    orphan_shadow_daemon_cleaned,
+    orphan_shadow_daemon_killed,
+    shadow_main_pid,
+    shadow_invocation_id,
 ) = sys.argv[1:]
 
 def read_json(path: str) -> object:
@@ -672,6 +757,11 @@ result = {
     'real_order_submission': False,
     'shadow_restarts_before': rb,
     'shadow_restarts_after': ra,
+    'shadow_main_pid': shadow_main_pid,
+    'shadow_invocation_id': shadow_invocation_id,
+    'orphan_shadow_daemon_count': int(orphan_shadow_daemon_count or 0),
+    'orphan_shadow_daemon_cleaned': int(orphan_shadow_daemon_cleaned or 0),
+    'orphan_shadow_daemon_killed': int(orphan_shadow_daemon_killed or 0),
     'cycle_count_before': cb,
     'cycle_count_after': ca,
     'latest_cycle_before': tb,
@@ -702,6 +792,7 @@ main() {
   install_dependencies_if_needed
   validate_on_vps
   stop_project_runtime_units
+  cleanup_orphan_shadow_daemons
   ensure_runtime_writable_by_service_user
   install_project_units
   start_shadow_and_wait_ready

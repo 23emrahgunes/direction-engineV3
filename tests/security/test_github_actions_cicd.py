@@ -139,6 +139,11 @@ def test_deploy_smoke_records_dashboard_endpoints_and_settlement_progress() -> N
     assert "'shadow_status': shadow_status" in source
     assert "'settlement_scan_count_before': settlement_before" in source
     assert "'settlement_scan_count_after': settlement_after" in source
+    assert "'shadow_main_pid': shadow_main_pid" in source
+    assert "'shadow_invocation_id': shadow_invocation_id" in source
+    assert "'orphan_shadow_daemon_count': int(orphan_shadow_daemon_count or 0)" in source
+    assert "'orphan_shadow_daemon_cleaned': int(orphan_shadow_daemon_cleaned or 0)" in source
+    assert "'orphan_shadow_daemon_killed': int(orphan_shadow_daemon_killed or 0)" in source
 
 
 def test_deploy_starts_shadow_before_dashboard_and_report_smoke() -> None:
@@ -153,6 +158,12 @@ def test_deploy_starts_shadow_before_dashboard_and_report_smoke() -> None:
     assert "FROM evidence_windows" in source
     assert "ORDER BY started_at DESC LIMIT 1" in source
 
+    main_block = source[source.index("main() {") :]
+    stop_units = main_block.index("stop_project_runtime_units")
+    orphan_cleanup = main_block.index("cleanup_orphan_shadow_daemons")
+    runtime_ownership = main_block.index("ensure_runtime_writable_by_service_user")
+    assert stop_units < orphan_cleanup < runtime_ownership
+
     shadow_start = source.index("start_shadow_and_wait_ready")
     dashboard_start = source.index("start_dashboard_and_report")
     smoke = source.index("smoke_check")
@@ -163,6 +174,37 @@ def test_deploy_starts_shadow_before_dashboard_and_report_smoke() -> None:
     shadow_function = source[function_start:function_end]
     assert "systemctl restart direction-engine-v3-shadow.service" in shadow_function
     assert "systemctl restart direction-engine-v3-dashboard.service" not in shadow_function
+
+
+def test_deploy_cleans_only_verified_orphan_shadow_daemons() -> None:
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "verified_orphan_shadow_pids()" in source
+    assert "cleanup_orphan_shadow_daemons()" in source
+    assert "direction_engine_v3.shadow.daemon" in source
+    assert (
+        'main_pid="$(systemctl show -p MainPID --value direction-engine-v3-shadow.service'
+        in source
+    )
+    assert '[ "$pid" = "${main_pid:-0}" ]' in source
+    assert 'cmdline="$(tr \'\\0\' \' \' < "$proc/cmdline"' in source
+    assert 'cwd="$(readlink -f "$proc/cwd"' in source
+    assert 'exe="$(readlink -f "$proc/exe"' in source
+    assert '[ "$cwd" = "$project_real" ]' in source
+    assert '[[ "$cmdline" == *"$PROJECT_DIR"* ]]' in source
+    assert '[[ "$cmdline" == *"$PY"* ]]' in source
+    assert '[[ "$exe" == "$project_real/.venv/bin/"* ]]' in source
+    assert "WARN refusing non-project shadow-like process" in source
+    assert "ORPHAN_SHADOW_DAEMON_FOUND" in source
+    assert "kill -TERM" in source
+    assert "deadline=$((SECONDS + 10))" in source
+    assert "ORPHAN_SHADOW_DAEMON_TERM_TIMEOUT" in source
+    assert "kill -KILL" in source
+    assert "ORPHAN_SHADOW_DAEMON_CLEANED" in source
+    assert "NO_ORPHAN_SHADOW_DAEMON" in source
+    assert "exit 25" in source
+    assert "pkill" not in source
+    assert "kill -9" not in source
 
 
 def test_deploy_failure_diagnostics_include_current_journal_and_preserve_stage() -> None:
