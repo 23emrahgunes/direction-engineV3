@@ -151,6 +151,7 @@ _PAPER_RECENT_PERFORMANCE_SAMPLE = 10
 _PAPER_RECENT_PERFORMANCE_LIMIT = 20
 _PAPER_RECENT_MIN_WIN_RATE = Decimal("0.35")
 _PAPER_RECENT_MAX_LOSS_USDC = Decimal("-5.00")
+_PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS = 20.0
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -792,7 +793,22 @@ class ShadowDaemon:
         cycle_id = f"shadow-cycle:{int(cycle_started_at.timestamp() * 1000)}"
         settlement_payload: dict[str, object] = {}
         if self._settlement_service is not None:
-            settlement_payload = await self._settlement_service.run_once()
+            try:
+                settlement_payload = await asyncio.wait_for(
+                    self._settlement_service.run_once(),
+                    timeout=_PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                settlement_payload = {
+                    "status": "SETTLEMENT_SCAN_TIMEOUT",
+                    "reason": "PAPER_SETTLEMENT_SCAN_TIMEOUT",
+                    "timeout_seconds": _PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS,
+                    "checked_trades": 0,
+                    "completed": 0,
+                    "pending": 0,
+                    "blocked": 0,
+                    "last_error": "PAPER_SETTLEMENT_SCAN_TIMEOUT",
+                }
             self._append_shadow_event(
                 event_id=f"{self._evidence_window.window_id}:{cycle_id}:settlement",
                 window_id=self._evidence_window.window_id,

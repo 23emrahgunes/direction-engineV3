@@ -110,6 +110,21 @@ class SettlementProbe:
         }
 
 
+class HangingSettlementProbe:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancelled = False
+
+    async def run_once(self) -> dict[str, object]:
+        self.calls += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return {}
+
+
 def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
     shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
@@ -225,6 +240,50 @@ def test_negative_paper_capital_abstains_without_crashing_and_keeps_settlement_s
     assert summary["spendable_capital"] == "0"
     assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+
+
+def test_settlement_scan_timeout_records_evidence_and_cycle_continues(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "direction_engine_v3.shadow.daemon._PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    probe = HangingSettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=FixtureClient(),
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    result = asyncio.run(daemon.run_once())
+
+    assert probe.calls == 1
+    assert probe.cancelled is True
+    assert result.markets_discovered == 1
+    assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
+    assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+    settlement = shadow.latest_events(event_type="PAPER_SETTLEMENT_SCAN", limit=1)[0]
+    assert settlement["payload"]["status"] == "SETTLEMENT_SCAN_TIMEOUT"
+    assert settlement["payload"]["reason"] == "PAPER_SETTLEMENT_SCAN_TIMEOUT"
 
 
 def test_expected_bucket_collection_failure_does_not_stop_cycle_or_other_buckets(
