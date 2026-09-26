@@ -552,13 +552,18 @@ class PublicShadowDataClient:
         )
         if raw_event_obj is None:
             return None
-        return self._stage_sync(
+        discovery = self._stage_sync(
             stages,
             "GAMMA_PARSE",
             bucket,
             slug=slug,
             operation=lambda: self._parse_discovery(raw_event_obj, bucket),
         )
+        if discovery is None:
+            return None
+        if not isinstance(discovery, MarketDiscovery):
+            raise TypeError("parsed discovery must be MarketDiscovery")
+        return discovery
 
     async def _stage(
         self,

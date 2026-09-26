@@ -12,10 +12,11 @@ from direction_engine_v3.domain import (
     OutcomeSide,
 )
 from direction_engine_v3.market_data import (
+    HORIZON_DURATIONS,
     OFFICIAL_REFERENCE_SOURCES,
+    SUPPORTED_MARKET_BUCKETS,
     DataSource,
     EventLineage,
-    HORIZON_DURATIONS,
     MarketBucket,
     MarketDataError,
     MarketDiscovery,
@@ -23,7 +24,6 @@ from direction_engine_v3.market_data import (
     ReferenceFreshnessPolicy,
     SettlementMetadata,
     SettlementMethod,
-    SUPPORTED_MARKET_BUCKETS,
 )
 from direction_engine_v3.market_data.official_runtime import PriceToBeatResolution
 from direction_engine_v3.shadow.ptb_scheduler import (
@@ -154,7 +154,9 @@ async def _assert_one_asset_failure_does_not_block_other_assets(tmp_path: Path) 
 
     events = shadow.latest_events(event_type="PTB_BOUNDARY_SCHEDULER", limit=20)
     payloads = [event["payload"] for event in events]
-    ready_assets = {payload["asset"] for payload in payloads if payload["ptb_status"] == "PTB_READY"}
+    ready_assets = {
+        payload["asset"] for payload in payloads if payload["ptb_status"] == "PTB_READY"
+    }
     exhausted_assets = {
         payload["asset"]
         for payload in payloads
