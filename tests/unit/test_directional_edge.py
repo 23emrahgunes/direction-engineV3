@@ -16,8 +16,14 @@ from direction_engine_v3.domain import (
     ProbabilityForecast,
     ProxyReference,
 )
-from direction_engine_v3.features import ExternalDirectionalSnapshot, build_directional_features
+from direction_engine_v3.features import (
+    ExternalDirectionalSnapshot,
+    ExternalTemporalState,
+    build_directional_features,
+)
 from direction_engine_v3.market_data import (
+    CryptoTopOfBook,
+    CryptoTrade,
     DataSource,
     EventLineage,
     FeeSchedule,
@@ -30,6 +36,7 @@ from direction_engine_v3.strategies.directional import (
     CalibrationReadiness,
     DirectionalPolicy,
     assess_directional_edge,
+    build_directional_decision_audit,
 )
 
 START = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
@@ -307,6 +314,186 @@ def test_stale_unstable_flipping_tied_and_low_edge_forecasts_abstain() -> None:
         policy=POLICY,
     )
     assert low.reason == "NET_EDGE_BELOW_MINIMUM"
+
+
+def test_signal_unstable_audit_exposes_first_gate_and_thresholds() -> None:
+    assessment = assess_directional_edge(
+        market(),
+        ptb(),
+        features(stability="0.60", flip_rate="0.40"),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW,
+        policy=POLICY,
+    )
+    audit = build_directional_decision_audit(
+        market(),
+        ptb(),
+        features(stability="0.60", flip_rate="0.40"),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW,
+        policy=POLICY,
+        assessment=assessment,
+        temporal_diagnostics={
+            "flip_count": 4,
+            "flip_denominator": 10,
+            "return_sample_count": 11,
+            "return_sign_count": 11,
+        },
+        pricing_status="EXECUTABLE_PRICE_READY",
+    )
+
+    assert assessment.reason == "SIGNAL_UNSTABLE"
+    assert audit["version"] == "DIRECTIONAL_DECISION_AUDIT_V1"
+    assert audit["first_failing_gate"] == "SIGNAL_STABILITY_GATE"
+    gates = audit["gates"]
+    assert isinstance(gates, dict)
+    assert gates["SIGNAL_STABILITY_GATE"]["status"] == "FAIL"
+    assert gates["FLIP_RATE_GATE"]["status"] == "NOT_REACHED"
+    assert gates["PRICING_GATE"]["status"] == "NOT_REACHED"
+    signal = audit["signal"]
+    assert isinstance(signal, dict)
+    assert signal["signal_stability_actual"] == "0.60"
+    assert signal["signal_stability_minimum"] == "0.70"
+    assert signal["flip_rate_actual"] == "0.40"
+    assert signal["flip_rate_maximum"] == "0.20"
+    assert signal["signal_stability_formula"] == "1 - flip_rate"
+    assert signal["flip_count"] == 4
+    pricing_payload = audit["pricing"]
+    assert isinstance(pricing_payload, dict)
+    assert pricing_payload["counterfactual_pricing_available"] is True
+
+
+def test_flip_rate_audit_keeps_current_policy_order() -> None:
+    assessment = assess_directional_edge(
+        market(),
+        ptb(),
+        features(stability="0.75", flip_rate="0.25"),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW,
+        policy=POLICY,
+    )
+    audit = build_directional_decision_audit(
+        market(),
+        ptb(),
+        features(stability="0.75", flip_rate="0.25"),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW,
+        policy=POLICY,
+        assessment=assessment,
+    )
+
+    assert assessment.reason == "FLIP_RATE_TOO_HIGH"
+    assert audit["first_failing_gate"] == "FLIP_RATE_GATE"
+    gates = audit["gates"]
+    assert isinstance(gates, dict)
+    assert gates["SIGNAL_STABILITY_GATE"]["status"] == "PASS"
+    assert gates["FLIP_RATE_GATE"]["status"] == "FAIL"
+
+
+def test_audit_does_not_change_trade_assessment_economics() -> None:
+    assessment = assess_directional_edge(
+        market(),
+        ptb(),
+        features(),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW + timedelta(milliseconds=100),
+        policy=POLICY,
+    )
+    audit = build_directional_decision_audit(
+        market(),
+        ptb(),
+        features(),
+        forecast(),
+        calibration(),
+        pricing("up"),
+        pricing("down"),
+        observed_at=NOW + timedelta(milliseconds=100),
+        policy=POLICY,
+        assessment=assessment,
+    )
+
+    assert assessment.action is DecisionAction.TRADE
+    assert assessment.reason == "PRE_RISK_CANDIDATE"
+    assert assessment.selected_side is OutcomeSide.UP
+    assert assessment.candidate is not None
+    assert audit["final_decision"] == "TRADE"
+    assert audit["first_failing_gate"] is None
+    assert audit["edge"]["net_edge"] == str(assessment.net_edge)
+
+
+def test_temporal_state_reports_diagnostic_counts_without_changing_snapshot() -> None:
+    state = ExternalTemporalState(max_age=timedelta(seconds=10), minimum_points=3)
+    for index, (seconds, value) in enumerate(
+        ((0, "100"), (1, "101"), (2, "100")), start=1
+    ):
+        ts = NOW - timedelta(seconds=seconds)
+        state.add_reference(
+            ProxyReference(
+                f"proxy-{index}",
+                "market-1",
+                Asset.BTC,
+                Decimal(value),
+                "binance-spot",
+                ts,
+                ts,
+                ts,
+            )
+        )
+    lineage = EventLineage(DataSource.BINANCE_SPOT, NOW, NOW, NOW, 1)
+    state.add_book(
+        CryptoTopOfBook(
+            Asset.BTC,
+            Decimal("99"),
+            Decimal("10"),
+            Decimal("101"),
+            Decimal("10"),
+            1,
+            lineage,
+        )
+    )
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 1, False, lineage)
+    )
+
+    result = state.build_snapshot(
+        asset=Asset.BTC,
+        current_reference=ProxyReference(
+            "proxy-current",
+            "market-1",
+            Asset.BTC,
+            Decimal("100"),
+            "binance-spot",
+            NOW,
+            NOW,
+            NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    assert result.snapshot is not None
+    assert result.diagnostics["scope"] == "asset_level"
+    assert result.diagnostics["reference_sample_count"] == 3
+    assert result.diagnostics["unique_reference_source_timestamp_count"] == 3
+    assert result.diagnostics["near_duplicate_reference_count"] == 2
+    assert result.diagnostics["return_sample_count"] == 2
+    assert result.diagnostics["return_sign_count"] == 2
+    assert result.diagnostics["flip_count"] == 1
+    assert result.diagnostics["flip_denominator"] == 1
 
 
 def test_selected_side_requires_full_identity_matched_executable_price() -> None:

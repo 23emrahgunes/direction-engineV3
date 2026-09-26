@@ -44,6 +44,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/paper/abstains"),
         ("GET", "/api/shadow/status"),
         ("GET", "/api/directional/status"),
+        ("GET", "/api/directional/audit"),
     }
     assert all(method == "GET" for method, _path in routes)
 
@@ -78,6 +79,8 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert response.content_type == "text/html"
     assert "Direction Engine V3" in body
     assert "PAPER / SHADOW" in body
+    assert "Trade Decision Breakdown" in body
+    assert "/api/directional/audit?hours=24" in body
     assert "NO REAL ORDER" in body
     assert "APP_MODE=PAPER" in body
     assert "LIVE_TRADING_ENABLED=false" in body
@@ -407,6 +410,99 @@ def test_directional_status_preserves_newest_strategy_event(tmp_path, monkeypatc
     asyncio.run(_assert_newest_strategy_event_is_visible())
 
 
+def test_directional_status_exposes_decision_audit_summary(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="strategy-audit",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "SIGNAL_UNSTABLE",
+            "p_up": "0.60",
+            "p_down": "0.40",
+            "pricing_status": "EXECUTABLE_PRICE_READY",
+            "decision_audit": {
+                "version": "DIRECTIONAL_DECISION_AUDIT_V1",
+                "final_decision": "ABSTAIN",
+                "final_reason": "SIGNAL_UNSTABLE",
+                "first_failing_gate": "SIGNAL_STABILITY_GATE",
+                "signal": {
+                    "signal_stability_actual": "0.60",
+                    "signal_stability_minimum": "0.70",
+                    "flip_rate_actual": "0.40",
+                    "flip_rate_maximum": "0.20",
+                },
+                "pricing": {
+                    "counterfactual_pricing_available": True,
+                    "counterfactual_net_edge": "0.04",
+                },
+                "edge": {"counterfactual_edge_margin": "0.01"},
+            },
+        },
+        observed_at=datetime(2026, 9, 15, 12, 2, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_directional_status_contains_decision_audit())
+
+
+def test_directional_audit_endpoint_uses_real_time_window_and_coverage(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    repository.append_event(
+        event_id="old",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={"strategy": "DIRECTIONAL_EDGE", "action": "ABSTAIN", "reason": "OLD"},
+        observed_at=datetime(2026, 9, 25, 11, 0, tzinfo=UTC),
+    )
+    repository.append_event(
+        event_id="legacy",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "UNKNOWN_NEW_REASON",
+        },
+        observed_at=datetime(2026, 9, 26, 12, 0, tzinfo=UTC),
+    )
+    repository.append_event(
+        event_id="audit",
+        window_id="window",
+        event_type="STRATEGY_EVALUATION",
+        bucket_key="BTC-5m",
+        payload={
+            "strategy": "DIRECTIONAL_EDGE",
+            "action": "ABSTAIN",
+            "reason": "SIGNAL_UNSTABLE",
+            "decision_audit": {
+                "version": "DIRECTIONAL_DECISION_AUDIT_V1",
+                "first_failing_gate": "SIGNAL_STABILITY_GATE",
+                "signal": {
+                    "signal_stability_actual": "0.60",
+                    "flip_rate_actual": "0.40",
+                    "signal_stability_minus_minimum": "-0.10",
+                    "maximum_flip_rate_minus_actual": "-0.20",
+                },
+                "edge": {"counterfactual_edge_margin": "0.02"},
+            },
+        },
+        observed_at=datetime(2026, 9, 26, 12, 2, tzinfo=UTC),
+    )
+
+    asyncio.run(_assert_directional_audit_endpoint())
+
+
 def test_directional_status_does_not_show_risk_reject_as_open_position(
     tmp_path, monkeypatch
 ) -> None:
@@ -540,6 +636,53 @@ async def _assert_newest_strategy_event_is_visible() -> None:
     assert bucket["selected_side"] == "UP"
     assert bucket["net_edge"] == "0.21"
     assert bucket["directional_execution"]["risk_approved"] is True
+
+
+async def _assert_directional_status_contains_decision_audit() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+    bucket = next(item for item in payload["buckets"] if item["asset"] == "BTC")
+    assert bucket["audit_version"] == "DIRECTIONAL_DECISION_AUDIT_V1"
+    assert bucket["first_failing_gate"] == "SIGNAL_STABILITY_GATE"
+    assert bucket["final_decision"] == "ABSTAIN"
+    assert bucket["final_reason"] == "SIGNAL_UNSTABLE"
+    assert bucket["signal_stability"] == "0.60"
+    assert bucket["minimum_signal_stability"] == "0.70"
+    assert bucket["flip_rate"] == "0.40"
+    assert bucket["maximum_flip_rate"] == "0.20"
+    assert bucket["counterfactual_net_edge"] == "0.04"
+    assert bucket["counterfactual_edge_margin"] == "0.01"
+    assert bucket["counterfactual_pricing_available"] is True
+
+
+async def _assert_directional_audit_endpoint() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/audit?hours=24")
+        payload = await response.json()
+    finally:
+        await client.close()
+    assert response.status == 200
+    assert payload["status"] == "DIRECTIONAL_DECISION_AUDIT_READY"
+    assert payload["version"] == "DIRECTIONAL_DECISION_AUDIT_V1"
+    assert payload["total_directional_evaluations"] == 2
+    assert payload["reason_counts"]["UNKNOWN_NEW_REASON"] == 1
+    assert payload["reason_counts"]["SIGNAL_UNSTABLE"] == 1
+    assert payload["audit_payload_coverage"] == {
+        "events_with_audit": 1,
+        "total_directional_evaluations": 2,
+    }
+    assert payload["first_failing_gate_counts"]["SIGNAL_STABILITY_GATE"] == 1
+    assert payload["signal_stability_distribution"]["median"] == "0.60"
+    assert payload["flip_rate_distribution"]["median"] == "0.40"
 
 
 async def _assert_risk_reject_is_not_open_position() -> None:

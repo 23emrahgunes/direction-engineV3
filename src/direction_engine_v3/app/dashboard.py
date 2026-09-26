@@ -1,7 +1,8 @@
 """Read-only dashboard snapshot assembly for V3.13."""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -279,6 +280,26 @@ def build_directional_runtime_status() -> dict[str, object]:
         latest_pipeline = pipeline_by_bucket.get(bucket_key)
         latest_payload = latest["payload"] if latest is not None else {}
         payload = dict(latest_payload) if isinstance(latest_payload, dict) else {}
+        audit_payload = payload.get("decision_audit")
+        decision_audit = dict(audit_payload) if isinstance(audit_payload, dict) else {}
+        signal_obj = decision_audit.get("signal")
+        pricing_obj = decision_audit.get("pricing")
+        edge_obj = decision_audit.get("edge")
+        audit_signal = (
+            dict(signal_obj)
+            if isinstance(signal_obj, dict)
+            else {}
+        )
+        audit_pricing = (
+            dict(pricing_obj)
+            if isinstance(pricing_obj, dict)
+            else {}
+        )
+        audit_edge = (
+            dict(edge_obj)
+            if isinstance(edge_obj, dict)
+            else {}
+        )
         pipeline_payload_obj = latest_pipeline["payload"] if latest_pipeline is not None else {}
         pipeline_payload = (
             dict(pipeline_payload_obj) if isinstance(pipeline_payload_obj, dict) else {}
@@ -341,6 +362,26 @@ def build_directional_runtime_status() -> dict[str, object]:
                 "executable_cost": payload.get("executable_cost"),
                 "net_edge": payload.get("net_edge"),
                 "directional_execution": payload.get("directional_execution", {}),
+                "decision_audit": decision_audit,
+                "audit_version": decision_audit.get("version"),
+                "first_failing_gate": decision_audit.get("first_failing_gate"),
+                "final_decision": decision_audit.get("final_decision", payload.get("action")),
+                "final_reason": decision_audit.get("final_reason", payload.get("reason")),
+                "signal_stability": audit_signal.get("signal_stability_actual"),
+                "minimum_signal_stability": audit_signal.get("signal_stability_minimum"),
+                "flip_rate": audit_signal.get("flip_rate_actual"),
+                "maximum_flip_rate": audit_signal.get("flip_rate_maximum"),
+                "counterfactual_net_edge": audit_edge.get(
+                    "counterfactual_net_edge",
+                    audit_pricing.get("counterfactual_net_edge"),
+                ),
+                "counterfactual_edge_margin": audit_edge.get(
+                    "counterfactual_edge_margin",
+                    audit_pricing.get("counterfactual_edge_margin"),
+                ),
+                "counterfactual_pricing_available": audit_pricing.get(
+                    "counterfactual_pricing_available"
+                ),
                 "current_losing_streak": _execution_field(
                     payload, "current_losing_streak"
                 ),
@@ -387,6 +428,99 @@ def build_directional_runtime_status() -> dict[str, object]:
     }
 
 
+def build_directional_decision_audit(*, hours: str | None = None) -> dict[str, object]:
+    lookback_hours = _safe_hours(hours)
+    generated_at = datetime.now(UTC)
+    since = generated_at - timedelta(hours=lookback_hours)
+    data_dir = runtime_data_dir()
+    shadow = SQLiteShadowRepository(data_dir / "shadow_evidence.sqlite3", read_only=True)
+    try:
+        events = shadow.events_since(
+            event_type="STRATEGY_EVALUATION",
+            observed_at=since,
+            limit=50_000,
+        )
+    except ShadowStorageUnavailable as exc:
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "status": "DATABASE_NOT_INITIALIZED",
+            "reason": str(exc),
+            "real_order_submission": False,
+        }
+    directional_events = [
+        event
+        for event in events
+        if isinstance(event.get("payload"), dict)
+        and dict(cast(dict[str, object], event["payload"])).get("strategy")
+        == "DIRECTIONAL_EDGE"
+    ]
+    reason_counts: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    gate_counts: dict[str, int] = {}
+    by_bucket: dict[str, list[dict[str, object]]] = {}
+    stability_values: list[Decimal] = []
+    flip_values: list[Decimal] = []
+    stability_distance_values: list[Decimal] = []
+    flip_distance_values: list[Decimal] = []
+    edge_distance_values: list[Decimal] = []
+    audit_count = 0
+    for event in directional_events:
+        payload = cast(dict[str, object], event["payload"])
+        action = str(payload.get("action", "UNKNOWN"))
+        reason = str(payload.get("reason", "UNKNOWN"))
+        action_counts[action] = action_counts.get(action, 0) + 1
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        bucket_key = str(event.get("bucket_key") or "UNKNOWN")
+        audit_obj = payload.get("decision_audit")
+        if isinstance(audit_obj, dict):
+            audit = dict(audit_obj)
+            audit_count += 1
+            by_bucket.setdefault(bucket_key, []).append(audit)
+            gate = audit.get("first_failing_gate")
+            if gate is not None:
+                gate_key = str(gate)
+                gate_counts[gate_key] = gate_counts.get(gate_key, 0) + 1
+            signal = audit.get("signal")
+            if isinstance(signal, dict):
+                _append_decimal(stability_values, signal.get("signal_stability_actual"))
+                _append_decimal(flip_values, signal.get("flip_rate_actual"))
+                _append_decimal(
+                    stability_distance_values,
+                    signal.get("signal_stability_minus_minimum"),
+                )
+                _append_decimal(
+                    flip_distance_values,
+                    signal.get("maximum_flip_rate_minus_actual"),
+                )
+            edge = audit.get("edge")
+            if isinstance(edge, dict):
+                _append_decimal(edge_distance_values, edge.get("counterfactual_edge_margin"))
+    return {
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "status": "DIRECTIONAL_DECISION_AUDIT_READY",
+        "version": "DIRECTIONAL_DECISION_AUDIT_V1",
+        "generated_at": generated_at.isoformat(),
+        "window": {"hours": lookback_hours, "since": since.isoformat()},
+        "real_order_submission": False,
+        "total_directional_evaluations": len(directional_events),
+        "action_counts": action_counts,
+        "reason_counts": reason_counts,
+        "first_failing_gate_counts": gate_counts,
+        "audit_payload_coverage": {
+            "events_with_audit": audit_count,
+            "total_directional_evaluations": len(directional_events),
+        },
+        "signal_stability_distribution": _distribution(stability_values),
+        "flip_rate_distribution": _distribution(flip_values),
+        "threshold_distance_distributions": {
+            "signal_stability_minus_minimum": _distribution(stability_distance_values),
+            "maximum_flip_rate_minus_actual": _distribution(flip_distance_values),
+            "counterfactual_edge_margin": _distribution(edge_distance_values),
+        },
+        "same_asset_cross_horizon": _same_asset_cross_horizon(by_bucket),
+    }
+
+
 def _paper_trades_for_directional_bucket(
     data_dir: Path, bucket: object
 ) -> tuple[object, ...]:
@@ -407,6 +541,102 @@ def _paper_trades_for_directional_bucket(
         )
     except Exception:
         return ()
+
+
+def _safe_hours(raw: str | None, *, default: int = 24, maximum: int = 72) -> int:
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("hours must be an integer") from exc
+    if value < 1:
+        raise ValueError("hours must be positive")
+    return min(value, maximum)
+
+
+def _append_decimal(target: list[Decimal], raw: object) -> None:
+    if raw is None:
+        return
+    try:
+        target.append(Decimal(str(raw)))
+    except Exception:
+        return
+
+
+def _distribution(values: list[Decimal]) -> dict[str, object]:
+    if not values:
+        return {"count": 0}
+    ordered = sorted(values)
+    count = len(ordered)
+    return {
+        "count": count,
+        "min": str(ordered[0]),
+        "p10": str(_percentile(ordered, Decimal("0.10"))),
+        "p25": str(_percentile(ordered, Decimal("0.25"))),
+        "median": str(_percentile(ordered, Decimal("0.50"))),
+        "p75": str(_percentile(ordered, Decimal("0.75"))),
+        "p90": str(_percentile(ordered, Decimal("0.90"))),
+        "max": str(ordered[-1]),
+        "mean": str(sum(ordered, Decimal("0")) / Decimal(count)),
+    }
+
+
+def _percentile(values: list[Decimal], quantile: Decimal) -> Decimal:
+    if len(values) == 1:
+        return values[0]
+    rank = quantile * Decimal(len(values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = rank - Decimal(lower)
+    return values[lower] + (values[upper] - values[lower]) * fraction
+
+
+def _same_asset_cross_horizon(
+    by_bucket: dict[str, list[dict[str, object]]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for asset in SUPPORTED_ASSETS:
+        rows: dict[str, object] = {}
+        stability_values: list[str | None] = []
+        flip_values: list[str | None] = []
+        for horizon in SUPPORTED_HORIZONS:
+            bucket_key = f"{asset}-{horizon}"
+            latest = by_bucket.get(bucket_key, [None])[0]
+            signal = latest.get("signal") if isinstance(latest, dict) else None
+            temporal = latest.get("temporal_state") if isinstance(latest, dict) else None
+            signal_payload = signal if isinstance(signal, dict) else {}
+            temporal_payload = temporal if isinstance(temporal, dict) else {}
+            stability = cast(object | None, signal_payload.get("signal_stability_actual"))
+            flip = cast(object | None, signal_payload.get("flip_rate_actual"))
+            stability_text = None if stability is None else str(stability)
+            flip_text = None if flip is None else str(flip)
+            stability_values.append(stability_text)
+            flip_values.append(flip_text)
+            rows[str(horizon)] = {
+                "signal_stability": stability_text,
+                "flip_rate": flip_text,
+                "reference_sample_count": temporal_payload.get("reference_sample_count"),
+                "unique_reference_source_timestamp_count": temporal_payload.get(
+                    "unique_reference_source_timestamp_count"
+                ),
+                "near_duplicate_reference_count": temporal_payload.get(
+                    "near_duplicate_reference_count"
+                ),
+            }
+        present_stability = [item for item in stability_values if item is not None]
+        present_flip = [item for item in flip_values if item is not None]
+        result[str(asset)] = {
+            "buckets": rows,
+            "same_signal_stability_values": (
+                len(set(present_stability)) == 1 if len(present_stability) > 1 else None
+            ),
+            "same_flip_rate_values": (
+                len(set(present_flip)) == 1 if len(present_flip) > 1 else None
+            ),
+            "shared_state_evidence": "asset_level_temporal_state_diagnostics",
+        }
+    return result
 
 
 def _paper_repository() -> SQLitePaperRepository:

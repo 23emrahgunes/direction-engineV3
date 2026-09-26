@@ -13,6 +13,7 @@ from aiohttp import web
 
 from direction_engine_v3.app.dashboard import (
     build_dashboard_snapshot,
+    build_directional_decision_audit,
     build_directional_runtime_status,
     build_paper_performance,
     build_paper_summary,
@@ -210,6 +211,14 @@ async def directional_status(request: web.Request) -> web.Response:
     return await _json_from_builder(request, build_directional_runtime_status)
 
 
+async def directional_audit(request: web.Request) -> web.Response:
+    return await _json_from_builder(
+        request,
+        build_directional_decision_audit,
+        hours=request.query.get("hours"),
+    )
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.cleanup_ctx.append(dashboard_api_executor)
@@ -228,6 +237,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/paper/abstains", paper_abstains, allow_head=False)
     app.router.add_get("/api/shadow/status", shadow_status, allow_head=False)
     app.router.add_get("/api/directional/status", directional_status, allow_head=False)
+    app.router.add_get("/api/directional/audit", directional_audit, allow_head=False)
     return app
 
 

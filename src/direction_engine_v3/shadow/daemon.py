@@ -128,6 +128,7 @@ from direction_engine_v3.strategies.directional import (
     DirectionalAssessment,
     DirectionalPolicy,
     assess_directional_edge,
+    build_directional_decision_audit,
 )
 from direction_engine_v3.strategies.structural_arb import (
     StructuralAction,
@@ -216,6 +217,7 @@ class ShadowMarketState:
     ptb_status: str = "PTB_UNAVAILABLE"
     ptb_reason: str = "OFFICIAL_PTB_UNAVAILABLE"
     feature_status: str = "FEATURES_UNAVAILABLE"
+    feature_diagnostics: Mapping[str, object] | None = None
     chainlink_status: Mapping[str, object] | None = None
     binance_hourly_status: Mapping[str, object] | None = None
     pipeline_stages: tuple[BucketPipelineStage, ...] = ()
@@ -470,6 +472,7 @@ class PublicShadowDataClient:
             )
         features = None
         feature_status = "FEATURES_UNAVAILABLE"
+        feature_diagnostics = None
         if proxy is not None:
             feature_result = self._stage_sync(
                 stages,
@@ -485,7 +488,7 @@ class PublicShadowDataClient:
                 ),
             )
             if feature_result is not None:
-                features, feature_status = feature_result
+                features, feature_status, feature_diagnostics = feature_result
         else:
             stages.append(
                 _stage_record(
@@ -508,6 +511,7 @@ class PublicShadowDataClient:
             unavailable_reason=_first_failure_reason(stages),
             price_to_beat=ptb_resolution.price_to_beat,
             directional_features=features,
+            feature_diagnostics=feature_diagnostics,
             ptb_status=ptb_resolution.ptb_status,
             ptb_reason=ptb_resolution.reason,
             feature_status=feature_status,
@@ -734,18 +738,18 @@ class PublicShadowDataClient:
         price_to_beat: PriceToBeatRecord | None,
         *,
         observed_at: datetime,
-    ) -> tuple[FeatureVector | None, str]:
+    ) -> tuple[FeatureVector | None, str, Mapping[str, object] | None]:
         if price_to_beat is None:
-            return None, "OFFICIAL_PTB_UNAVAILABLE"
+            return None, "OFFICIAL_PTB_UNAVAILABLE", None
         if self._feature_state is None:
-            return None, "FEATURE_STATE_UNAVAILABLE"
+            return None, "FEATURE_STATE_UNAVAILABLE", None
         result = self._feature_state.build_snapshot(
             asset=discovery.market.asset,
             current_reference=proxy,
             observed_at=observed_at,
         )
         if result.snapshot is None:
-            return None, result.reason
+            return None, result.reason, result.diagnostics
         return (
             build_directional_features(
                 discovery.market,
@@ -755,6 +759,7 @@ class PublicShadowDataClient:
                 feature_set_version="v3.15.3-directional-official-ptb",
             ),
             result.reason,
+            result.diagnostics,
         )
 
 
@@ -1156,6 +1161,13 @@ class ShadowDaemon:
         forecast, calibration, forecast_status = self._directional_forecast(
             state, model_status=model_status
         )
+        directional_policy = DirectionalPolicy(
+            minimum_net_edge=Decimal("0.03"),
+            uncertainty_buffer=Decimal("0.01"),
+            minimum_signal_stability=Decimal("0.70"),
+            maximum_flip_rate=Decimal("0.20"),
+            max_forecast_age=timedelta(seconds=5),
+        )
         assessment = assess_directional_edge(
             state.discovery.market,
             state.price_to_beat,
@@ -1165,13 +1177,7 @@ class ShadowDaemon:
             up_pricing,
             down_pricing,
             observed_at=state.observed_at,
-            policy=DirectionalPolicy(
-                minimum_net_edge=Decimal("0.03"),
-                uncertainty_buffer=Decimal("0.01"),
-                minimum_signal_stability=Decimal("0.70"),
-                maximum_flip_rate=Decimal("0.20"),
-                max_forecast_age=timedelta(seconds=5),
-            ),
+            policy=directional_policy,
         )
         trade_recorded = False
         directional_execution: dict[str, object] = {}
@@ -1190,6 +1196,21 @@ class ShadowDaemon:
                     else None,
                 )
             )
+        decision_audit = build_directional_decision_audit(
+            state.discovery.market,
+            state.price_to_beat,
+            state.directional_features,
+            forecast,
+            calibration,
+            up_pricing,
+            down_pricing,
+            observed_at=state.observed_at,
+            policy=directional_policy,
+            assessment=assessment,
+            temporal_diagnostics=state.feature_diagnostics,
+            pricing_status=pricing_status,
+            directional_execution=directional_execution,
+        )
         self._append_shadow_event(
             event_id=f"{cycle_id}:{state.discovery.market.condition_id}:directional",
             window_id=self._evidence_window.window_id,
@@ -1234,8 +1255,11 @@ class ShadowDaemon:
                 "executable_cost": str(assessment.executable_cost)
                 if assessment.executable_cost is not None
                 else None,
+                "executable_up_cost": _pricing_cost_payload(up_pricing),
+                "executable_down_cost": _pricing_cost_payload(down_pricing),
                 "net_edge": str(assessment.net_edge) if assessment.net_edge is not None else None,
                 "pricing_status": pricing_status,
+                "decision_audit": decision_audit,
                 "directional_execution": directional_execution,
                 "chainlink": dict(state.chainlink_status or {}),
                 "binance_hourly": dict(state.binance_hourly_status or {}),
@@ -2278,6 +2302,7 @@ def _pipeline_payload(state: ShadowMarketState) -> dict[str, object]:
         if state.price_to_beat is not None
         else None,
         "feature_status": state.feature_status,
+        "feature_diagnostics": dict(state.feature_diagnostics or {}),
         "feature_error": _combined_error(by_stage, ("FEATURE_BUILD",)),
         "chainlink": dict(state.chainlink_status or {}),
         "binance_hourly": dict(state.binance_hourly_status or {}),
@@ -2671,6 +2696,12 @@ def _feature_vector_payload(features: FeatureVector | None) -> dict[str, object]
             for item in features.features
         ],
     }
+
+
+def _pricing_cost_payload(pricing: DepthSimulation | None) -> str | None:
+    if pricing is None or pricing.all_in_cost_per_share is None:
+        return None
+    return str(pricing.all_in_cost_per_share)
 
 
 def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object] | None:

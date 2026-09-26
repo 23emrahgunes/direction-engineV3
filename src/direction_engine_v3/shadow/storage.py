@@ -277,6 +277,41 @@ class SQLiteShadowRepository:
             )
         return tuple(events)
 
+    def events_since(
+        self,
+        *,
+        event_type: str,
+        observed_at: datetime,
+        limit: int = 50_000,
+    ) -> tuple[dict[str, object], ...]:
+        require_text("event_type", event_type)
+        require_utc("observed_at", observed_at)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self._read_all(
+            (
+                "SELECT event_id,event_type,bucket_key,payload_json,observed_at "
+                "FROM shadow_events WHERE event_type=? AND observed_at>=? "
+                "ORDER BY observed_at DESC LIMIT ?"
+            ),
+            (event_type, observed_at.isoformat(), limit),
+        )
+        events: list[dict[str, object]] = []
+        for row in rows:
+            payload = json.loads(str(row[3]))
+            if not isinstance(payload, dict):
+                raise RuntimeError("stored shadow event payload is not an object")
+            events.append(
+                {
+                    "event_id": str(row[0]),
+                    "event_type": str(row[1]),
+                    "bucket_key": str(row[2]) if row[2] is not None else None,
+                    "payload": payload,
+                    "observed_at": str(row[4]),
+                }
+            )
+        return tuple(events)
+
     def _connect(self, *, write: bool = False) -> sqlite3.Connection:
         if write and self._read_only:
             raise ShadowStorageUnavailable("read-only shadow repository cannot write")

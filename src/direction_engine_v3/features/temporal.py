@@ -19,6 +19,7 @@ _ONE = Decimal("1")
 class TemporalFeatureResult:
     snapshot: ExternalDirectionalSnapshot | None
     reason: str
+    diagnostics: dict[str, object]
 
 
 class ExternalTemporalState:
@@ -57,15 +58,17 @@ class ExternalTemporalState:
         books = tuple(self._books.get(asset, ()))
         trades = tuple(self._trades.get(asset, ()))
         if current_reference.source_ts > observed_at:
-            return TemporalFeatureResult(None, "FEATURE_SOURCE_IN_FUTURE")
+            return TemporalFeatureResult(None, "FEATURE_SOURCE_IN_FUTURE", self._diagnostics(asset))
         if observed_at - current_reference.source_ts > self._max_age:
-            return TemporalFeatureResult(None, "EXTERNAL_REFERENCE_STALE")
+            return TemporalFeatureResult(None, "EXTERNAL_REFERENCE_STALE", self._diagnostics(asset))
         if len(references) < self._minimum_points:
-            return TemporalFeatureResult(None, "FEATURE_HISTORY_WARMING")
+            return TemporalFeatureResult(None, "FEATURE_HISTORY_WARMING", self._diagnostics(asset))
         if not books:
-            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE")
+            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE", self._diagnostics(asset))
         if not trades:
-            return TemporalFeatureResult(None, "EXTERNAL_TRADE_FLOW_STALE")
+            return TemporalFeatureResult(
+                None, "EXTERNAL_TRADE_FLOW_STALE", self._diagnostics(asset)
+            )
 
         prices = tuple(item.value for item in references)
         short_return = _return(prices[-2], prices[-1])
@@ -84,13 +87,13 @@ class ExternalTemporalState:
         latest_book = books[-1]
         book_source_ts = latest_book.lineage.source_ts or latest_book.lineage.recv_ts
         if book_source_ts > observed_at:
-            return TemporalFeatureResult(None, "EXTERNAL_BOOK_FUTURE")
+            return TemporalFeatureResult(None, "EXTERNAL_BOOK_FUTURE", self._diagnostics(asset))
         if observed_at - book_source_ts > self._max_age:
-            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE")
+            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE", self._diagnostics(asset))
         spread_mid = (latest_book.bid_price + latest_book.ask_price) / Decimal("2")
         depth_total = latest_book.bid_quantity + latest_book.ask_quantity
         if depth_total <= _ZERO:
-            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE")
+            return TemporalFeatureResult(None, "EXTERNAL_BOOK_STALE", self._diagnostics(asset))
         book_imbalance = (latest_book.bid_quantity - latest_book.ask_quantity) / depth_total
         microprice = (
             latest_book.ask_price * latest_book.bid_quantity
@@ -103,7 +106,9 @@ class ExternalTemporalState:
         )
         total_volume = sum((trade.quantity for trade in trades), _ZERO)
         if total_volume <= _ZERO:
-            return TemporalFeatureResult(None, "EXTERNAL_TRADE_FLOW_STALE")
+            return TemporalFeatureResult(
+                None, "EXTERNAL_TRADE_FLOW_STALE", self._diagnostics(asset)
+            )
         trade_imbalance = signed_volume / total_volume
 
         signs = [item > _ZERO for item in returns if item != _ZERO]
@@ -111,6 +116,12 @@ class ExternalTemporalState:
         flip_rate = Decimal(flips) / Decimal(max(len(signs) - 1, 1))
         signal_stability = _ONE - min(_ONE, flip_rate)
         regime_score = min(_ONE, realized_volatility * Decimal("100"))
+        diagnostics = self._diagnostics(
+            asset,
+            returns=returns,
+            signs=tuple(signs),
+            flip_count=flips,
+        )
         return TemporalFeatureResult(
             ExternalDirectionalSnapshot(
                 current_reference=current_reference,
@@ -130,6 +141,7 @@ class ExternalTemporalState:
                 source_ts=max(current_reference.source_ts, book_source_ts),
             ),
             "FEATURES_READY",
+            diagnostics,
         )
 
     def _prune(self, asset: Asset, observed_at: datetime) -> None:
@@ -146,6 +158,43 @@ class ExternalTemporalState:
                     break
                 queue.popleft()
 
+    def _diagnostics(
+        self,
+        asset: Asset,
+        *,
+        returns: tuple[Decimal, ...] = (),
+        signs: tuple[bool, ...] = (),
+        flip_count: int = 0,
+    ) -> dict[str, object]:
+        references = tuple(self._references.get(asset, ()))
+        books = tuple(self._books.get(asset, ()))
+        trades = tuple(self._trades.get(asset, ()))
+        reference_ts = tuple(item.source_ts for item in references)
+        book_ts = tuple(item.lineage.source_ts or item.lineage.recv_ts for item in books)
+        trade_ts = tuple(item.lineage.source_ts or item.lineage.recv_ts for item in trades)
+        return {
+            "scope": "asset_level",
+            "asset": asset.value,
+            "near_duplicate_interval_seconds": 2,
+            "reference_sample_count": len(references),
+            "book_sample_count": len(books),
+            "trade_sample_count": len(trades),
+            "unique_reference_source_timestamp_count": len(set(reference_ts)),
+            "unique_book_source_timestamp_count": len(set(book_ts)),
+            "unique_trade_source_timestamp_count": len(set(trade_ts)),
+            "near_duplicate_reference_count": _near_duplicate_count(reference_ts),
+            "near_duplicate_book_count": _near_duplicate_count(book_ts),
+            "near_duplicate_trade_count": _near_duplicate_count(trade_ts),
+            "return_sample_count": len(returns),
+            "return_count": len(returns),
+            "nonzero_return_count": sum(1 for item in returns if item != _ZERO),
+            "return_sign_count": len(signs),
+            "positive_return_sign_count": sum(1 for item in signs if item),
+            "negative_return_sign_count": sum(1 for item in signs if not item),
+            "flip_count": flip_count,
+            "flip_denominator": max(len(signs) - 1, 1),
+        }
+
 
 def _return(previous: Decimal, current: Decimal) -> Decimal:
     if previous <= _ZERO:
@@ -157,3 +206,12 @@ def _mean_abs(values: tuple[Decimal, ...]) -> Decimal:
     if not values:
         return _ZERO
     return sum((abs(item) for item in values), _ZERO) / Decimal(len(values))
+
+
+def _near_duplicate_count(timestamps: tuple[datetime, ...]) -> int:
+    ordered = tuple(sorted(timestamps))
+    return sum(
+        1
+        for left, right in pairwise(ordered)
+        if timedelta(0) <= right - left <= timedelta(seconds=2)
+    )
