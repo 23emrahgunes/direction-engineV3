@@ -94,6 +94,20 @@ class ProgrammingFailureClient:
         raise RuntimeError("programming defect")
 
 
+class HangingBucketClient:
+    def __init__(self) -> None:
+        self.cancelled = 0
+
+    async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
+        if bucket == MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        return ShadowMarketState(bucket, None, None, None, None, None, None, now, "fixture")
+
+
 class SettlementProbe:
     def __init__(self) -> None:
         self.calls = 0
@@ -323,6 +337,53 @@ def test_expected_bucket_collection_failure_does_not_stop_cycle_or_other_buckets
         item.reason == "MARKET_DATA_ERROR:COLLECT_BUCKET"
         for item in paper.abstains()
     )
+
+
+def test_bucket_collection_timeout_records_bucket_failure_and_cycle_continues(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "direction_engine_v3.shadow.daemon._BUCKET_COLLECTION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
+    paper.initialize()
+    shadow.initialize()
+    client = HangingBucketClient()
+    probe = SettlementProbe()
+    window = new_evidence_window(
+        aws_user_id="user",
+        aws_account="account",
+        aws_arn="arn:aws:iam::123456789012:user/test",
+        started_at=NOW,
+        commit="abcdef1234567890",
+    )
+    shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
+    daemon = ShadowDaemon(
+        data_client=client,
+        paper_repository=paper,
+        shadow_repository=shadow,
+        evidence_window=window,
+        report_dir=tmp_path,
+        settlement_service=probe,
+        clock=StaticClock(),
+        poll_seconds=1,
+    )
+
+    result = asyncio.run(daemon.run_once())
+
+    assert client.cancelled == 1
+    assert result.markets_discovered == 0
+    assert shadow.event_counts()["PAPER_SETTLEMENT_SCAN"] == 1
+    assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
+    bucket_event = shadow.latest_events(
+        event_type="MARKET_DATA_PIPELINE",
+        bucket_key="BTC-5m",
+        limit=1,
+    )[0]
+    assert bucket_event["payload"]["unavailable_reason"] == "TRANSPORT_TIMEOUT:COLLECT_BUCKET"
 
 
 def test_unexpected_bucket_collection_failure_still_raises_after_settlement_scan(

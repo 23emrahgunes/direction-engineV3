@@ -152,6 +152,7 @@ _PAPER_RECENT_PERFORMANCE_LIMIT = 20
 _PAPER_RECENT_MIN_WIN_RATE = Decimal("0.35")
 _PAPER_RECENT_MAX_LOSS_USDC = Decimal("-5.00")
 _PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS = 20.0
+_BUCKET_COLLECTION_TIMEOUT_SECONDS = 75.0
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -820,7 +821,10 @@ class ShadowDaemon:
         market_selection_at = self._clock.utc_now()
         collected = await asyncio.gather(
             *(
-                self._data_client.collect_bucket(bucket, now=market_selection_at)
+                asyncio.wait_for(
+                    self._data_client.collect_bucket(bucket, now=market_selection_at),
+                    timeout=_BUCKET_COLLECTION_TIMEOUT_SECONDS,
+                )
                 for bucket in SUPPORTED_MARKET_BUCKETS
             ),
             return_exceptions=True,
@@ -2103,6 +2107,7 @@ def _pipeline_payload(state: ShadowMarketState) -> dict[str, object]:
         "latest_observed_at": state.observed_at.isoformat(),
         "market_id": market.market_id if market is not None else None,
         "condition_id": market.condition_id if market is not None else None,
+        "unavailable_reason": state.unavailable_reason,
         "discovery_status": _combined_status(by_stage, ("GAMMA_FETCH", "GAMMA_PARSE")),
         "discovery_error": _combined_error(by_stage, ("GAMMA_FETCH", "GAMMA_PARSE")),
         "book_status": _combined_status(
