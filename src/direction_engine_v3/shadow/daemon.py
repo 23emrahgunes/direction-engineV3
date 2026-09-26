@@ -116,6 +116,7 @@ from direction_engine_v3.shadow.evidence import (
     EvidenceFingerprint,
     EvidenceWindow,
 )
+from direction_engine_v3.shadow.ptb_scheduler import PTBBoundaryScheduler
 from direction_engine_v3.shadow.reporting import build_shadow_summary, write_reports
 from direction_engine_v3.shadow.storage import (
     ShadowStartupStorageDiagnostic,
@@ -266,30 +267,8 @@ class PublicShadowDataClient:
         window = window_containing(bucket, now)
         slug = _slug(bucket, window.start)
         stages: list[BucketPipelineStage] = []
-        raw_event = await self._stage(
-            stages,
-            "GAMMA_FETCH",
-            bucket,
-            slug=slug,
-            operation=lambda: self._transport.get_json(_EVENT_URL.format(slug=slug)),
-        )
-        if raw_event is None:
-            return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
-        raw_event_obj = self._stage_sync(
-            stages,
-            "GAMMA_PARSE",
-            bucket,
-            slug=slug,
-            operation=lambda: _object(raw_event, "Gamma event"),
-        )
-        if raw_event_obj is None:
-            return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
-        discovery = self._stage_sync(
-            stages,
-            "GAMMA_PARSE",
-            bucket,
-            slug=slug,
-            operation=lambda: self._parse_discovery(raw_event_obj, bucket),
+        discovery = await self._discover_market_with_stages(
+            bucket, window_start=window.start, stages=stages
         )
         if discovery is None:
             return self._unavailable_state(bucket, stages, "MARKET_NOT_AVAILABLE")
@@ -534,6 +513,51 @@ class PublicShadowDataClient:
             pipeline_stages=tuple(stages),
             up_fee_schedule=up_fee,
             down_fee_schedule=down_fee,
+        )
+
+    async def discover_market(
+        self, bucket: MarketBucket, *, window_start: datetime
+    ) -> MarketDiscovery:
+        stages: list[BucketPipelineStage] = []
+        discovery = await self._discover_market_with_stages(
+            bucket, window_start=window_start, stages=stages
+        )
+        if discovery is None:
+            raise MarketDataError(_first_failure_reason(stages) or "MARKET_NOT_AVAILABLE")
+        return discovery
+
+    async def _discover_market_with_stages(
+        self,
+        bucket: MarketBucket,
+        *,
+        window_start: datetime,
+        stages: list[BucketPipelineStage],
+    ) -> MarketDiscovery | None:
+        slug = _slug(bucket, window_start)
+        raw_event = await self._stage(
+            stages,
+            "GAMMA_FETCH",
+            bucket,
+            slug=slug,
+            operation=lambda: self._transport.get_json(_EVENT_URL.format(slug=slug)),
+        )
+        if raw_event is None:
+            return None
+        raw_event_obj = self._stage_sync(
+            stages,
+            "GAMMA_PARSE",
+            bucket,
+            slug=slug,
+            operation=lambda: _object(raw_event, "Gamma event"),
+        )
+        if raw_event_obj is None:
+            return None
+        return self._stage_sync(
+            stages,
+            "GAMMA_PARSE",
+            bucket,
+            slug=slug,
+            operation=lambda: self._parse_discovery(raw_event_obj, bucket),
         )
 
     async def _stage(
@@ -2257,15 +2281,16 @@ async def run_daemon(
     async with PublicTransport(timeout_seconds=15) as transport:
         chainlink = ChainlinkTwapCollector(transport, clock)
         binance_hourly = BinanceHourlyOfficialCollector(transport, clock)
+        ptb_policy = ReferenceFreshnessPolicy(
+            max_source_age=timedelta(seconds=120),
+            max_receive_latency=timedelta(seconds=120),
+            boundary_tolerance=timedelta(seconds=90),
+        )
         official_ptb = OfficialPriceToBeatService(
             repository=ptb_repository,
             chainlink=chainlink,
             binance_hourly=binance_hourly,
-            policy=ReferenceFreshnessPolicy(
-                max_source_age=timedelta(seconds=120),
-                max_receive_latency=timedelta(seconds=120),
-                boundary_tolerance=timedelta(seconds=90),
-            ),
+            policy=ptb_policy,
         )
         feature_state = ExternalTemporalState(max_age=timedelta(seconds=120), minimum_points=3)
         settlement_service = PaperSettlementService(
@@ -2275,13 +2300,14 @@ async def run_daemon(
             clock=clock,
             max_trades_per_pass=1,
         )
+        data_client = PublicShadowDataClient(
+            transport,
+            clock,
+            official_ptb=official_ptb,
+            feature_state=feature_state,
+        )
         daemon = ShadowDaemon(
-            data_client=PublicShadowDataClient(
-                transport,
-                clock,
-                official_ptb=official_ptb,
-                feature_state=feature_state,
-            ),
+            data_client=data_client,
             paper_repository=paper,
             shadow_repository=shadow,
             evidence_window=evidence_window,
@@ -2302,15 +2328,46 @@ async def run_daemon(
                 with suppress(asyncio.CancelledError):
                     await collector_task
         stop = asyncio.Event()
+        scheduler = PTBBoundaryScheduler(
+            discovery_client=data_client,
+            official_ptb=official_ptb,
+            shadow_repository=shadow,
+            evidence_window_id=evidence_window.window_id,
+            clock=clock,
+            policy=ptb_policy,
+        )
         loop = asyncio.get_running_loop()
         for item in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(item, stop.set)
+        daemon_task = asyncio.create_task(daemon.run_forever(stop), name="shadow-daemon")
+        scheduler_task = asyncio.create_task(
+            scheduler.run(stop), name="ptb-boundary-scheduler"
+        )
         try:
-            await daemon.run_forever(stop)
+            done, pending = await asyncio.wait(
+                {daemon_task, scheduler_task}, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    stop.set()
+                    raise exc
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            stop.set()
+            await scheduler.cancel()
             collector_stop.set()
             collector_task.cancel()
+            for task in (daemon_task, scheduler_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(daemon_task, scheduler_task, return_exceptions=True)
             with suppress(asyncio.CancelledError):
                 await collector_task
     return None
