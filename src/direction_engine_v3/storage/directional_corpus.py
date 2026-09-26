@@ -57,6 +57,25 @@ class SQLiteDirectionalCorpusRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_directional_corpus_condition_observed
+                ON directional_corpus(condition_id, observed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_directional_corpus_bucket_observed
+                ON directional_corpus(asset, horizon, observed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_directional_corpus_training_ready
+                ON directional_corpus(asset, horizon, observed_at)
+                WHERE outcome_json IS NOT NULL
+                """
+            )
 
     def save_pre_outcome(
         self,
@@ -233,20 +252,24 @@ class SQLiteDirectionalCorpusRepository:
         return int(row[0])
 
     def training_ready_records(
-        self, *, asset: Asset, horizon: Horizon
+        self, *, asset: Asset, horizon: Horizon, limit: int | None = None
     ) -> tuple[DirectionalTrainingRecord, ...]:
         """Return official-outcome labeled records with complete feature vectors."""
 
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        query = """
+            SELECT record_id,condition_id,observed_at,payload_json,outcome_json
+            FROM directional_corpus
+            WHERE asset=? AND horizon=? AND outcome_json IS NOT NULL
+            ORDER BY observed_at ASC
+            """
+        params: tuple[object, ...] = (asset.value, horizon.value)
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (*params, limit)
         with sqlite3.connect(self._path) as connection:
-            rows = connection.execute(
-                """
-                SELECT record_id,condition_id,observed_at,payload_json,outcome_json
-                FROM directional_corpus
-                WHERE asset=? AND horizon=? AND outcome_json IS NOT NULL
-                ORDER BY observed_at ASC
-                """,
-                (asset.value, horizon.value),
-            ).fetchall()
+            rows = connection.execute(query, params).fetchall()
         records: list[DirectionalTrainingRecord] = []
         for row in rows:
             payload = json.loads(str(row[3]))

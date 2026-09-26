@@ -69,18 +69,25 @@ def load_paper_registry_from_corpus(
     repository: SQLiteDirectionalCorpusRepository | None,
     *,
     minimum_samples: int = 100,
+    max_records_per_bucket: int | None = None,
 ) -> PaperRegistryLoadResult:
     """Build exact-bucket PAPER models from labeled official-outcome corpus records."""
 
     if minimum_samples < 1:
         raise ValueError("minimum_samples must be positive")
+    if max_records_per_bucket is not None and max_records_per_bucket < minimum_samples:
+        raise ValueError("max_records_per_bucket must be at least minimum_samples")
     states: list[BucketModelState] = []
     reports: list[PaperBucketTrainingReport] = []
     for bucket in SUPPORTED_MARKET_BUCKETS:
         records = (
             ()
             if repository is None
-            else repository.training_ready_records(asset=bucket.asset, horizon=bucket.horizon)
+            else repository.training_ready_records(
+                asset=bucket.asset,
+                horizon=bucket.horizon,
+                limit=max_records_per_bucket,
+            )
         )
         count = len({item.condition_id for item in records})
         if count < minimum_samples:

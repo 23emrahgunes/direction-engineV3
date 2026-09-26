@@ -153,6 +153,7 @@ _PAPER_RECENT_MIN_WIN_RATE = Decimal("0.35")
 _PAPER_RECENT_MAX_LOSS_USDC = Decimal("-5.00")
 _PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS = 20.0
 _BUCKET_COLLECTION_TIMEOUT_SECONDS = 75.0
+_PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET = 2_000
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -784,8 +785,28 @@ class ShadowDaemon:
         self._settlement_service = settlement_service
         self._clock = clock or SystemClock()
         self._poll_seconds = poll_seconds
+        model_registry_started_monotonic = self._clock.monotonic_ns()
+        _shadow_runtime_log(
+            "PAPER_MODEL_REGISTRY_LOAD_START",
+            window_id=evidence_window.window_id,
+            corpus_configured=directional_corpus_repository is not None,
+            max_records_per_bucket=_PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET,
+        )
         self._paper_model_result = load_paper_registry_from_corpus(
-            directional_corpus_repository
+            directional_corpus_repository,
+            max_records_per_bucket=_PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET,
+        )
+        model_registry_elapsed_ms = (
+            self._clock.monotonic_ns() - model_registry_started_monotonic
+        ) / 1_000_000
+        _shadow_runtime_log(
+            "PAPER_MODEL_REGISTRY_LOAD_DONE",
+            window_id=evidence_window.window_id,
+            elapsed_ms=round(model_registry_elapsed_ms, 3),
+            report_count=len(self._paper_model_result.reports),
+            ready_bucket_count=sum(
+                1 for item in self._paper_model_result.reports if item.state == "SHADOW_CANDIDATE"
+            ),
         )
         self._registry = self._paper_model_result.registry
 
@@ -2409,7 +2430,17 @@ async def run_daemon(
         payload=evidence_window.as_dict()
         | {"previous_report_only_window_invalid_for_strategy_burn_in": True},
     )
+    _shadow_runtime_log(
+        "SHADOW_POST_STARTUP_INIT_START",
+        window_id=evidence_window.window_id,
+        code_commit=commit,
+    )
     async with PublicTransport(timeout_seconds=15) as transport:
+        _shadow_runtime_log(
+            "SHADOW_PUBLIC_TRANSPORT_READY",
+            window_id=evidence_window.window_id,
+            code_commit=commit,
+        )
         chainlink = ChainlinkTwapCollector(transport, clock)
         binance_hourly = BinanceHourlyOfficialCollector(transport, clock)
         ptb_policy = ReferenceFreshnessPolicy(
@@ -2437,6 +2468,11 @@ async def run_daemon(
             official_ptb=official_ptb,
             feature_state=feature_state,
         )
+        _shadow_runtime_log(
+            "SHADOW_DAEMON_CONSTRUCT_START",
+            window_id=evidence_window.window_id,
+            code_commit=commit,
+        )
         daemon = ShadowDaemon(
             data_client=data_client,
             paper_repository=paper,
@@ -2447,6 +2483,11 @@ async def run_daemon(
             settlement_service=settlement_service,
             clock=clock,
             poll_seconds=poll_seconds,
+        )
+        _shadow_runtime_log(
+            "SHADOW_DAEMON_CONSTRUCT_DONE",
+            window_id=evidence_window.window_id,
+            code_commit=commit,
         )
         collector_stop = asyncio.Event()
         collector_task = asyncio.create_task(chainlink.run(collector_stop))

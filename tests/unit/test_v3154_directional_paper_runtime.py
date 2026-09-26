@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -67,6 +68,41 @@ def test_directional_corpus_requires_feature_vector_and_official_outcome(tmp_pat
     assert records[0].outcome_up is True
 
 
+def test_directional_corpus_training_ready_query_is_indexed_and_boundable(tmp_path) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+    for index in range(3):
+        repository.save_pre_outcome(
+            record_id=f"official-label-{index}",
+            asset=Asset.BTC,
+            horizon=Horizon.FIVE_MINUTES,
+            condition_id=f"condition-{index}",
+            observed_at=NOW + timedelta(seconds=index),
+            payload=_training_payload(),
+        )
+        repository.attach_verified_outcome_once(
+            record_id=f"official-label-{index}",
+            outcome={"settlement_source_kind": "OFFICIAL", "outcome_up": index % 2 == 0},
+            attached_at=NOW + timedelta(minutes=5),
+        )
+
+    records = repository.training_ready_records(
+        asset=Asset.BTC, horizon=Horizon.FIVE_MINUTES, limit=2
+    )
+    with sqlite3.connect(tmp_path / "corpus.sqlite3") as connection:
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(directional_corpus)").fetchall()
+        }
+
+    assert [record.record_id for record in records] == [
+        "official-label-0",
+        "official-label-1",
+    ]
+    assert "idx_directional_corpus_training_ready" in indexes
+    assert "idx_directional_corpus_condition_observed" in indexes
+
+
 def test_paper_registry_reports_exact_bucket_insufficient_sample_without_fallback(
     tmp_path,
 ) -> None:
@@ -98,6 +134,18 @@ def test_paper_registry_reports_exact_bucket_insufficient_sample_without_fallbac
     eth_state = result.registry.state_for(MarketBucket(Asset.ETH, Horizon.FIVE_MINUTES))
     assert btc_state.readiness.ready is False
     assert eth_state.readiness.ready is False
+
+
+def test_paper_registry_loader_rejects_too_small_startup_bound(tmp_path) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+
+    with pytest.raises(ValueError, match="max_records_per_bucket"):
+        load_paper_registry_from_corpus(
+            repository,
+            minimum_samples=2,
+            max_records_per_bucket=1,
+        )
 
 
 def test_paper_research_baseline_is_deterministic_external_only_and_unpromotable() -> None:
