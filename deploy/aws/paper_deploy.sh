@@ -160,6 +160,19 @@ stop_project_runtime_units() {
   systemctl stop direction-engine-v3-shadow.service || true
 }
 
+require_active_unit() {
+  local unit="$1"
+  local failure_exit="${2:-31}"
+  if systemctl is-active --quiet "$unit"; then
+    return 0
+  fi
+  echo "Required project unit is not active: $unit" >&2
+  systemctl show -p Id -p ActiveState -p SubState -p MainPID -p NRestarts -p InvocationID "$unit" || true
+  systemctl --no-pager --full status "$unit" || true
+  journalctl -u "$unit" --since "$DEPLOY_STARTED_AT" --no-pager -n 120 || true
+  exit "$failure_exit"
+}
+
 start_shadow_and_wait_ready() {
   STAGE="shadow-startup"
   local shadow_started_at
@@ -170,8 +183,15 @@ start_shadow_and_wait_ready() {
 
 start_dashboard_and_report() {
   STAGE="dashboard-report-start"
+  systemctl reset-failed direction-engine-v3-dashboard.service || true
   systemctl restart direction-engine-v3-dashboard.service
-  systemctl restart direction-engine-v3-shadow-report.timer
+  require_active_unit direction-engine-v3-dashboard.service 31
+  systemctl reset-failed direction-engine-v3-shadow-report.timer direction-engine-v3-shadow-report.service || true
+  if ! systemctl restart direction-engine-v3-shadow-report.timer; then
+    log "WARN shadow report timer did not start during deploy; continuing with shadow/dashboard smoke"
+    systemctl --no-pager --full status direction-engine-v3-shadow-report.timer || true
+    journalctl -u direction-engine-v3-shadow-report.timer --since "$DEPLOY_STARTED_AT" --no-pager -n 80 || true
+  fi
 }
 
 shadow_startup_ready() {
@@ -350,8 +370,8 @@ PY
 
 smoke_check() {
   STAGE="fast-smoke"
-  systemctl is-active --quiet direction-engine-v3-shadow.service
-  systemctl is-active --quiet direction-engine-v3-dashboard.service
+  require_active_unit direction-engine-v3-shadow.service 30
+  require_active_unit direction-engine-v3-dashboard.service 31
   local restarts_before restarts_after cycles_before cycles_after cycle_ts_before cycle_ts_after
   local settlement_before settlement_after settlement_ts_before settlement_ts_after
   local chainlink_gate_status smoke_started_at runtime_health_status
@@ -362,8 +382,8 @@ smoke_check() {
   settlement_before="$(settlement_scan_count)"
   settlement_ts_before="$(latest_settlement_scan_ts)"
   sleep 45
-  systemctl is-active --quiet direction-engine-v3-shadow.service
-  systemctl is-active --quiet direction-engine-v3-dashboard.service
+  require_active_unit direction-engine-v3-shadow.service 30
+  require_active_unit direction-engine-v3-dashboard.service 31
   restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
   cycles_after="$(cycle_count)"
   cycle_ts_after="$(latest_cycle_ts)"
