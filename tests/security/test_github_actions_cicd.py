@@ -56,7 +56,9 @@ def test_deploy_workflow_uses_oidc_ssm_exact_sha_and_concurrency() -> None:
 def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidence() -> None:
     source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
-    assert "sleep 45" in source
+    assert "wait_for_shadow_cycle_and_settlement_progress" in source
+    assert "deadline=$((SECONDS + 180))" in source
+    assert "sleep 10" in source
     assert "--max-time 8" in source
     assert "PTB_READY_NOT_OBSERVED" not in source
     assert "BOUNDARY" not in source

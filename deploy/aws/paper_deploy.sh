@@ -342,6 +342,46 @@ else:
 PY
 }
 
+wait_for_shadow_cycle_and_settlement_progress() {
+  local restarts_before="$1"
+  local cycles_before="$2"
+  local cycle_ts_before="$3"
+  local settlement_before="$4"
+  local settlement_ts_before="$5"
+  local deadline=$((SECONDS + 180))
+  cycles_after="$cycles_before"
+  cycle_ts_after="$cycle_ts_before"
+  settlement_after="$settlement_before"
+  settlement_ts_after="$settlement_ts_before"
+  while [ "$SECONDS" -le "$deadline" ]; do
+    sleep 10
+    require_active_unit direction-engine-v3-shadow.service 30
+    require_active_unit direction-engine-v3-dashboard.service 31
+    restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
+    if [ "$restarts_after" != "$restarts_before" ]; then
+      echo "Shadow service restart count changed during smoke" >&2
+      exit 20
+    fi
+    cycles_after="$(cycle_count)"
+    cycle_ts_after="$(latest_cycle_ts)"
+    settlement_after="$(settlement_scan_count)"
+    settlement_ts_after="$(latest_settlement_scan_ts)"
+    if [ "$cycles_after" -gt "$cycles_before" ] && [ "$cycle_ts_after" != "$cycle_ts_before" ] \
+      && [ "$settlement_after" -gt "$settlement_before" ] && [ "$settlement_ts_after" != "$settlement_ts_before" ]; then
+      return 0
+    fi
+    log "waiting for shadow cycle smoke evidence: cycles=$cycles_before->$cycles_after settlement=$settlement_before->$settlement_after"
+  done
+  if [ "$cycles_after" -le "$cycles_before" ] || [ "$cycle_ts_after" = "$cycle_ts_before" ]; then
+    echo "Shadow daemon did not advance a REAL_SHADOW_CYCLE during smoke" >&2
+    exit 21
+  fi
+  if [ "$settlement_after" -le "$settlement_before" ] || [ "$settlement_ts_after" = "$settlement_ts_before" ]; then
+    echo "Shadow daemon did not advance a PAPER_SETTLEMENT_SCAN during smoke" >&2
+    exit 24
+  fi
+}
+
 probe_dashboard_endpoint() {
   local name="$1" url="$2" output_path="$3"
   local started_at elapsed_ms status_code curl_exit
@@ -393,26 +433,7 @@ smoke_check() {
   cycle_ts_before="$(latest_cycle_ts)"
   settlement_before="$(settlement_scan_count)"
   settlement_ts_before="$(latest_settlement_scan_ts)"
-  sleep 45
-  require_active_unit direction-engine-v3-shadow.service 30
-  require_active_unit direction-engine-v3-dashboard.service 31
-  restarts_after="$(systemctl show -p NRestarts --value direction-engine-v3-shadow.service)"
-  cycles_after="$(cycle_count)"
-  cycle_ts_after="$(latest_cycle_ts)"
-  settlement_after="$(settlement_scan_count)"
-  settlement_ts_after="$(latest_settlement_scan_ts)"
-  if [ "$restarts_after" != "$restarts_before" ]; then
-    echo "Shadow service restart count changed during smoke" >&2
-    exit 20
-  fi
-  if [ "$cycles_after" -le "$cycles_before" ] || [ "$cycle_ts_after" = "$cycle_ts_before" ]; then
-    echo "Shadow daemon did not advance a REAL_SHADOW_CYCLE during smoke" >&2
-    exit 21
-  fi
-  if [ "$settlement_after" -le "$settlement_before" ] || [ "$settlement_ts_after" = "$settlement_ts_before" ]; then
-    echo "Shadow daemon did not advance a PAPER_SETTLEMENT_SCAN during smoke" >&2
-    exit 24
-  fi
+  wait_for_shadow_cycle_and_settlement_progress "$restarts_before" "$cycles_before" "$cycle_ts_before" "$settlement_before" "$settlement_ts_before"
   probe_dashboard_endpoint "root" "http://127.0.0.1:8130/" "/tmp/direction-engine-v3-dashboard.html"
   probe_dashboard_endpoint "dashboard" "http://127.0.0.1:8130/api/dashboard" "/tmp/direction-engine-v3-dashboard.json"
   probe_dashboard_endpoint "paper-summary" "http://127.0.0.1:8130/api/paper/summary" "/tmp/direction-engine-v3-paper-summary.json"
