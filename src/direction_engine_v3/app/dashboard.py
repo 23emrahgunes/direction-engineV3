@@ -398,6 +398,24 @@ def build_directional_runtime_status() -> dict[str, object]:
                     payload, "risk_brake_active", False
                 ),
                 "risk_brake_reason": _execution_field(payload, "risk_brake_reason"),
+                "risk_observation_reasons": _execution_field(
+                    payload, "risk_observation_reasons", ()
+                ),
+                "risk_stake_reduced": _execution_field(
+                    payload, "risk_stake_reduced", False
+                ),
+                "risk_stake_reduction_reason": _execution_field(
+                    payload, "risk_stake_reduction_reason"
+                ),
+                "reduced_stake_cap_usdc": _execution_field(
+                    payload, "reduced_stake_cap_usdc"
+                ),
+                "original_required_capital": _execution_field(
+                    payload, "original_required_capital"
+                ),
+                "effective_required_capital": _execution_field(
+                    payload, "effective_required_capital"
+                ),
                 "paper_current_equity": _execution_field(payload, "paper_current_equity"),
                 "open_cost_basis": _execution_field(payload, "open_cost_basis"),
                 "open_trade_count": _execution_field(payload, "open_trade_count"),

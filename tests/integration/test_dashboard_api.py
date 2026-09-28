@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -456,13 +456,14 @@ def test_directional_audit_endpoint_uses_real_time_window_and_coverage(
     monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
     repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
     repository.initialize()
+    now = datetime.now(UTC)
     repository.append_event(
         event_id="old",
         window_id="window",
         event_type="STRATEGY_EVALUATION",
         bucket_key="BTC-5m",
         payload={"strategy": "DIRECTIONAL_EDGE", "action": "ABSTAIN", "reason": "OLD"},
-        observed_at=datetime(2026, 9, 25, 11, 0, tzinfo=UTC),
+        observed_at=now - timedelta(hours=25),
     )
     repository.append_event(
         event_id="legacy",
@@ -473,8 +474,8 @@ def test_directional_audit_endpoint_uses_real_time_window_and_coverage(
             "strategy": "DIRECTIONAL_EDGE",
             "action": "ABSTAIN",
             "reason": "UNKNOWN_NEW_REASON",
-        },
-        observed_at=datetime(2026, 9, 26, 12, 0, tzinfo=UTC),
+            },
+        observed_at=now - timedelta(hours=1),
     )
     repository.append_event(
         event_id="audit",
@@ -495,9 +496,9 @@ def test_directional_audit_endpoint_uses_real_time_window_and_coverage(
                     "maximum_flip_rate_minus_actual": "-0.20",
                 },
                 "edge": {"counterfactual_edge_margin": "0.02"},
+                },
             },
-        },
-        observed_at=datetime(2026, 9, 26, 12, 2, tzinfo=UTC),
+        observed_at=now - timedelta(minutes=30),
     )
 
     asyncio.run(_assert_directional_audit_endpoint())

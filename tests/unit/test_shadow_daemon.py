@@ -9,6 +9,7 @@ from direction_engine_v3.domain import (
     Market,
     MarketToken,
     OfficialReference,
+    OrderSide,
     OutcomeSide,
     ProbabilityForecast,
     ProxyReference,
@@ -30,9 +31,11 @@ from direction_engine_v3.market_data import (
     SettlementMetadata,
     SettlementMethod,
 )
+from direction_engine_v3.pricing import LiquidityRole, PricingPolicy, simulate_depth
 from direction_engine_v3.shadow.daemon import (
     ShadowDaemon,
     ShadowMarketState,
+    _apply_paper_directional_reduced_stake,
     _paper_directional_entry_brake,
     new_evidence_window,
 )
@@ -642,7 +645,7 @@ def test_paper_open_position_count_brake_blocks_new_directional_fill(tmp_path) -
     assert "MAXIMUM_PAPER_POSITIONS" in brake.reasons
 
 
-def test_paper_recent_poor_performance_brake_blocks_new_directional_fill(
+def test_paper_recent_poor_performance_reduces_directional_stake_without_blocking(
     tmp_path,
 ) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
@@ -701,9 +704,105 @@ def test_paper_recent_poor_performance_brake_blocks_new_directional_fill(
         forecast=forecast,
     )
 
-    assert brake.active is True
-    assert "POOR_RECENT_PAPER_PERFORMANCE" in brake.reasons
+    assert brake.active is False
+    assert brake.stake_reduced is True
+    assert "POOR_RECENT_PAPER_PERFORMANCE" in brake.observation_reasons
+    assert "POOR_RECENT_PAPER_PERFORMANCE" not in brake.reasons
     assert brake.recent_win_rate == Decimal("0")
+    assert brake.payload()["risk_brake_active"] is False
+    assert brake.payload()["risk_stake_reduced"] is True
+    assert brake.payload()["reduced_stake_cap_usdc"] == "0.75"
+
+
+def test_paper_recent_poor_performance_reduced_stake_updates_candidate_and_quantity(
+    tmp_path,
+) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    for index in range(10):
+        paper.save_trade_snapshot(
+            trade_id=f"recent-loss-reduced-{index}",
+            decision_id=f"decision:recent-loss-reduced-{index}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-recent-loss-reduced-{index}",
+            side="UP",
+            status="SETTLED",
+            observed_at=NOW - timedelta(minutes=index + 1),
+            payload={
+                "stake": "0.10",
+                "cost_basis_usdc": "0.10",
+                "realized_paper_pnl": "-0.10",
+                "win_loss": "LOSS",
+                "real_order_submission": False,
+            },
+        )
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-reduced-stake",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("2.00"),
+        Decimal("0.20"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+    assert state.up_book is not None
+    assert state.fee_schedule is not None
+    pricing = simulate_depth(
+        state.up_book,
+        state.fee_schedule,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("2"),
+        limit_price=Decimal("1"),
+        role=LiquidityRole.TAKER,
+        observed_at=NOW,
+        policy=PricingPolicy(
+            max_book_age=timedelta(seconds=30),
+            max_fee_age=timedelta(seconds=30),
+            slippage_buffer_bps=Decimal("10"),
+            fee_buffer_bps=Decimal("500"),
+        ),
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=(),
+        recent_trades=paper.trades(strategy="DIRECTIONAL_EDGE"),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+    reduced, quantity, fee, payload = _apply_paper_directional_reduced_stake(
+        candidate,
+        pricing,
+        brake,
+    )
+
+    assert brake.active is False
+    assert reduced.required_capital == Decimal("0.75")
+    assert reduced.expected_net_value < candidate.expected_net_value
+    assert quantity == Decimal("0.75") / pricing.all_in_cost_per_share
+    assert fee == pricing.total_fee_usdc * quantity / pricing.filled_quantity
+    assert payload["risk_stake_reduced"] is True
+    assert payload["original_required_capital"] == "2.00"
+    assert payload["effective_required_capital"] == "0.75"
 
 
 def test_paper_baseline_stake_cap_blocks_large_research_baseline_candidate(

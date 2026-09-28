@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -152,6 +152,7 @@ _PAPER_RECENT_PERFORMANCE_SAMPLE = 10
 _PAPER_RECENT_PERFORMANCE_LIMIT = 20
 _PAPER_RECENT_MIN_WIN_RATE = Decimal("0.35")
 _PAPER_RECENT_MAX_LOSS_USDC = Decimal("-5.00")
+_PAPER_POOR_PERFORMANCE_REDUCED_STAKE_USDC = Decimal("0.75")
 _PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS = 20.0
 _BUCKET_COLLECTION_TIMEOUT_SECONDS = 75.0
 _PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET = 2_000
@@ -1418,35 +1419,6 @@ class ShadowDaemon:
                 abstains,
             )
         paper_summary = self._paper_repository.summary(now=state.observed_at)
-        capital = _paper_capital_gate(paper_summary, candidate.required_capital)
-        if capital.status != "PAPER_CAPITAL_OK":
-            payload = {
-                "candidate_id": candidate.candidate_id,
-                "label": _PAPER_LABEL,
-                "raw_available_capital": capital.raw_available_capital,
-                "spendable_capital": capital.spendable_capital,
-                "required_capital": str(candidate.required_capital),
-                "open_cost_basis": paper_summary.get("open_cost_basis"),
-                "expired_but_unsettled_cost_basis": paper_summary.get(
-                    "expired_but_unsettled_cost_basis"
-                ),
-                "unfilled_reservations": paper_summary.get("unfilled_reservations"),
-                "open_trade_count": paper_summary.get("open_trade_count"),
-                "open_unique_condition_count": paper_summary.get(
-                    "open_unique_condition_count"
-                ),
-                "legacy_missing_window_end_count": paper_summary.get(
-                    "legacy_missing_window_end_count"
-                ),
-            }
-            abstains = self._record_abstain(
-                state,
-                cycle_id=cycle_id,
-                strategy=StrategyKind.DIRECTIONAL_EDGE,
-                reason=capital.status,
-                payload=payload,
-            )
-            return False, {"router_status": capital.status, **payload}, abstains
         open_directional_trades = self._paper_repository.trades(
             strategy=StrategyKind.DIRECTIONAL_EDGE.value,
             status="OPEN",
@@ -1487,6 +1459,42 @@ class ShadowDaemon:
                 },
                 abstains,
             )
+        (
+            candidate,
+            execution_quantity,
+            execution_fee,
+            reduced_stake_payload,
+        ) = _apply_paper_directional_reduced_stake(candidate, pricing, brake)
+        capital = _paper_capital_gate(paper_summary, candidate.required_capital)
+        if capital.status != "PAPER_CAPITAL_OK":
+            payload = {
+                "candidate_id": candidate.candidate_id,
+                "label": _PAPER_LABEL,
+                "raw_available_capital": capital.raw_available_capital,
+                "spendable_capital": capital.spendable_capital,
+                "required_capital": str(candidate.required_capital),
+                "open_cost_basis": paper_summary.get("open_cost_basis"),
+                "expired_but_unsettled_cost_basis": paper_summary.get(
+                    "expired_but_unsettled_cost_basis"
+                ),
+                "unfilled_reservations": paper_summary.get("unfilled_reservations"),
+                "open_trade_count": paper_summary.get("open_trade_count"),
+                "open_unique_condition_count": paper_summary.get(
+                    "open_unique_condition_count"
+                ),
+                "legacy_missing_window_end_count": paper_summary.get(
+                    "legacy_missing_window_end_count"
+                ),
+                **reduced_stake_payload,
+            }
+            abstains = self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.DIRECTIONAL_EDGE,
+                reason=capital.status,
+                payload=payload,
+            )
+            return False, {"router_status": capital.status, **payload}, abstains
         routing = route_opportunities(
             (
                 RoutingOpportunity(
@@ -1561,7 +1569,7 @@ class ShadowDaemon:
             market,
             risk,
             decision_id=f"decision:{candidate.candidate_id}",
-            quantity=pricing.filled_quantity,
+            quantity=execution_quantity,
             limit_price=pricing.worst_price,
             created_at=state.observed_at,
         )
@@ -1571,9 +1579,9 @@ class ShadowDaemon:
             (
                 PaperFillEvidence(
                     plan.intents[0].client_order_id,
-                    pricing.filled_quantity,
+                    execution_quantity,
                     pricing.vwap,
-                    pricing.total_fee_usdc,
+                    execution_fee,
                     state.observed_at,
                     state.observed_at,
                 ),
@@ -1606,15 +1614,16 @@ class ShadowDaemon:
                 "p_down": str(forecast.p_down) if forecast is not None else None,
                 "executable_cost": str(assessment.executable_cost),
                 "entry_vwap": str(pricing.vwap),
-                "fee": str(pricing.total_fee_usdc),
+                "fee": str(execution_fee),
                 "net_edge": str(assessment.net_edge),
                 "stake": str(candidate.required_capital),
                 "cost_basis_usdc": str(candidate.required_capital),
-                "shares": str(pricing.filled_quantity),
+                "shares": str(execution_quantity),
                 "model_version": forecast.model_version if forecast is not None else None,
                 "calibration_version": calibration_version,
                 "risk_decision_id": risk.risk_decision_id,
                 "risk_approved": True,
+                **reduced_stake_payload,
                 "fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
                 "position_status": "OPEN",
                 "real_order_submission": False,
@@ -1630,6 +1639,7 @@ class ShadowDaemon:
                 "risk_approved": True,
                 "paper_trade_id": trade.trade_id,
                 "paper_fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
+                **reduced_stake_payload,
             },
             0,
         )
@@ -2817,9 +2827,47 @@ def _paper_capital_gate(
     return _PaperCapitalGate("PAPER_CAPITAL_OK", raw_available, raw_available)
 
 
+def _apply_paper_directional_reduced_stake(
+    candidate: StrategyCandidate,
+    pricing: DepthSimulation,
+    brake: "_PaperDirectionalEntryBrake",
+) -> tuple[StrategyCandidate, Decimal, Decimal, dict[str, object]]:
+    if (
+        not brake.stake_reduced
+        or pricing.all_in_cost_per_share is None
+        or pricing.vwap is None
+        or pricing.filled_quantity <= Decimal("0")
+        or candidate.required_capital <= brake.reduced_stake_cap
+    ):
+        return candidate, pricing.filled_quantity, pricing.total_fee_usdc, brake.payload()
+    capped_capital = min(candidate.required_capital, brake.reduced_stake_cap)
+    execution_quantity = capped_capital / pricing.all_in_cost_per_share
+    fee_ratio = execution_quantity / pricing.filled_quantity
+    execution_fee = pricing.total_fee_usdc * fee_ratio
+    expected_net_value = (
+        candidate.expected_net_value * execution_quantity / pricing.filled_quantity
+    )
+    reduced_candidate = replace(
+        candidate,
+        required_capital=capped_capital,
+        expected_net_value=expected_net_value,
+    )
+    payload = {
+        **brake.payload(),
+        "original_required_capital": str(candidate.required_capital),
+        "effective_required_capital": str(capped_capital),
+        "original_shares": str(pricing.filled_quantity),
+        "effective_shares": str(execution_quantity),
+        "original_fee": str(pricing.total_fee_usdc),
+        "effective_fee": str(execution_fee),
+    }
+    return reduced_candidate, execution_quantity, execution_fee, payload
+
+
 @dataclass(frozen=True, slots=True)
 class _PaperDirectionalEntryBrake:
     reasons: tuple[str, ...]
+    observation_reasons: tuple[str, ...]
     initial_equity: Decimal | None
     paper_current_equity: Decimal | None
     open_cost_basis: Decimal | None
@@ -2829,10 +2877,15 @@ class _PaperDirectionalEntryBrake:
     recent_win_rate: Decimal | None
     recent_realized_pnl: Decimal
     baseline_stake_cap: Decimal
+    reduced_stake_cap: Decimal
 
     @property
     def active(self) -> bool:
         return bool(self.reasons)
+
+    @property
+    def stake_reduced(self) -> bool:
+        return "POOR_RECENT_PAPER_PERFORMANCE" in self.observation_reasons
 
     @property
     def reason(self) -> str:
@@ -2845,6 +2898,11 @@ class _PaperDirectionalEntryBrake:
             "risk_brake_active": self.active,
             "risk_brake_reason": self.reason if self.active else None,
             "risk_reasons": list(self.reasons),
+            "risk_observation_reasons": list(self.observation_reasons),
+            "risk_stake_reduced": self.stake_reduced,
+            "risk_stake_reduction_reason": (
+                "POOR_RECENT_PAPER_PERFORMANCE" if self.stake_reduced else None
+            ),
             "initial_equity": str(self.initial_equity)
             if self.initial_equity is not None
             else None,
@@ -2862,6 +2920,7 @@ class _PaperDirectionalEntryBrake:
             else None,
             "recent_directional_pnl": str(self.recent_realized_pnl),
             "baseline_stake_cap_usdc": str(self.baseline_stake_cap),
+            "reduced_stake_cap_usdc": str(self.reduced_stake_cap),
         }
 
 
@@ -2894,6 +2953,7 @@ def _paper_directional_entry_brake(
         Decimal(recent_wins) / Decimal(len(recent_settled)) if recent_settled else None
     )
     reasons: list[str] = []
+    observation_reasons: list[str] = []
     if initial_equity is None or paper_current_equity is None or open_cost_basis is None:
         reasons.append("PAPER_CAPITAL_STATE_INVALID")
     else:
@@ -2920,7 +2980,7 @@ def _paper_directional_entry_brake(
             or recent_realized_pnl <= _PAPER_RECENT_MAX_LOSS_USDC
         )
     ):
-        reasons.append("POOR_RECENT_PAPER_PERFORMANCE")
+        observation_reasons.append("POOR_RECENT_PAPER_PERFORMANCE")
     if (
         forecast is not None
         and forecast.model_version == PAPER_RESEARCH_BASELINE_MODEL_VERSION
@@ -2929,6 +2989,7 @@ def _paper_directional_entry_brake(
         reasons.append("BASELINE_RESEARCH_STAKE_CAP")
     return _PaperDirectionalEntryBrake(
         tuple(dict.fromkeys(reasons)),
+        tuple(dict.fromkeys(observation_reasons)),
         initial_equity,
         paper_current_equity,
         open_cost_basis,
@@ -2938,6 +2999,7 @@ def _paper_directional_entry_brake(
         recent_win_rate,
         recent_realized_pnl,
         _PAPER_BASELINE_MAX_STAKE_USDC,
+        _PAPER_POOR_PERFORMANCE_REDUCED_STAKE_USDC,
     )
 
 
