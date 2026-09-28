@@ -2885,7 +2885,21 @@ class _PaperDirectionalEntryBrake:
 
     @property
     def stake_reduced(self) -> bool:
-        return "POOR_RECENT_PAPER_PERFORMANCE" in self.observation_reasons
+        return any(
+            reason
+            in {
+                "PAPER_DRAWDOWN_BRAKE_ACTIVE",
+                "POOR_RECENT_PAPER_PERFORMANCE",
+                "BASELINE_RESEARCH_STAKE_CAP",
+            }
+            for reason in self.observation_reasons
+        )
+
+    @property
+    def stake_reduction_reason(self) -> str | None:
+        if not self.stake_reduced:
+            return None
+        return self.observation_reasons[0]
 
     @property
     def reason(self) -> str:
@@ -2900,9 +2914,7 @@ class _PaperDirectionalEntryBrake:
             "risk_reasons": list(self.reasons),
             "risk_observation_reasons": list(self.observation_reasons),
             "risk_stake_reduced": self.stake_reduced,
-            "risk_stake_reduction_reason": (
-                "POOR_RECENT_PAPER_PERFORMANCE" if self.stake_reduced else None
-            ),
+            "risk_stake_reduction_reason": self.stake_reduction_reason,
             "initial_equity": str(self.initial_equity)
             if self.initial_equity is not None
             else None,
@@ -2960,7 +2972,7 @@ def _paper_directional_entry_brake(
         if paper_current_equity <= initial_equity * (
             Decimal("1") - _PAPER_DRAWDOWN_BRAKE_RATIO
         ):
-            reasons.append("PAPER_DRAWDOWN_BRAKE_ACTIVE")
+            observation_reasons.append("PAPER_DRAWDOWN_BRAKE_ACTIVE")
         if (
             paper_current_equity > Decimal("0")
             and open_cost_basis >= paper_current_equity * _PAPER_MAX_OPEN_EXPOSURE_RATIO
@@ -2986,7 +2998,7 @@ def _paper_directional_entry_brake(
         and forecast.model_version == PAPER_RESEARCH_BASELINE_MODEL_VERSION
         and candidate.required_capital > _PAPER_BASELINE_MAX_STAKE_USDC
     ):
-        reasons.append("BASELINE_RESEARCH_STAKE_CAP")
+        observation_reasons.append("BASELINE_RESEARCH_STAKE_CAP")
     return _PaperDirectionalEntryBrake(
         tuple(dict.fromkeys(reasons)),
         tuple(dict.fromkeys(observation_reasons)),

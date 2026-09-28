@@ -469,7 +469,7 @@ def test_unexpected_bucket_collection_failure_still_raises_after_settlement_scan
     assert shadow.event_counts().get("REAL_SHADOW_CYCLE", 0) == 0
 
 
-def test_paper_drawdown_brake_blocks_new_directional_fill_without_stopping_cycle(
+def test_paper_drawdown_brake_reduces_directional_stake_without_stopping_cycle(
     tmp_path,
 ) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
@@ -516,12 +516,13 @@ def test_paper_drawdown_brake_blocks_new_directional_fill_without_stopping_cycle
 
     assert result.markets_discovered == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
-    assert paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN") == ()
-    abstain = next(
-        item for item in paper.abstains() if item.reason == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
-    )
-    assert abstain.payload["risk_brake_active"] is True
-    assert abstain.payload["paper_current_equity"] == "30.00"
+    trades = paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN")
+    assert len(trades) == 1
+    assert trades[0].payload["risk_brake_active"] is False
+    assert trades[0].payload["risk_stake_reduced"] is True
+    assert trades[0].payload["risk_stake_reduction_reason"] == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
+    assert trades[0].payload["paper_current_equity"] == "30.00"
+    assert trades[0].payload["cost_basis_usdc"] == "0.75"
 
 
 def test_paper_open_exposure_brake_blocks_new_directional_fill(tmp_path) -> None:
@@ -805,7 +806,7 @@ def test_paper_recent_poor_performance_reduced_stake_updates_candidate_and_quant
     assert payload["effective_required_capital"] == "0.75"
 
 
-def test_paper_baseline_stake_cap_blocks_large_research_baseline_candidate(
+def test_paper_baseline_stake_cap_reduces_large_research_baseline_candidate(
     tmp_path,
 ) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
@@ -845,8 +846,10 @@ def test_paper_baseline_stake_cap_blocks_large_research_baseline_candidate(
         forecast=forecast,
     )
 
-    assert brake.active is True
-    assert brake.reason == "BASELINE_RESEARCH_STAKE_CAP"
+    assert brake.active is False
+    assert brake.stake_reduced is True
+    assert "BASELINE_RESEARCH_STAKE_CAP" in brake.observation_reasons
+    assert brake.payload()["risk_stake_reduction_reason"] == "BASELINE_RESEARCH_STAKE_CAP"
 
 
 def test_paper_entry_brake_allows_healthy_small_candidate(tmp_path) -> None:
