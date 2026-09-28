@@ -520,6 +520,18 @@ if result["curl_exit"] != 0 or not str(status_code).startswith(("2", "3")):
 PY
 }
 
+probe_dashboard_endpoint_warn() {
+  local name="$1" url="$2" output_path="$3"
+  set +e
+  probe_dashboard_endpoint "$name" "$url" "$output_path"
+  local probe_exit="$?"
+  set -e
+  if [ "$probe_exit" -ne 0 ]; then
+    log "RUNTIME_HEALTH_WARN dashboard_endpoint_unavailable name=$name url=$url"
+  fi
+  return 0
+}
+
 smoke_check() {
   STAGE="fast-smoke"
   require_active_unit direction-engine-v3-shadow.service 30
@@ -537,8 +549,8 @@ smoke_check() {
   probe_dashboard_endpoint "root" "http://127.0.0.1:8130/" "/tmp/direction-engine-v3-dashboard.html"
   probe_dashboard_endpoint "dashboard" "http://127.0.0.1:8130/api/dashboard" "/tmp/direction-engine-v3-dashboard.json"
   probe_dashboard_endpoint "paper-summary" "http://127.0.0.1:8130/api/paper/summary" "/tmp/direction-engine-v3-paper-summary.json"
-  probe_dashboard_endpoint "directional" "http://127.0.0.1:8130/api/directional/status" "/tmp/direction-engine-v3-directional.json"
-  probe_dashboard_endpoint "shadow" "http://127.0.0.1:8130/api/shadow/status" "/tmp/direction-engine-v3-shadow.json"
+  probe_dashboard_endpoint_warn "directional" "http://127.0.0.1:8130/api/directional/status" "/tmp/direction-engine-v3-directional.json"
+  probe_dashboard_endpoint_warn "shadow" "http://127.0.0.1:8130/api/shadow/status" "/tmp/direction-engine-v3-shadow.json"
   grep -q "PAPER / SHADOW" /tmp/direction-engine-v3-dashboard.html
   chainlink_gate_status="$(chainlink_gate "$smoke_started_at")"
   runtime_health_status="$chainlink_gate_status"

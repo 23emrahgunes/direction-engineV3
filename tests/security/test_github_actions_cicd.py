@@ -116,19 +116,21 @@ def test_deploy_smoke_records_dashboard_endpoints_and_settlement_progress() -> N
     source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
     assert "probe_dashboard_endpoint()" in source
+    assert "probe_dashboard_endpoint_warn()" in source
     assert 'probe_dashboard_endpoint "root" "http://127.0.0.1:8130/"' in source
     assert (
         'probe_dashboard_endpoint "paper-summary" '
         '"http://127.0.0.1:8130/api/paper/summary"'
     ) in source
     assert (
-        'probe_dashboard_endpoint "directional" '
+        'probe_dashboard_endpoint_warn "directional" '
         '"http://127.0.0.1:8130/api/directional/status"'
     ) in source
     assert (
-        'probe_dashboard_endpoint "shadow" '
+        'probe_dashboard_endpoint_warn "shadow" '
         '"http://127.0.0.1:8130/api/shadow/status"'
     ) in source
+    assert "RUNTIME_HEALTH_WARN dashboard_endpoint_unavailable" in source
     assert "settlement_scan_count()" in source
     assert "latest_settlement_scan_ts()" in source
     assert "PAPER_SETTLEMENT_SCAN" in source
