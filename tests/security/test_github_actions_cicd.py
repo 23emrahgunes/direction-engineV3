@@ -117,6 +117,8 @@ def test_deploy_smoke_records_dashboard_endpoints_and_settlement_progress() -> N
 
     assert "probe_dashboard_endpoint()" in source
     assert "probe_dashboard_endpoint_warn()" in source
+    assert 'local probe_result="$?"' in source
+    assert 'return "$probe_result"' in source
     assert 'probe_dashboard_endpoint "root" "http://127.0.0.1:8130/"' in source
     assert (
         'probe_dashboard_endpoint "paper-summary" '

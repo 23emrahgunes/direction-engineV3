@@ -491,6 +491,7 @@ probe_dashboard_endpoint() {
   curl_exit="$?"
   set -e
   elapsed_ms="$(( $(date +%s%3N) - started_at ))"
+  set +e
   "$PY" - "$name" "$url" "$output_path" "/tmp/direction-engine-v3-${name}.err" "$status_code" "$curl_exit" "$elapsed_ms" <<'PY'
 import json
 import sys
@@ -518,6 +519,9 @@ print(json.dumps(result, sort_keys=True))
 if result["curl_exit"] != 0 or not str(status_code).startswith(("2", "3")):
     raise SystemExit(1)
 PY
+  local probe_result="$?"
+  set -e
+  return "$probe_result"
 }
 
 probe_dashboard_endpoint_warn() {
