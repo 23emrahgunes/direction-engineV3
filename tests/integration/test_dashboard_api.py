@@ -38,6 +38,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/metrics"),
         ("GET", "/api/dashboard"),
         ("GET", "/api/paper/summary"),
+        ("GET", "/api/paper/reconciliation"),
         ("GET", "/api/paper/performance"),
         ("GET", "/api/paper/trades"),
         ("GET", "/api/paper/trades/{id}"),
@@ -81,6 +82,8 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "PAPER / SHADOW" in body
     assert "Trade Decision Breakdown" in body
     assert "/api/directional/audit?hours=24" in body
+    assert "Exposure Reconciliation" in body
+    assert "/api/paper/reconciliation" in body
     assert "NO REAL ORDER" in body
     assert "APP_MODE=PAPER" in body
     assert "LIVE_TRADING_ENABLED=false" in body

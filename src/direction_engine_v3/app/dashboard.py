@@ -123,6 +123,19 @@ def build_paper_summary() -> dict[str, object]:
     return repository.summary()
 
 
+def build_paper_reconciliation() -> dict[str, object]:
+    paper_path = runtime_data_dir() / "paper.sqlite3"
+    if not paper_path.exists():
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "status": "DATABASE_NOT_INITIALIZED",
+            "reason": "paper.sqlite3 not found",
+            "real_order_submission": False,
+        }
+    repository = SQLitePaperRepository(paper_path)
+    return repository.exposure_reconciliation()
+
+
 def build_paper_performance(*, strategy: str = "DIRECTIONAL_EDGE") -> dict[str, object]:
     repository = _paper_repository()
     return repository.performance(strategy=strategy)

@@ -1294,6 +1294,113 @@ class SQLitePaperRepository:
             "buckets": tuple(buckets.values()),
         }
 
+    def exposure_reconciliation(self, *, now: datetime | None = None) -> dict[str, object]:
+        """Explain PAPER exposure from raw snapshots, settlement overlays, and windows.
+
+        This is a read-only diagnostic: it does not initialize, migrate, settle, or mutate
+        PAPER state.  Raw snapshots are kept separate from public overlay status so stale
+        historical ``OPEN`` records with settlement rows remain visible without inflating
+        current open exposure.
+        """
+
+        if now is None:
+            now = datetime.now(UTC)
+        require_utc("now", now)
+        raw_trades = self._raw_trade_snapshots(limit=100_000)
+        settlements = {item.trade_id: item for item in self.settlements()}
+        condition_ids = {item.condition_id for item in raw_trades}
+        overlays = {
+            condition_id: self.identity_overlay(condition_id) for condition_id in condition_ids
+        }
+        attempts = {
+            condition_id: self.settlement_attempt(condition_id) for condition_id in condition_ids
+        }
+        rows = tuple(
+            _reconciliation_row(
+                trade=trade,
+                settlement=settlements.get(trade.trade_id),
+                overlay=overlays.get(trade.condition_id),
+                attempt=attempts.get(trade.condition_id),
+                now=now,
+            )
+            for trade in raw_trades
+        )
+        open_rows = tuple(item for item in rows if item["overlay_status"] == "OPEN")
+        directional_open = tuple(
+            item for item in open_rows if item["strategy"] == "DIRECTIONAL_EDGE"
+        )
+        structural_open = tuple(
+            item for item in open_rows if item["strategy"] == "STRUCTURAL_ARBITRAGE"
+        )
+        expired_unsettled = tuple(
+            item for item in open_rows if item["window_state"] == "EXPIRED_UNSETTLED"
+        )
+        unknown_window = tuple(
+            item for item in open_rows if item["window_state"] == "UNKNOWN_WINDOW"
+        )
+        settled_overlay = tuple(item for item in rows if item["settlement_exists"] is True)
+        summary = self.summary(now=now)
+        calculated_open_cost_basis = sum(
+            (Decimal(str(item["cost_basis_usdc"])) for item in open_rows),
+            Decimal("0"),
+        )
+        calculated_open_trade_count = len(open_rows)
+        summary_open_cost_basis = Decimal(str(summary.get("open_cost_basis", "0")))
+        summary_open_trade_count = int(str(summary.get("open_trade_count", "0")))
+        count_matches = calculated_open_trade_count == summary_open_trade_count
+        cost_matches = calculated_open_cost_basis == summary_open_cost_basis
+        return {
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "status": "RECONCILIATION_OK"
+            if count_matches and cost_matches
+            else "RECONCILIATION_MISMATCH",
+            "generated_at": now.isoformat(),
+            "real_order_submission": False,
+            "summary": {
+                "open_trade_count": summary_open_trade_count,
+                "open_cost_basis": str(summary_open_cost_basis),
+                "paper_current_equity": summary.get("paper_current_equity"),
+                "realized_pnl": summary.get("realized_pnl"),
+                "paper_run_id": summary.get("paper_run_id"),
+            },
+            "calculated": {
+                "global_open_trade_count": calculated_open_trade_count,
+                "global_open_cost_basis": str(calculated_open_cost_basis),
+                "directional_open_count": len(directional_open),
+                "directional_open_cost_basis": str(_row_cost_sum(directional_open)),
+                "structural_open_count": len(structural_open),
+                "structural_open_cost_basis": str(_row_cost_sum(structural_open)),
+                "expired_unsettled_count": len(expired_unsettled),
+                "expired_unsettled_cost_basis": str(_row_cost_sum(expired_unsettled)),
+                "unknown_window_open_count": len(unknown_window),
+                "unknown_window_open_cost_basis": str(_row_cost_sum(unknown_window)),
+                "settled_overlay_count": len(settled_overlay),
+                "raw_snapshot_count": len(rows),
+            },
+            "matches": {
+                "open_trade_count": count_matches,
+                "open_cost_basis": cost_matches,
+            },
+            "difference": {
+                "open_trade_count": calculated_open_trade_count - summary_open_trade_count,
+                "open_cost_basis": str(calculated_open_cost_basis - summary_open_cost_basis),
+            },
+            "open_trades": tuple(open_rows),
+            "trades": rows,
+        }
+
+    def _raw_trade_snapshots(self, *, limit: int = 100_000) -> tuple[PaperTradeSnapshot, ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                "SELECT trade_id,decision_id,strategy,asset,horizon,condition_id,side,status,"
+                "label,payload_json,observed_at FROM paper_trade_snapshots "
+                "ORDER BY observed_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(_trade_from_row(row) for row in rows)
+
     def _overlay_trade(self, trade: PaperTradeSnapshot) -> PaperTradeSnapshot:
         settlement = self.settlement_for_trade(trade.trade_id)
         if settlement is None:
@@ -1570,6 +1677,93 @@ def _capital_basis(trade: PaperTradeSnapshot) -> Decimal:
     return Decimal(str(trade.payload.get("cost_basis_usdc", trade.payload.get("stake", "0"))))
 
 
+def _row_cost_sum(rows: tuple[Mapping[str, object], ...]) -> Decimal:
+    return sum((Decimal(str(item["cost_basis_usdc"])) for item in rows), Decimal("0"))
+
+
+def _reconciliation_row(
+    *,
+    trade: PaperTradeSnapshot,
+    settlement: PaperTradeSettlement | None,
+    overlay: PaperTradeIdentityOverlay | None,
+    attempt: PaperSettlementConditionAttempt | None,
+    now: datetime,
+) -> dict[str, object]:
+    overlay_status = "SETTLED" if settlement is not None else trade.status
+    window_start = _effective_window_start(trade, overlay)
+    window_end = _effective_window_end(trade, overlay)
+    cost_basis = settlement.cost_basis_usdc if settlement is not None else _capital_basis(trade)
+    window_state = _window_state(overlay_status, window_end, now)
+    return {
+        "trade_id": trade.trade_id,
+        "strategy": trade.strategy,
+        "asset": trade.asset,
+        "horizon": trade.horizon,
+        "condition_id": trade.condition_id,
+        "side": trade.side,
+        "raw_status": trade.status,
+        "overlay_status": overlay_status,
+        "settlement_exists": settlement is not None,
+        "cost_basis_usdc": str(cost_basis),
+        "stake": None if trade.payload.get("stake") is None else str(trade.payload.get("stake")),
+        "window_start": window_start.isoformat() if window_start is not None else None,
+        "window_end": window_end.isoformat() if window_end is not None else None,
+        "window_state": window_state,
+        "settlement_attempt_state": attempt.state if attempt is not None else None,
+        "last_attempt_reason": attempt.last_reason if attempt is not None else None,
+        "last_successful_settlement_at": (
+            attempt.last_successful_settlement_at.isoformat()
+            if attempt is not None and attempt.last_successful_settlement_at is not None
+            else None
+        ),
+        "paper_run_id": trade.payload.get("paper_run_id"),
+        "observed_at": trade.observed_at.isoformat(),
+        "settled_at": settlement.settled_at.isoformat() if settlement is not None else None,
+        "exposure_bucket": _exposure_bucket(
+            strategy=trade.strategy,
+            raw_status=trade.status,
+            overlay_status=overlay_status,
+            window_state=window_state,
+        ),
+    }
+
+
+def _window_state(overlay_status: str, window_end: datetime | None, now: datetime) -> str:
+    if overlay_status == "SETTLED":
+        return "SETTLED"
+    if overlay_status != "OPEN":
+        return "NOT_OPEN"
+    if window_end is None:
+        return "UNKNOWN_WINDOW"
+    if window_end <= now:
+        return "EXPIRED_UNSETTLED"
+    return "ACTIVE"
+
+
+def _exposure_bucket(
+    *,
+    strategy: str,
+    raw_status: str,
+    overlay_status: str,
+    window_state: str,
+) -> str:
+    if overlay_status == "SETTLED":
+        if raw_status == "OPEN":
+            return "legacy_stale_open_snapshot"
+        return "settled_overlay"
+    if overlay_status != "OPEN":
+        return "not_open"
+    if window_state == "UNKNOWN_WINDOW":
+        return "unknown_window_open"
+    if window_state == "EXPIRED_UNSETTLED":
+        return "expired_unsettled"
+    if strategy == "DIRECTIONAL_EDGE":
+        return "directional_open"
+    if strategy == "STRUCTURAL_ARBITRAGE":
+        return "structural_open"
+    return "other_open"
+
+
 def _payload_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -1584,6 +1778,14 @@ def _effective_window_end(
 ) -> datetime | None:
     return _payload_datetime(trade.payload.get("window_end")) or (
         overlay.window_end if overlay is not None and overlay.status == "RECOVERED" else None
+    )
+
+
+def _effective_window_start(
+    trade: PaperTradeSnapshot, overlay: PaperTradeIdentityOverlay | None
+) -> datetime | None:
+    return _payload_datetime(trade.payload.get("window_start")) or (
+        overlay.window_start if overlay is not None and overlay.status == "RECOVERED" else None
     )
 
 
