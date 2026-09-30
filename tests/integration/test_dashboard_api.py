@@ -563,7 +563,14 @@ def test_directional_status_exposes_paper_risk_brake(tmp_path, monkeypatch) -> N
                 "risk_brake_reason": "PAPER_DRAWDOWN_BRAKE_ACTIVE",
                 "paper_current_equity": "30.00",
                 "open_cost_basis": "12.00",
+                "directional_open_cost_basis": "12.00",
+                "global_open_cost_basis": "20.52",
+                "structural_open_cost_basis": "8.52",
+                "directional_available_capital": "18.00",
                 "open_trade_count": 4,
+                "directional_open_trade_count": 4,
+                "global_open_trade_count": 6,
+                "structural_open_trade_count": 2,
                 "same_asset_open_count": 1,
                 "recent_directional_win_rate": "0.10",
                 "recent_directional_pnl": "-6.00",
@@ -722,7 +729,14 @@ async def _assert_paper_risk_brake_is_visible() -> None:
     assert bucket["risk_brake_reason"] == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
     assert bucket["paper_current_equity"] == "30.00"
     assert bucket["open_cost_basis"] == "12.00"
+    assert bucket["directional_open_cost_basis"] == "12.00"
+    assert bucket["global_open_cost_basis"] == "20.52"
+    assert bucket["structural_open_cost_basis"] == "8.52"
+    assert bucket["directional_available_capital"] == "18.00"
     assert bucket["open_trade_count"] == 4
+    assert bucket["directional_open_trade_count"] == 4
+    assert bucket["global_open_trade_count"] == 6
+    assert bucket["structural_open_trade_count"] == 2
     assert bucket["same_asset_open_count"] == 1
     assert bucket["recent_directional_win_rate"] == "0.10"
     assert bucket["recent_directional_pnl"] == "-6.00"

@@ -1153,8 +1153,56 @@ class SQLitePaperRepository:
             (_capital_basis(item) for item in open_trades),
             Decimal("0"),
         )
+        directional_open_trades = tuple(
+            item for item in open_trades if item.strategy == "DIRECTIONAL_EDGE"
+        )
+        structural_open_trades = tuple(
+            item for item in open_trades if item.strategy == "STRUCTURAL_ARBITRAGE"
+        )
+        directional_settled = tuple(
+            item for item in settled if item.strategy == "DIRECTIONAL_EDGE"
+        )
+        structural_settled = tuple(
+            item for item in settled if item.strategy == "STRUCTURAL_ARBITRAGE"
+        )
+        directional_acknowledged = tuple(
+            item for item in acknowledged if item.strategy == "DIRECTIONAL_EDGE"
+        )
+        structural_acknowledged = tuple(
+            item for item in acknowledged if item.strategy == "STRUCTURAL_ARBITRAGE"
+        )
+        directional_realized_pnl = sum(
+            (
+                Decimal(str(item.payload.get("realized_paper_pnl", "0")))
+                for item in directional_settled
+            ),
+            Decimal("0"),
+        )
+        structural_realized_pnl = sum(
+            (
+                Decimal(str(item.payload.get("realized_paper_pnl", "0")))
+                for item in structural_settled
+            ),
+            Decimal("0"),
+        )
+        directional_open_cost_basis = sum(
+            (_capital_basis(item) for item in directional_open_trades),
+            Decimal("0"),
+        )
+        structural_open_cost_basis = sum(
+            (_capital_basis(item) for item in structural_open_trades),
+            Decimal("0"),
+        )
         unfilled_reservations = sum(
             (_capital_basis(item) for item in acknowledged),
+            Decimal("0"),
+        )
+        directional_unfilled_reservations = sum(
+            (_capital_basis(item) for item in directional_acknowledged),
+            Decimal("0"),
+        )
+        structural_unfilled_reservations = sum(
+            (_capital_basis(item) for item in structural_acknowledged),
             Decimal("0"),
         )
         known_active_open_cost_basis = sum(
@@ -1185,6 +1233,14 @@ class SQLitePaperRepository:
             ),
             Decimal("0"),
         )
+        structural_unknown_window_open_cost_basis = sum(
+            (
+                _capital_basis(item)
+                for item in structural_open_trades
+                if _effective_window_end(item, overlays.get(item.condition_id)) is None
+            ),
+            Decimal("0"),
+        )
         legacy_missing_window_end_count = sum(
             1 for item in open_trades if _payload_datetime(item.payload.get("window_end")) is None
         )
@@ -1203,6 +1259,24 @@ class SQLitePaperRepository:
             initial_equity + realized_pnl - open_cost_basis - unfilled_reservations
         )
         spendable_capital = max(Decimal("0"), raw_available_capital)
+        directional_raw_available_capital = (
+            initial_equity
+            + directional_realized_pnl
+            - directional_open_cost_basis
+            - directional_unfilled_reservations
+        )
+        directional_spendable_capital = max(
+            Decimal("0"), directional_raw_available_capital
+        )
+        structural_raw_available_capital = (
+            initial_equity
+            + structural_realized_pnl
+            - structural_open_cost_basis
+            - structural_unfilled_reservations
+        )
+        structural_spendable_capital = max(
+            Decimal("0"), structural_raw_available_capital
+        )
         run_metadata = self.run_metadata()
         return {
             "label": "PAPER / SHADOW — NO REAL ORDER",
@@ -1224,6 +1298,29 @@ class SQLitePaperRepository:
             "spendable_capital": str(spendable_capital),
             "realized_pnl": str(realized_pnl),
             "open_cost_basis": str(open_cost_basis),
+            "directional_realized_pnl": str(directional_realized_pnl),
+            "directional_open_cost_basis": str(directional_open_cost_basis),
+            "directional_open_trade_count": len(directional_open_trades),
+            "directional_unfilled_reservations": str(
+                directional_unfilled_reservations
+            ),
+            "directional_raw_available_capital": str(
+                directional_raw_available_capital
+            ),
+            "directional_spendable_capital": str(directional_spendable_capital),
+            "directional_current_equity": str(initial_equity + directional_realized_pnl),
+            "structural_realized_pnl": str(structural_realized_pnl),
+            "structural_open_cost_basis": str(structural_open_cost_basis),
+            "structural_open_trade_count": len(structural_open_trades),
+            "structural_unfilled_reservations": str(
+                structural_unfilled_reservations
+            ),
+            "structural_raw_available_capital": str(structural_raw_available_capital),
+            "structural_spendable_capital": str(structural_spendable_capital),
+            "structural_current_equity": str(initial_equity + structural_realized_pnl),
+            "structural_unknown_window_open_cost_basis": str(
+                structural_unknown_window_open_cost_basis
+            ),
             "known_active_open_cost_basis": str(known_active_open_cost_basis),
             "known_expired_unsettled_cost_basis": str(known_expired_unsettled_cost_basis),
             "unknown_window_open_cost_basis": str(unknown_window_open_cost_basis),

@@ -187,6 +187,12 @@ def test_paper_reconciliation_explains_raw_overlay_and_window_exposure(tmp_path)
     assert payload["calculated"]["structural_open_cost_basis"] == "2.50"
     assert payload["calculated"]["expired_unsettled_count"] == 1
     assert payload["calculated"]["unknown_window_open_count"] == 1
+    summary = repository.summary(now=now)
+    assert summary["directional_open_trade_count"] == 3
+    assert summary["directional_open_cost_basis"] == "2.50"
+    assert summary["structural_open_trade_count"] == 1
+    assert summary["structural_open_cost_basis"] == "2.50"
+    assert summary["structural_unknown_window_open_cost_basis"] == "0"
     rows = {str(item["trade_id"]): item for item in payload["trades"]}
     assert rows["raw-open-settled"]["raw_status"] == "OPEN"
     assert rows["raw-open-settled"]["overlay_status"] == "SETTLED"

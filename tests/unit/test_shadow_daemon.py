@@ -36,6 +36,7 @@ from direction_engine_v3.shadow.daemon import (
     ShadowDaemon,
     ShadowMarketState,
     _apply_paper_directional_reduced_stake,
+    _paper_capital_gate,
     _paper_directional_entry_brake,
     new_evidence_window,
 )
@@ -583,6 +584,106 @@ def test_paper_open_exposure_brake_blocks_new_directional_fill(tmp_path) -> None
 
     assert brake.active is True
     assert "OPEN_EXPOSURE_LIMIT" in brake.reasons
+
+
+def test_structural_open_exposure_does_not_block_directional_scope_brake(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    paper.save_trade_snapshot(
+        trade_id="structural-open-exposure",
+        decision_id="decision:structural-open-exposure",
+        strategy="STRUCTURAL_ARBITRAGE",
+        asset="SOL",
+        horizon="5m",
+        condition_id="condition-structural-open-exposure",
+        side="BUY_MERGE",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=1),
+        payload={
+            "stake": "12",
+            "cost_basis_usdc": "12",
+            "fill_status": "FILLED",
+            "real_order_submission": False,
+        },
+    )
+    summary = paper.summary(now=NOW)
+    state = _market_state(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    candidate = StrategyCandidate(
+        "candidate-structural-open-exposure",
+        StrategyKind.DIRECTIONAL_EDGE,
+        state.discovery.market.market_id,
+        Decimal("1"),
+        Decimal("0.05"),
+        Decimal("0.5"),
+        NOW,
+        NOW + timedelta(seconds=30),
+        OutcomeSide.UP,
+    )
+    forecast = ProbabilityForecast(
+        state.discovery.market.market_id,
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.55"),
+        Decimal("0.45"),
+        "READY_MODEL",
+        "READY_CALIBRATION",
+        "features-v1",
+        NOW,
+        NOW,
+    )
+
+    brake = _paper_directional_entry_brake(
+        summary,
+        open_trades=paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN"),
+        recent_trades=paper.trades(strategy="DIRECTIONAL_EDGE"),
+        candidate=candidate,
+        market=state.discovery.market,
+        forecast=forecast,
+    )
+
+    assert summary["open_cost_basis"] == "12"
+    assert summary["structural_open_cost_basis"] == "12"
+    assert summary["directional_open_cost_basis"] == "0"
+    assert brake.active is False
+    assert "OPEN_EXPOSURE_LIMIT" not in brake.reasons
+    assert brake.payload()["global_open_cost_basis"] == "12"
+    assert brake.payload()["structural_open_cost_basis"] == "12"
+    assert brake.payload()["directional_open_cost_basis"] == "0"
+
+
+def test_directional_capital_gate_uses_directional_scope_when_requested(tmp_path) -> None:
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    paper.save_trade_snapshot(
+        trade_id="structural-open-capital",
+        decision_id="decision:structural-open-capital",
+        strategy="STRUCTURAL_ARBITRAGE",
+        asset="SOL",
+        horizon="5m",
+        condition_id="condition-structural-open-capital",
+        side="BUY_MERGE",
+        status="OPEN",
+        observed_at=NOW - timedelta(minutes=1),
+        payload={
+            "stake": "39.50",
+            "cost_basis_usdc": "39.50",
+            "fill_status": "FILLED",
+            "real_order_submission": False,
+        },
+    )
+    summary = paper.summary(now=NOW)
+
+    global_capital = _paper_capital_gate(summary, Decimal("1.00"))
+    directional_capital = _paper_capital_gate(
+        summary,
+        Decimal("1.00"),
+        raw_available_key="directional_raw_available_capital",
+    )
+
+    assert summary["raw_available_capital"] == "0.50"
+    assert summary["directional_raw_available_capital"] == "40.00"
+    assert global_capital.status == "INSUFFICIENT_PAPER_CAPITAL"
+    assert directional_capital.status == "PAPER_CAPITAL_OK"
 
 
 def test_paper_open_position_count_brake_blocks_new_directional_fill(tmp_path) -> None:

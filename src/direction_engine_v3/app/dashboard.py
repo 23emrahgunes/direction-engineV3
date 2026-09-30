@@ -431,7 +431,28 @@ def build_directional_runtime_status() -> dict[str, object]:
                 ),
                 "paper_current_equity": _execution_field(payload, "paper_current_equity"),
                 "open_cost_basis": _execution_field(payload, "open_cost_basis"),
+                "directional_open_cost_basis": _execution_field(
+                    payload, "directional_open_cost_basis"
+                ),
+                "global_open_cost_basis": _execution_field(
+                    payload, "global_open_cost_basis"
+                ),
+                "structural_open_cost_basis": _execution_field(
+                    payload, "structural_open_cost_basis"
+                ),
+                "directional_available_capital": _execution_field(
+                    payload, "directional_available_capital"
+                ),
                 "open_trade_count": _execution_field(payload, "open_trade_count"),
+                "directional_open_trade_count": _execution_field(
+                    payload, "directional_open_trade_count"
+                ),
+                "global_open_trade_count": _execution_field(
+                    payload, "global_open_trade_count"
+                ),
+                "structural_open_trade_count": _execution_field(
+                    payload, "structural_open_trade_count"
+                ),
                 "same_asset_open_count": _execution_field(
                     payload, "same_asset_open_count"
                 ),

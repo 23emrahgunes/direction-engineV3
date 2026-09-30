@@ -1380,6 +1380,7 @@ class ShadowDaemon:
     ) -> tuple[bool, dict[str, object], int]:
         assert state.discovery is not None
         market = state.discovery.market
+        token_ids = tuple(token.token_id for token in market.tokens)
         entry_checked_at = self._clock.utc_now()
         market_lifecycle_reason = _market_lifecycle_reason(market, entry_checked_at)
         if market_lifecycle_reason is not None:
@@ -1465,7 +1466,11 @@ class ShadowDaemon:
             execution_fee,
             reduced_stake_payload,
         ) = _apply_paper_directional_reduced_stake(candidate, pricing, brake)
-        capital = _paper_capital_gate(paper_summary, candidate.required_capital)
+        capital = _paper_capital_gate(
+            paper_summary,
+            candidate.required_capital,
+            raw_available_key="directional_raw_available_capital",
+        )
         if capital.status != "PAPER_CAPITAL_OK":
             payload = {
                 "candidate_id": candidate.candidate_id,
@@ -1474,6 +1479,12 @@ class ShadowDaemon:
                 "spendable_capital": capital.spendable_capital,
                 "required_capital": str(candidate.required_capital),
                 "open_cost_basis": paper_summary.get("open_cost_basis"),
+                "directional_open_cost_basis": paper_summary.get(
+                    "directional_open_cost_basis"
+                ),
+                "structural_open_cost_basis": paper_summary.get(
+                    "structural_open_cost_basis"
+                ),
                 "expired_but_unsettled_cost_basis": paper_summary.get(
                     "expired_but_unsettled_cost_basis"
                 ),
@@ -1527,7 +1538,11 @@ class ShadowDaemon:
                 payload={"candidate_id": candidate.candidate_id, "label": _PAPER_LABEL},
             )
             return False, {"router_status": "ROUTER_REJECTED_DIRECTIONAL"}, abstains
-        portfolio_state = self._portfolio_state_from_paper(state.observed_at)
+        portfolio_state = self._portfolio_state_from_paper(
+            state.observed_at,
+            bankroll_key="directional_spendable_capital",
+            realized_pnl_key="directional_realized_pnl",
+        )
         risk = _risk_decision(
             candidate,
             market,
@@ -1687,7 +1702,13 @@ class ShadowDaemon:
             )
         return RouterSnapshot(0, tuple(claims), ())
 
-    def _portfolio_state_from_paper(self, now: datetime) -> PortfolioState:
+    def _portfolio_state_from_paper(
+        self,
+        now: datetime,
+        *,
+        bankroll_key: str = "spendable_capital",
+        realized_pnl_key: str = "realized_pnl",
+    ) -> PortfolioState:
         summary = self._paper_repository.summary(now=now)
         consecutive_losses = int(str(summary["current_losing_streak"]))
         cooldown_until = _paper_cooldown_until(summary, consecutive_losses)
@@ -1717,9 +1738,9 @@ class ShadowDaemon:
                 )
             )
         return PortfolioState(
-            Decimal(str(summary["spendable_capital"])),
+            Decimal(str(summary[bankroll_key])),
             tuple(exposures),
-            Decimal(str(summary["realized_pnl"])),
+            Decimal(str(summary[realized_pnl_key])),
             Decimal(str(summary["maximum_drawdown"])),
             consecutive_losses,
             cooldown_until,
@@ -1956,6 +1977,28 @@ class ShadowDaemon:
     ) -> None:
         assert state.discovery is not None
         market = state.discovery.market
+        token_ids = tuple(token.token_id for token in market.tokens)
+        if (
+            not market.condition_id
+            or not market.market_id
+            or len(token_ids) < 2
+            or market.window_end <= market.window_start
+        ):
+            self._record_abstain(
+                state,
+                cycle_id=cycle_id,
+                strategy=StrategyKind.STRUCTURAL_ARBITRAGE,
+                reason="STRUCTURAL_WINDOW_METADATA_MISSING",
+                payload={
+                    "condition_id": market.condition_id,
+                    "market_id": market.market_id,
+                    "token_count": len(token_ids),
+                    "window_start": market.window_start.isoformat(),
+                    "window_end": market.window_end.isoformat(),
+                    "label": _PAPER_LABEL,
+                },
+            )
+            return
         entry_checked_at = self._clock.utc_now()
         market_lifecycle_reason = _market_lifecycle_reason(market, entry_checked_at)
         if market_lifecycle_reason is not None:
@@ -1981,7 +2024,6 @@ class ShadowDaemon:
             state.observed_at,
             min(market.window_end, state.observed_at + timedelta(seconds=5)),
         )
-        token_ids = tuple(token.token_id for token in market.tokens)
         paper_summary = self._paper_repository.summary(now=state.observed_at)
         capital = _paper_capital_gate(paper_summary, candidate.required_capital)
         if capital.status != "PAPER_CAPITAL_OK":
@@ -2097,7 +2139,12 @@ class ShadowDaemon:
             side="BUY_MERGE",
             status="OPEN" if result.fills else "ACKNOWLEDGED",
             payload={
+                "asset": market.asset.value,
+                "horizon": market.horizon.value,
                 "condition_id": market.condition_id,
+                "market_id": market.market_id,
+                "window_start": market.window_start.isoformat(),
+                "window_end": market.window_end.isoformat(),
                 "shares": str(opportunity.shares),
                 "entry_vwap": str(opportunity.combined_price_per_share),
                 "fee": str(opportunity.up.total_fee_usdc + opportunity.down.total_fee_usdc),
@@ -2106,6 +2153,15 @@ class ShadowDaemon:
                 ),
                 "net_edge": str(opportunity.expected_net_profit),
                 "stake": str(candidate.required_capital),
+                "cost_basis_usdc": str(candidate.required_capital),
+                "up_token_id": token_ids[0],
+                "down_token_id": token_ids[1],
+                "up_shares": str(opportunity.up.filled_quantity),
+                "down_shares": str(opportunity.down.filled_quantity),
+                "up_vwap": str(opportunity.up.vwap),
+                "down_vwap": str(opportunity.down.vwap),
+                "up_fee": str(opportunity.up.total_fee_usdc),
+                "down_fee": str(opportunity.down.total_fee_usdc),
                 "fill_status": "FILLED" if result.fills else "ACKNOWLEDGED",
                 "position_status": "OPEN",
                 "model_version": "MODEL_FREE",
@@ -2803,12 +2859,17 @@ class _PaperCapitalGate:
 
 
 def _paper_capital_gate(
-    paper_summary: Mapping[str, object], required_capital: Decimal
+    paper_summary: Mapping[str, object],
+    required_capital: Decimal,
+    *,
+    raw_available_key: str = "raw_available_capital",
 ) -> _PaperCapitalGate:
     try:
-        raw_value = paper_summary.get(
-            "raw_available_capital", paper_summary.get("available_capital")
-        )
+        raw_value = paper_summary.get(raw_available_key)
+        if raw_value is None and raw_available_key != "raw_available_capital":
+            raw_value = paper_summary.get("raw_available_capital")
+        if raw_value is None:
+            raw_value = paper_summary.get("available_capital")
         if raw_value is None:
             raise ValueError("raw_available_capital missing")
         raw_available = Decimal(str(raw_value))
@@ -2871,7 +2932,12 @@ class _PaperDirectionalEntryBrake:
     initial_equity: Decimal | None
     paper_current_equity: Decimal | None
     open_cost_basis: Decimal | None
+    global_open_cost_basis: Decimal | None
+    structural_open_cost_basis: Decimal | None
+    directional_available_capital: Decimal | None
     open_trade_count: int | None
+    global_open_trade_count: int | None
+    structural_open_trade_count: int | None
     same_asset_open_count: int
     recent_settled_count: int
     recent_win_rate: Decimal | None
@@ -2924,7 +2990,22 @@ class _PaperDirectionalEntryBrake:
             "open_cost_basis": str(self.open_cost_basis)
             if self.open_cost_basis is not None
             else None,
+            "directional_open_cost_basis": str(self.open_cost_basis)
+            if self.open_cost_basis is not None
+            else None,
+            "global_open_cost_basis": str(self.global_open_cost_basis)
+            if self.global_open_cost_basis is not None
+            else None,
+            "structural_open_cost_basis": str(self.structural_open_cost_basis)
+            if self.structural_open_cost_basis is not None
+            else None,
+            "directional_available_capital": str(self.directional_available_capital)
+            if self.directional_available_capital is not None
+            else None,
             "open_trade_count": self.open_trade_count,
+            "directional_open_trade_count": self.open_trade_count,
+            "global_open_trade_count": self.global_open_trade_count,
+            "structural_open_trade_count": self.structural_open_trade_count,
             "same_asset_open_count": self.same_asset_open_count,
             "recent_directional_settled_count": self.recent_settled_count,
             "recent_directional_win_rate": str(self.recent_win_rate)
@@ -2946,9 +3027,28 @@ def _paper_directional_entry_brake(
     forecast: ProbabilityForecast | None,
 ) -> _PaperDirectionalEntryBrake:
     initial_equity = _safe_decimal(paper_summary.get("initial_equity"))
-    paper_current_equity = _safe_decimal(paper_summary.get("paper_current_equity"))
-    open_cost_basis = _safe_decimal(paper_summary.get("open_cost_basis"))
+    paper_current_equity = _safe_decimal(
+        paper_summary.get("directional_current_equity")
+        if paper_summary.get("directional_current_equity") is not None
+        else paper_summary.get("paper_current_equity")
+    )
+    open_cost_basis = _safe_decimal(
+        paper_summary.get("directional_open_cost_basis")
+        if paper_summary.get("directional_open_cost_basis") is not None
+        else paper_summary.get("open_cost_basis")
+    )
+    global_open_cost_basis = _safe_decimal(paper_summary.get("open_cost_basis"))
+    structural_open_cost_basis = _safe_decimal(
+        paper_summary.get("structural_open_cost_basis")
+    )
+    directional_available_capital = _safe_decimal(
+        paper_summary.get("directional_raw_available_capital")
+    )
     open_trade_count = len(open_trades)
+    global_open_trade_count = _safe_int(paper_summary.get("open_trade_count"))
+    structural_open_trade_count = _safe_int(
+        paper_summary.get("structural_open_trade_count")
+    )
     same_asset_open_count = sum(
         1 for item in open_trades if str(getattr(item, "asset", "")) == market.asset.value
     )
@@ -3005,7 +3105,12 @@ def _paper_directional_entry_brake(
         initial_equity,
         paper_current_equity,
         open_cost_basis,
+        global_open_cost_basis,
+        structural_open_cost_basis,
+        directional_available_capital,
         open_trade_count,
+        global_open_trade_count,
+        structural_open_trade_count,
         same_asset_open_count,
         len(recent_settled),
         recent_win_rate,

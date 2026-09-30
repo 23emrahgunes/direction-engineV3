@@ -24,6 +24,14 @@ from direction_engine_v3.storage import SQLitePaperRepository
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
 
 
+class _StaticClock:
+    def utc_now(self) -> datetime:
+        return NOW + timedelta(milliseconds=50)
+
+    def monotonic_ns(self) -> int:
+        return 1
+
+
 def test_structural_pair_skew_abstains_without_killing_cycle(tmp_path: Path) -> None:
     daemon, paper, shadow = _daemon(tmp_path)
     first = _state(
@@ -49,6 +57,29 @@ def test_structural_pair_skew_abstains_without_killing_cycle(tmp_path: Path) -> 
         and item["payload"].get("reason") == "PAIRED_BOOK_SOURCE_SKEW"
         for item in structural_events
     )
+
+
+def test_structural_paper_snapshot_persists_window_and_leg_metadata(
+    tmp_path: Path,
+) -> None:
+    daemon, paper, _shadow = _daemon(tmp_path)
+    daemon._clock = _StaticClock()
+
+    accepted = daemon._evaluate_structural(_state(), cycle_id="cycle")
+
+    assert accepted is True
+    trade = paper.trades(strategy="STRUCTURAL_ARBITRAGE", limit=1)[0]
+    assert trade.payload["asset"] == "BTC"
+    assert trade.payload["horizon"] == "5m"
+    assert trade.payload["condition_id"] == "condition-1"
+    assert trade.payload["market_id"] == "market-1"
+    assert trade.payload["window_start"] == NOW.isoformat()
+    assert trade.payload["window_end"] == (NOW + timedelta(minutes=5)).isoformat()
+    assert trade.payload["cost_basis_usdc"] == trade.payload["stake"]
+    assert trade.payload["up_token_id"] == "up-token"
+    assert trade.payload["down_token_id"] == "down-token"
+    assert trade.payload["up_shares"] == "5"
+    assert trade.payload["down_shares"] == "5"
 
 
 def test_structural_stale_book_abstains_and_next_daemon_cycle_runs(tmp_path: Path) -> None:
