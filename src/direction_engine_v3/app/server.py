@@ -26,7 +26,7 @@ from direction_engine_v3.app.dashboard import (
 
 DASHBOARD_INDEX_HTML = web.AppKey("dashboard_index_html", str)
 DASHBOARD_API_EXECUTOR = web.AppKey("dashboard_api_executor", ThreadPoolExecutor)
-API_RESPONSE_TIMEOUT_SECONDS = 5.0
+API_RESPONSE_TIMEOUT_SECONDS = 15.0
 
 
 def dashboard_index_path() -> Path:
@@ -95,7 +95,7 @@ async def _json_from_builder(
                 "reason": "dashboard read-only data builder exceeded timeout",
                 "real_order_submission": False,
             },
-            status=503,
+            status=200,
         )
     except Exception as exc:
         return web.json_response(
@@ -104,7 +104,7 @@ async def _json_from_builder(
                 "reason": type(exc).__name__,
                 "real_order_submission": False,
             },
-            status=503,
+            status=200,
         )
     return web.json_response(payload)
 

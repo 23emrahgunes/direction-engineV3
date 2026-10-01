@@ -156,10 +156,37 @@ async def _assert_dashboard_root_survives_blocked_api_builder() -> None:
 
     assert root_response.status == 200
     assert "Direction Engine V3" in root_body
-    assert blocked_response.status == 503
+    assert blocked_response.status == 200
     assert blocked_payload == {
         "status": "API_TIMEOUT",
         "reason": "dashboard read-only data builder exceeded timeout",
+        "real_order_submission": False,
+    }
+
+
+def test_dashboard_api_builder_exception_returns_payload_with_http_200(monkeypatch) -> None:
+    def broken_shadow_status() -> dict[str, object]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dashboard_server, "build_shadow_status", broken_shadow_status)
+
+    asyncio.run(_assert_builder_exception_returns_payload_with_http_200())
+
+
+async def _assert_builder_exception_returns_payload_with_http_200() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/shadow/status")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    assert payload == {
+        "status": "API_UNAVAILABLE",
+        "reason": "RuntimeError",
         "real_order_submission": False,
     }
 
