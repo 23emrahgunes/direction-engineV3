@@ -1017,6 +1017,10 @@ class SQLitePaperRepository:
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY observed_at DESC"
+        sql_limited = post_status is None and post_win_loss is None
+        if sql_limited:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         trades = tuple(self._overlay_trade(_trade_from_row(row)) for row in rows)
@@ -1024,6 +1028,8 @@ class SQLitePaperRepository:
             trades = tuple(item for item in trades if item.status == post_status)
         if post_win_loss is not None:
             trades = tuple(item for item in trades if item.payload.get("win_loss") == post_win_loss)
+        if sql_limited:
+            return trades
         return trades[offset : offset + limit]
 
     def unsettled_trade_snapshots(

@@ -64,7 +64,7 @@ async def dashboard_api_executor(app: web.Application) -> AsyncIterator[None]:
     unhealthy.
     """
 
-    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dashboard-api")
+    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dashboard-api")
     app[DASHBOARD_API_EXECUTOR] = executor
     try:
         yield

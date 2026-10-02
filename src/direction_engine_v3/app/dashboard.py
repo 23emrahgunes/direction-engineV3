@@ -25,6 +25,12 @@ from direction_engine_v3.observability import (
 from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteShadowRepository
 from direction_engine_v3.storage import SQLitePaperRepository
 
+PAPER_LIST_DEFAULT_LIMIT = 25
+PAPER_LIST_MAX_LIMIT = 100
+DIRECTIONAL_AUDIT_EVENT_LIMIT = 5_000
+RECONCILIATION_OPEN_DETAIL_LIMIT = 100
+RECONCILIATION_RAW_DETAIL_LIMIT = 250
+
 
 @dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
@@ -133,7 +139,8 @@ def build_paper_reconciliation() -> dict[str, object]:
             "real_order_submission": False,
         }
     repository = SQLitePaperRepository(paper_path)
-    return repository.exposure_reconciliation()
+    payload = repository.exposure_reconciliation()
+    return _bounded_reconciliation_payload(payload)
 
 
 def build_paper_performance(*, strategy: str = "DIRECTIONAL_EDGE") -> dict[str, object]:
@@ -165,6 +172,7 @@ def list_paper_trades(
     )
     return {
         "label": "PAPER / SHADOW — NO REAL ORDER",
+        "real_order_submission": False,
         "trades": [_trade_as_dict(item) for item in trades],
     }
 
@@ -490,7 +498,7 @@ def build_directional_decision_audit(*, hours: str | None = None) -> dict[str, o
         events = shadow.events_since(
             event_type="STRATEGY_EVALUATION",
             observed_at=since,
-            limit=50_000,
+            limit=DIRECTIONAL_AUDIT_EVENT_LIMIT,
         )
     except ShadowStorageUnavailable as exc:
         return {
@@ -697,7 +705,27 @@ def _paper_repository() -> SQLitePaperRepository:
     return repository
 
 
-def _safe_limit(raw: str | None, *, default: int = 250, maximum: int = 500) -> int:
+def _bounded_reconciliation_payload(payload: dict[str, object]) -> dict[str, object]:
+    bounded = dict(payload)
+    open_rows = payload.get("open_trades")
+    if isinstance(open_rows, (tuple, list)):
+        bounded["open_trades"] = tuple(open_rows[:RECONCILIATION_OPEN_DETAIL_LIMIT])
+        bounded["open_trades_total_count"] = len(open_rows)
+        bounded["open_trades_truncated"] = len(open_rows) > RECONCILIATION_OPEN_DETAIL_LIMIT
+    raw_rows = payload.get("trades")
+    if isinstance(raw_rows, (tuple, list)):
+        bounded["trades"] = tuple(raw_rows[:RECONCILIATION_RAW_DETAIL_LIMIT])
+        bounded["trades_total_count"] = len(raw_rows)
+        bounded["trades_truncated"] = len(raw_rows) > RECONCILIATION_RAW_DETAIL_LIMIT
+    return bounded
+
+
+def _safe_limit(
+    raw: str | None,
+    *,
+    default: int = PAPER_LIST_DEFAULT_LIMIT,
+    maximum: int = PAPER_LIST_MAX_LIMIT,
+) -> int:
     if raw is None:
         return default
     try:

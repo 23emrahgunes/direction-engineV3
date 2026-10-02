@@ -228,3 +228,75 @@ def test_paper_reconciliation_api_is_read_only_get(tmp_path, monkeypatch) -> Non
     assert payload["real_order_submission"] is False
     assert payload["status"] == "RECONCILIATION_OK"
     assert payload["calculated"]["structural_open_cost_basis"] == "4.00"
+
+
+def test_paper_trades_api_defaults_and_caps_large_read_limit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    repository.initialize()
+    for index in range(130):
+        repository.save_trade_snapshot(
+            trade_id=f"trade-{index:03d}",
+            decision_id=f"decision-{index:03d}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-{index:03d}",
+            side="UP",
+            status="OPEN",
+            payload={
+                "cost_basis_usdc": "0.10",
+                "window_end": (NOW + timedelta(minutes=5)).isoformat(),
+            },
+            observed_at=NOW + timedelta(seconds=index),
+        )
+
+    default_response = asyncio.run(paper_trades(make_mocked_request("GET", "/api/paper/trades")))
+    capped_response = asyncio.run(
+        paper_trades(make_mocked_request("GET", "/api/paper/trades?limit=999"))
+    )
+    default_payload = json.loads(default_response.text)
+    capped_payload = json.loads(capped_response.text)
+
+    assert default_response.status == 200
+    assert capped_response.status == 200
+    assert len(default_payload["trades"]) == 25
+    assert len(capped_payload["trades"]) == 100
+    assert default_payload["real_order_submission"] is False
+    assert capped_payload["real_order_submission"] is False
+
+
+def test_paper_reconciliation_api_caps_large_detail_payload(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    repository.initialize()
+    for index in range(260):
+        repository.save_trade_snapshot(
+            trade_id=f"trade-{index:03d}",
+            decision_id=f"decision-{index:03d}",
+            strategy="DIRECTIONAL_EDGE",
+            asset="BTC",
+            horizon="5m",
+            condition_id=f"condition-{index:03d}",
+            side="UP",
+            status="OPEN",
+            payload={
+                "cost_basis_usdc": "0.10",
+                "window_end": (NOW + timedelta(minutes=5)).isoformat(),
+            },
+            observed_at=NOW + timedelta(seconds=index),
+        )
+
+    response = asyncio.run(
+        paper_reconciliation(make_mocked_request("GET", "/api/paper/reconciliation"))
+    )
+    payload = json.loads(response.text)
+
+    assert response.status == 200
+    assert payload["calculated"]["raw_snapshot_count"] == 260
+    assert payload["open_trades_total_count"] == 260
+    assert payload["trades_total_count"] == 260
+    assert payload["open_trades_truncated"] is True
+    assert payload["trades_truncated"] is True
+    assert len(payload["open_trades"]) == 100
+    assert len(payload["trades"]) == 250
