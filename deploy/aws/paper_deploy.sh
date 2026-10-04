@@ -487,7 +487,7 @@ probe_dashboard_endpoint() {
   local started_at elapsed_ms status_code curl_exit
   started_at="$(date +%s%3N)"
   set +e
-  status_code="$(curl -sS --max-time 8 -o "$output_path" -w "%{http_code}" "$url" 2>"/tmp/direction-engine-v3-${name}.err")"
+  status_code="$(curl -sS --max-time 20 -o "$output_path" -w "%{http_code}" "$url" 2>"/tmp/direction-engine-v3-${name}.err")"
   curl_exit="$?"
   set -e
   elapsed_ms="$(( $(date +%s%3N) - started_at ))"

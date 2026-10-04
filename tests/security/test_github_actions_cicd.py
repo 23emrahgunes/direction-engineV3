@@ -59,7 +59,7 @@ def test_deploy_script_is_fast_paper_only_and_does_not_wait_for_strategy_evidenc
     assert "wait_for_shadow_cycle_and_settlement_progress" in source
     assert "deadline=$((SECONDS + 180))" in source
     assert "sleep 10" in source
-    assert "--max-time 8" in source
+    assert "--max-time 20" in source
     assert "PTB_READY_NOT_OBSERVED" not in source
     assert "BOUNDARY" not in source
     assert "24h" not in source.lower()
