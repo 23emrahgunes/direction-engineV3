@@ -15,6 +15,7 @@ from direction_engine_v3.app.dashboard import (
     build_dashboard_snapshot,
     build_directional_decision_audit,
     build_directional_runtime_status,
+    build_feature_integrity_report,
     build_model_governance_status,
     build_paper_performance,
     build_paper_reconciliation,
@@ -229,6 +230,10 @@ async def model_governance(request: web.Request) -> web.Response:
     return await _json_from_builder(request, build_model_governance_status)
 
 
+async def feature_integrity(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, build_feature_integrity_report)
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.cleanup_ctx.append(dashboard_api_executor)
@@ -250,6 +255,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/directional/status", directional_status, allow_head=False)
     app.router.add_get("/api/directional/audit", directional_audit, allow_head=False)
     app.router.add_get("/api/model/governance", model_governance, allow_head=False)
+    app.router.add_get("/api/feature/integrity", feature_integrity, allow_head=False)
     return app
 
 

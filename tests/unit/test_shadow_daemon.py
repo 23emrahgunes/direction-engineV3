@@ -162,6 +162,10 @@ def test_shadow_daemon_records_evaluations_and_blocks_unpromoted_directional_pap
         started_at=NOW,
         commit="abcdef1234567890",
     )
+    assert (
+        window.fingerprint.feature_schema_version
+        == "v3.15.3-directional-official-ptb"
+    )
     shadow.save_window_once(window_id=window.window_id, payload=window.as_dict(), started_at=NOW)
     daemon = ShadowDaemon(
         data_client=FixtureClient(),

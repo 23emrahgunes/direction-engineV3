@@ -159,6 +159,8 @@ _BUCKET_COLLECTION_TIMEOUT_SECONDS = 75.0
 _PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET = 2_000
 _DIRECTIONAL_CHECKPOINT_TARGETS_SECONDS = (120, 90, 60, 45)
 _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS = 10
+_DIRECTIONAL_FEATURE_SCHEMA_VERSION = "v3.15.3-directional-official-ptb"
+_DIRECTIONAL_TEMPORAL_COMPARATOR_VERSION = "P2.1_TEMPORAL_COMPARATOR_V1"
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -227,6 +229,8 @@ class ShadowMarketState:
     pipeline_stages: tuple[BucketPipelineStage, ...] = ()
     up_fee_schedule: FeeSchedule | None = None
     down_fee_schedule: FeeSchedule | None = None
+    diagnostic_directional_features: FeatureVector | None = None
+    feature_integrity_comparison: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,11 +270,13 @@ class PublicShadowDataClient:
         *,
         official_ptb: OfficialPriceToBeatService | None = None,
         feature_state: ExternalTemporalState | None = None,
+        diagnostic_feature_state: ExternalTemporalState | None = None,
     ) -> None:
         self._transport = transport
         self._clock = clock
         self._official_ptb = official_ptb
         self._feature_state = feature_state
+        self._diagnostic_feature_state = diagnostic_feature_state
 
     async def collect_bucket(self, bucket: MarketBucket, *, now: datetime) -> ShadowMarketState:
         window = window_containing(bucket, now)
@@ -441,6 +447,15 @@ class PublicShadowDataClient:
             self._feature_state.add_book(external_book)
             if external_trade is not None:
                 self._feature_state.add_trade(external_trade)
+        if (
+            proxy is not None
+            and external_book is not None
+            and self._diagnostic_feature_state is not None
+        ):
+            self._diagnostic_feature_state.add_reference(proxy)
+            self._diagnostic_feature_state.add_book(external_book)
+            if external_trade is not None:
+                self._diagnostic_feature_state.add_trade(external_trade)
         evaluation_at = self._clock.utc_now()
         market_lifecycle_reason = _market_lifecycle_reason(discovery.market, evaluation_at)
         if market_lifecycle_reason is not None:
@@ -477,6 +492,8 @@ class PublicShadowDataClient:
         features = None
         feature_status = "FEATURES_UNAVAILABLE"
         feature_diagnostics = None
+        diagnostic_features = None
+        feature_integrity_comparison = None
         if proxy is not None:
             feature_result = self._stage_sync(
                 stages,
@@ -493,6 +510,17 @@ class PublicShadowDataClient:
             )
             if feature_result is not None:
                 features, feature_status, feature_diagnostics = feature_result
+            diagnostic_features, feature_integrity_comparison = (
+                self._build_feature_integrity_comparison(
+                    discovery,
+                    proxy,
+                    ptb_resolution.price_to_beat,
+                    observed_at=evaluation_at,
+                    legacy_features=features,
+                    legacy_status=feature_status,
+                    legacy_diagnostics=feature_diagnostics,
+                )
+            )
         else:
             stages.append(
                 _stage_record(
@@ -524,6 +552,8 @@ class PublicShadowDataClient:
             pipeline_stages=tuple(stages),
             up_fee_schedule=up_fee,
             down_fee_schedule=down_fee,
+            diagnostic_directional_features=diagnostic_features,
+            feature_integrity_comparison=feature_integrity_comparison,
         )
 
     async def discover_market(
@@ -760,11 +790,62 @@ class PublicShadowDataClient:
                 price_to_beat,
                 result.snapshot,
                 generated_at=observed_at,
-                feature_set_version="v3.15.3-directional-official-ptb",
+                feature_set_version=_DIRECTIONAL_FEATURE_SCHEMA_VERSION,
             ),
             result.reason,
             result.diagnostics,
         )
+
+    def _build_feature_integrity_comparison(
+        self,
+        discovery: MarketDiscovery,
+        proxy: ProxyReference,
+        price_to_beat: PriceToBeatRecord | None,
+        *,
+        observed_at: datetime,
+        legacy_features: FeatureVector | None,
+        legacy_status: str,
+        legacy_diagnostics: Mapping[str, object] | None,
+    ) -> tuple[FeatureVector | None, Mapping[str, object] | None]:
+        if self._diagnostic_feature_state is None:
+            return None, None
+        diagnostic_features: FeatureVector | None = None
+        diagnostic_status = "DIAGNOSTIC_FEATURES_UNAVAILABLE"
+        diagnostic_diagnostics: Mapping[str, object] | None = None
+        if price_to_beat is None:
+            diagnostic_status = "OFFICIAL_PTB_UNAVAILABLE"
+        else:
+            result = self._diagnostic_feature_state.build_snapshot(
+                asset=discovery.market.asset,
+                current_reference=proxy,
+                observed_at=observed_at,
+            )
+            diagnostic_status = result.reason
+            diagnostic_diagnostics = result.diagnostics
+            if result.snapshot is not None:
+                diagnostic_features = build_directional_features(
+                    discovery.market,
+                    price_to_beat,
+                    result.snapshot,
+                    generated_at=observed_at,
+                    feature_set_version=_DIRECTIONAL_FEATURE_SCHEMA_VERSION,
+                )
+        return diagnostic_features, {
+            "version": _DIRECTIONAL_TEMPORAL_COMPARATOR_VERSION,
+            "production_feature_schema_version": _DIRECTIONAL_FEATURE_SCHEMA_VERSION,
+            "diagnostic_feature_schema_version": _DIRECTIONAL_TEMPORAL_COMPARATOR_VERSION,
+            "production_semantics": "legacy_append_all",
+            "diagnostic_semantics": "source_identity_dedup",
+            "same_evaluation_timestamp": True,
+            "counterfactual_execution": False,
+            "legacy_feature_status": legacy_status,
+            "diagnostic_feature_status": diagnostic_status,
+            "legacy_diagnostics": dict(legacy_diagnostics or {}),
+            "diagnostic_diagnostics": dict(diagnostic_diagnostics or {}),
+            "feature_deltas": _feature_delta_payload(
+                legacy_features, diagnostic_features
+            ),
+        }
 
 
 class ShadowDaemon:
@@ -1183,6 +1264,19 @@ class ShadowDaemon:
             observed_at=state.observed_at,
             policy=directional_policy,
         )
+        feature_integrity_comparison = dict(state.feature_integrity_comparison or {})
+        if feature_integrity_comparison:
+            feature_integrity_comparison["decision_impact"] = (
+                self._diagnostic_decision_impact(
+                    state,
+                    model_status=model_status,
+                    directional_policy=directional_policy,
+                    legacy_assessment=assessment,
+                    legacy_forecast=forecast,
+                    up_pricing=up_pricing,
+                    down_pricing=down_pricing,
+                )
+            )
         trade_recorded = False
         directional_execution: dict[str, object] = {}
         execution_abstains = 0
@@ -1293,6 +1387,7 @@ class ShadowDaemon:
                 "net_edge": str(assessment.net_edge) if assessment.net_edge is not None else None,
                 "pricing_status": pricing_status,
                 "decision_audit": decision_audit,
+                "feature_integrity_comparison": feature_integrity_comparison or None,
                 "directional_execution": directional_execution,
                 "chainlink": dict(state.chainlink_status or {}),
                 "binance_hourly": dict(state.binance_hourly_status or {}),
@@ -1345,9 +1440,22 @@ class ShadowDaemon:
         *,
         model_status: ShadowBucketModelStatus,
     ) -> tuple[ProbabilityForecast | None, CalibrationReadiness | None, dict[str, object]]:
+        return self._directional_forecast_for_features(
+            state,
+            state.directional_features,
+            model_status=model_status,
+        )
+
+    def _directional_forecast_for_features(
+        self,
+        state: ShadowMarketState,
+        features: FeatureVector | None,
+        *,
+        model_status: ShadowBucketModelStatus,
+    ) -> tuple[ProbabilityForecast | None, CalibrationReadiness | None, dict[str, object]]:
         readiness = self._registry.state_for(state.bucket).readiness
         report = self._paper_model_result.report_for(state.bucket)
-        if state.directional_features is None:
+        if features is None:
             return (
                 None,
                 readiness,
@@ -1360,7 +1468,7 @@ class ShadowDaemon:
         if readiness.ready:
             try:
                 forecast = self._registry.forecast(
-                    state.directional_features, generated_at=state.observed_at
+                    features, generated_at=state.observed_at
                 )
                 return (
                     forecast,
@@ -1383,7 +1491,7 @@ class ShadowDaemon:
                 )
         if APP_MODE == "PAPER":
             forecast, baseline_readiness = paper_research_baseline_forecast(
-                state.directional_features,
+                features,
                 generated_at=state.observed_at,
             )
             return (
@@ -1404,6 +1512,87 @@ class ShadowDaemon:
                 "calibration_state": "CALIBRATION_NOT_READY",
             },
         )
+
+    def _diagnostic_decision_impact(
+        self,
+        state: ShadowMarketState,
+        *,
+        model_status: ShadowBucketModelStatus,
+        directional_policy: DirectionalPolicy,
+        legacy_assessment: DirectionalAssessment,
+        legacy_forecast: ProbabilityForecast | None,
+        up_pricing: DepthSimulation | None,
+        down_pricing: DepthSimulation | None,
+    ) -> dict[str, object]:
+        if state.discovery is None:
+            return {
+                "evaluated": False,
+                "reason": "MARKET_UNAVAILABLE",
+                "counterfactual_trades_executed": False,
+            }
+        diagnostic_features = state.diagnostic_directional_features
+        if diagnostic_features is None:
+            return {
+                "evaluated": False,
+                "reason": "DIAGNOSTIC_FEATURES_UNAVAILABLE",
+                "counterfactual_trades_executed": False,
+            }
+        diagnostic_forecast, diagnostic_calibration, diagnostic_forecast_status = (
+            self._directional_forecast_for_features(
+                state,
+                diagnostic_features,
+                model_status=model_status,
+            )
+        )
+        diagnostic_assessment = assess_directional_edge(
+            state.discovery.market,
+            state.price_to_beat,
+            diagnostic_features,
+            diagnostic_forecast,
+            diagnostic_calibration,
+            up_pricing,
+            down_pricing,
+            observed_at=state.observed_at,
+            policy=directional_policy,
+        )
+        legacy_trade_candidate = legacy_assessment.action is DecisionAction.TRADE
+        diagnostic_trade_candidate = diagnostic_assessment.action is DecisionAction.TRADE
+        return {
+            "evaluated": True,
+            "same_decision": legacy_assessment.action is diagnostic_assessment.action
+            and legacy_assessment.reason == diagnostic_assessment.reason,
+            "legacy_action": legacy_assessment.action.value,
+            "diagnostic_action": diagnostic_assessment.action.value,
+            "legacy_reason": legacy_assessment.reason,
+            "diagnostic_reason": diagnostic_assessment.reason,
+            "legacy_model_version": None
+            if legacy_forecast is None
+            else legacy_forecast.model_version,
+            "diagnostic_model_version": None
+            if diagnostic_forecast is None
+            else diagnostic_forecast.model_version,
+            "diagnostic_model_state": diagnostic_forecast_status["model_state"],
+            "diagnostic_calibration_state": diagnostic_forecast_status[
+                "calibration_state"
+            ],
+            "signal_unstable_changed": _reason_changed(
+                legacy_assessment.reason,
+                diagnostic_assessment.reason,
+                "SIGNAL_UNSTABLE",
+            ),
+            "flip_rate_too_high_changed": _reason_changed(
+                legacy_assessment.reason,
+                diagnostic_assessment.reason,
+                "FLIP_RATE_TOO_HIGH",
+            ),
+            "abstain_to_trade_candidate": (
+                not legacy_trade_candidate and diagnostic_trade_candidate
+            ),
+            "trade_candidate_to_abstain": (
+                legacy_trade_candidate and not diagnostic_trade_candidate
+            ),
+            "counterfactual_trades_executed": False,
+        }
 
     def _execute_directional_paper(
         self,
@@ -2464,6 +2653,7 @@ def _pipeline_payload(state: ShadowMarketState) -> dict[str, object]:
         else None,
         "feature_status": state.feature_status,
         "feature_diagnostics": dict(state.feature_diagnostics or {}),
+        "feature_integrity_comparison": dict(state.feature_integrity_comparison or {}),
         "feature_error": _combined_error(by_stage, ("FEATURE_BUILD",)),
         "chainlink": dict(state.chainlink_status or {}),
         "binance_hourly": dict(state.binance_hourly_status or {}),
@@ -2495,6 +2685,62 @@ def _combined_error(
     return None
 
 
+_COMPARATOR_DELTA_FIELDS = (
+    "short_return",
+    "medium_return",
+    "momentum",
+    "realized_volatility",
+    "volatility_acceleration",
+    "trade_imbalance",
+    "external_book_imbalance",
+    "microprice_distance",
+    "flip_rate",
+    "signal_stability",
+    "regime_score",
+)
+
+
+def _feature_delta_payload(
+    legacy_features: FeatureVector | None,
+    diagnostic_features: FeatureVector | None,
+) -> dict[str, object]:
+    if legacy_features is None or diagnostic_features is None:
+        return {
+            "status": "FEATURE_COMPARISON_UNAVAILABLE",
+            "features": {},
+        }
+    legacy_values = {feature.name: feature.value for feature in legacy_features.features}
+    diagnostic_values = {
+        feature.name: feature.value for feature in diagnostic_features.features
+    }
+    deltas: dict[str, object] = {}
+    for field in _COMPARATOR_DELTA_FIELDS:
+        legacy_value = legacy_values.get(field)
+        diagnostic_value = diagnostic_values.get(field)
+        if legacy_value is None or diagnostic_value is None:
+            deltas[field] = {
+                "legacy": None if legacy_value is None else str(legacy_value),
+                "diagnostic": None
+                if diagnostic_value is None
+                else str(diagnostic_value),
+                "absolute_delta": None,
+            }
+            continue
+        deltas[field] = {
+            "legacy": str(legacy_value),
+            "diagnostic": str(diagnostic_value),
+            "absolute_delta": str(abs(legacy_value - diagnostic_value)),
+        }
+    return {
+        "status": "FEATURE_COMPARISON_READY",
+        "features": deltas,
+    }
+
+
+def _reason_changed(legacy_reason: str, diagnostic_reason: str, reason: str) -> bool:
+    return (legacy_reason == reason) != (diagnostic_reason == reason)
+
+
 def new_evidence_window(
     *,
     aws_user_id: str,
@@ -2508,7 +2754,7 @@ def new_evidence_window(
         strategy_version="v3.15.1-real-shadow",
         model_version="v3.8-unpromoted",
         calibration_version="v3.8-unpromoted",
-        feature_schema_version="v3-directional-features",
+        feature_schema_version=_DIRECTIONAL_FEATURE_SCHEMA_VERSION,
         risk_policy_version="v3.9-risk",
         router_policy_version="v3.10-router",
         execution_policy_version="v3.11-paper",
@@ -2641,6 +2887,11 @@ async def run_daemon(
             policy=ptb_policy,
         )
         feature_state = ExternalTemporalState(max_age=timedelta(seconds=120), minimum_points=3)
+        diagnostic_feature_state = ExternalTemporalState(
+            max_age=timedelta(seconds=120),
+            minimum_points=3,
+            deduplicate_source_identities=True,
+        )
         settlement_service = PaperSettlementService(
             paper_repository=paper,
             corpus_repository=directional_corpus,
@@ -2653,6 +2904,7 @@ async def run_daemon(
             clock,
             official_ptb=official_ptb,
             feature_state=feature_state,
+            diagnostic_feature_state=diagnostic_feature_state,
         )
         _shadow_runtime_log(
             "SHADOW_DAEMON_CONSTRUCT_START",

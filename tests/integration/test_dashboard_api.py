@@ -47,6 +47,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/directional/status"),
         ("GET", "/api/directional/audit"),
         ("GET", "/api/model/governance"),
+        ("GET", "/api/feature/integrity"),
     }
     assert all(method == "GET" for method, _path in routes)
 
@@ -106,7 +107,12 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "Settlement / Data Health" in body
     assert "12 Bucket Live Status / Performance" in body
     assert "Abstains / Rejections" in body
-    assert "Model Governance / Structural Arb / Data / Read-only API Status" in body
+    assert (
+        "Model Governance / Feature Integrity / Structural Arb / Data / Read-only API Status"
+        in body
+    )
+    assert "P2.1 Feature Integrity" in body
+    assert "/api/feature/integrity" in body
     assert "Raw JSON" in body
     assert "<pre id=\"overview\"" not in body
     assert "Loading..." not in body
@@ -176,6 +182,156 @@ def test_dashboard_api_builder_exception_returns_payload_with_http_200(monkeypat
     monkeypatch.setattr(dashboard_server, "build_shadow_status", broken_shadow_status)
 
     asyncio.run(_assert_builder_exception_returns_payload_with_http_200())
+
+
+def test_feature_integrity_endpoint_is_read_only_and_reports_insufficient_evidence(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+
+    asyncio.run(_assert_feature_integrity_endpoint_reports_insufficient_evidence())
+
+
+async def _assert_feature_integrity_endpoint_reports_insufficient_evidence() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/feature/integrity")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    assert payload["real_order_submission"] is False
+    assert payload["status"] == "P2_1_FEATURE_INTEGRITY_AUDIT_READY"
+    assert payload["acceptance_marker"] == "P2_1_EVIDENCE_INSUFFICIENT"
+    assert payload["root_cause_classification"] == "INSUFFICIENT_EVIDENCE"
+    assert payload["feature_schema_transition"] == {
+        "production_schema": "v3.15.3-directional-official-ptb",
+        "diagnostic_comparator_version": "P2.1_TEMPORAL_COMPARATOR_V1",
+        "conditional_p2_1b_schema": (
+            "v3.15.3-directional-official-ptb-source-dedup-v2"
+        ),
+        "historical_rows_rewritten": False,
+        "production_checkpoint_rows_write_dedup_v2": False,
+        "mixed_schema_training_policy": "FEATURE_SCHEMA_MISMATCH",
+    }
+    assert payload["scope"]["production_execution_changed"] is False
+    assert payload["scope"]["model_promotion_changed"] is False
+
+
+def test_feature_integrity_endpoint_reports_bounded_duplicate_evidence(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    repository = SQLiteShadowRepository(tmp_path / "shadow_evidence.sqlite3")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    for index, bucket_key in enumerate(("BTC-5m", "BTC-15m", "BTC-1h")):
+        repository.append_event(
+            event_id=f"pipeline-{index}",
+            window_id="window",
+            event_type="MARKET_DATA_PIPELINE",
+            bucket_key=bucket_key,
+            payload={
+                "feature_status": "FEATURES_READY",
+                "feature_diagnostics": {
+                    "scope": "asset_level",
+                    "dedup_policy": "none_legacy_append_all",
+                },
+                "feature_integrity_comparison": {
+                    "version": "P2.1_TEMPORAL_COMPARATOR_V1",
+                    "production_semantics": "legacy_append_all",
+                    "diagnostic_semantics": "source_identity_dedup",
+                    "diagnostic_feature_status": "FEATURES_READY",
+                    "diagnostic_diagnostics": {
+                        "scope": "asset_level",
+                        "dedup_policy": "source_identity_v1",
+                        "reference_sample_count": 3,
+                        "book_sample_count": 1,
+                        "trade_sample_count": 2,
+                        "dedup_reference_skip_count": 1,
+                        "dedup_book_skip_count": 1,
+                        "dedup_trade_skip_count": 1,
+                        "reference_identity_conflict_count": 0,
+                        "book_identity_conflict_count": 1 if index == 0 else 0,
+                        "unique_reference_source_identity_count": 3,
+                        "unique_book_source_identity_count": 1,
+                        "unique_trade_source_identity_count": 2,
+                        "near_duplicate_reference_count": 1,
+                        "near_duplicate_book_count": 0,
+                        "near_duplicate_trade_count": 0,
+                    },
+                    "feature_deltas": {
+                        "status": "FEATURE_COMPARISON_READY",
+                        "features": {
+                            "short_return": {
+                                "legacy": "0.01",
+                                "diagnostic": "0.02",
+                                "absolute_delta": "0.01",
+                            }
+                        },
+                    },
+                    "decision_impact": {
+                        "evaluated": True,
+                        "same_decision": index != 0,
+                        "legacy_action": "ABSTAIN",
+                        "diagnostic_action": "TRADE" if index == 0 else "ABSTAIN",
+                        "legacy_reason": "SIGNAL_UNSTABLE",
+                        "diagnostic_reason": "EDGE_AVAILABLE"
+                        if index == 0
+                        else "SIGNAL_UNSTABLE",
+                        "signal_unstable_changed": index == 0,
+                        "flip_rate_too_high_changed": False,
+                        "abstain_to_trade_candidate": index == 0,
+                        "trade_candidate_to_abstain": False,
+                        "counterfactual_trades_executed": False,
+                    },
+                },
+            },
+            observed_at=observed_at + timedelta(seconds=index),
+        )
+
+    asyncio.run(_assert_feature_integrity_endpoint_reports_duplicate_evidence())
+
+
+async def _assert_feature_integrity_endpoint_reports_duplicate_evidence() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/feature/integrity")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    temporal = payload["temporal_integrity"]
+    assert temporal["source_identity_policy"] == "diagnostic_shadow_comparator_only"
+    assert temporal["production_temporal_semantics"] == "legacy_append_all"
+    assert temporal["total_source_identity_dedup_skips"] == 9
+    assert temporal["total_source_identity_conflicts"] == 1
+    assert temporal["duplicate_rates"]["trade"] == {
+        "duplicate_count": 3,
+        "retained_count": 6,
+        "previous_total_count": 9,
+        "rate": "0.3333333333333333333333333333",
+    }
+    assert (
+        temporal["cross_horizon_reingestion"]["assets"]["BTC"][
+            "dedup_rejected_reingestions"
+        ]["trade"]
+        == 3
+    )
+    assert payload["feature_delta_summary"]["status"] == (
+        "COMPARATOR_FEATURE_DELTA_READY"
+    )
+    assert payload["feature_delta_summary"]["features"]["short_return"]["count"] == 3
+    assert payload["decision_impact_summary"]["counterfactual_trades_executed"] is False
+    assert payload["decision_impact_summary"]["evaluations_compared"] == 3
+    assert payload["decision_impact_summary"]["different_decision_count"] == 1
+    assert payload["decision_impact_summary"]["abstain_to_trade_candidate_count"] == 1
 
 
 async def _assert_builder_exception_returns_payload_with_http_200() -> None:

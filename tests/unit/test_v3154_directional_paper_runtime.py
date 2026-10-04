@@ -286,13 +286,43 @@ def test_paper_registry_trains_non_degenerate_l2_shadow_candidate(tmp_path) -> N
     assert any(coefficient != Decimal("0") for coefficient in state.artifact.coefficients)
 
 
-def _training_payload(*, value: str = "0.01") -> dict[str, object]:
+def test_paper_registry_rejects_mixed_feature_schema_versions(tmp_path) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+    for index in range(6):
+        repository.save_pre_outcome(
+            record_id=f"mixed-schema-{index}",
+            asset=Asset.BTC,
+            horizon=Horizon.FIVE_MINUTES,
+            condition_id=f"condition-{index}",
+            observed_at=NOW + timedelta(seconds=index),
+            payload=_training_payload(
+                value=str(Decimal(index + 1) / Decimal("100")),
+                feature_set_version="feature-set-v2" if index == 5 else "feature-set-v1",
+            ),
+        )
+        repository.attach_verified_outcome_once(
+            record_id=f"mixed-schema-{index}",
+            outcome={"settlement_source_kind": "OFFICIAL", "outcome_up": index >= 3},
+            attached_at=NOW + timedelta(minutes=5),
+        )
+
+    result = load_paper_registry_from_corpus(repository, minimum_samples=6)
+    report = result.report_for(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+
+    assert report.state == "REJECTED"
+    assert report.rejection_reasons == ("FEATURE_SCHEMA_MISMATCH",)
+
+
+def _training_payload(
+    *, value: str = "0.01", feature_set_version: str = "feature-set"
+) -> dict[str, object]:
     return {
         "feature_vector": {
             "market_id": "market",
             "asset": "BTC",
             "horizon": "5m",
-            "feature_set_version": "feature-set",
+            "feature_set_version": feature_set_version,
             "generated_at": NOW.isoformat(),
             "features": [
                 {

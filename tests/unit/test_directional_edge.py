@@ -496,6 +496,225 @@ def test_temporal_state_reports_diagnostic_counts_without_changing_snapshot() ->
     assert result.diagnostics["flip_denominator"] == 1
 
 
+def test_temporal_state_deduplicates_only_exact_source_identities() -> None:
+    state = ExternalTemporalState(
+        max_age=timedelta(seconds=10),
+        minimum_points=3,
+        deduplicate_source_identities=True,
+    )
+    for index, (seconds, value) in enumerate(
+        ((2, "100"), (1, "101"), (0, "102")), start=1
+    ):
+        ts = NOW - timedelta(seconds=seconds)
+        state.add_reference(
+            ProxyReference(
+                f"proxy-{index}",
+                "market-1",
+                Asset.BTC,
+                Decimal(value),
+                "binance-spot",
+                ts,
+                ts,
+                ts,
+            )
+        )
+    state.add_reference(
+        ProxyReference(
+            "proxy-duplicate-id-does-not-matter",
+            "market-2",
+            Asset.BTC,
+            Decimal("102"),
+            "binance-spot",
+            NOW,
+            NOW,
+            NOW,
+        )
+    )
+    lineage = EventLineage(DataSource.BINANCE_SPOT, NOW, NOW, NOW, 1)
+    duplicate_book = CryptoTopOfBook(
+        Asset.BTC,
+        Decimal("99"),
+        Decimal("10"),
+        Decimal("101"),
+        Decimal("10"),
+        123,
+        lineage,
+    )
+    state.add_book(duplicate_book)
+    state.add_book(duplicate_book)
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 77, False, lineage)
+    )
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 77, False, lineage)
+    )
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 78, False, lineage)
+    )
+
+    result = state.build_snapshot(
+        asset=Asset.BTC,
+        current_reference=ProxyReference(
+            "proxy-current",
+            "market-1",
+            Asset.BTC,
+            Decimal("102"),
+            "binance-spot",
+            NOW,
+            NOW,
+            NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    assert result.snapshot is not None
+    assert result.diagnostics["dedup_policy"] == "source_identity_v1"
+    assert result.diagnostics["reference_sample_count"] == 3
+    assert result.diagnostics["book_sample_count"] == 1
+    assert result.diagnostics["trade_sample_count"] == 2
+    assert result.diagnostics["dedup_reference_skip_count"] == 1
+    assert result.diagnostics["dedup_book_skip_count"] == 1
+    assert result.diagnostics["dedup_trade_skip_count"] == 1
+    assert result.diagnostics["unique_trade_source_timestamp_count"] == 1
+    assert result.diagnostics["unique_trade_source_identity_count"] == 2
+    assert result.diagnostics["duplicate_trade_source_identity_count"] == 0
+
+
+def test_temporal_state_legacy_default_preserves_duplicate_source_events() -> None:
+    state = ExternalTemporalState(max_age=timedelta(seconds=10), minimum_points=3)
+    for index, (seconds, value) in enumerate(
+        ((2, "100"), (1, "101"), (0, "102")), start=1
+    ):
+        ts = NOW - timedelta(seconds=seconds)
+        state.add_reference(
+            ProxyReference(
+                f"proxy-{index}",
+                "market-1",
+                Asset.BTC,
+                Decimal(value),
+                "binance-spot",
+                ts,
+                ts,
+                ts,
+            )
+        )
+    duplicate_reference = ProxyReference(
+        "proxy-duplicate-id-does-not-matter",
+        "market-2",
+        Asset.BTC,
+        Decimal("102"),
+        "binance-spot",
+        NOW,
+        NOW,
+        NOW,
+    )
+    state.add_reference(duplicate_reference)
+    lineage = EventLineage(DataSource.BINANCE_SPOT, NOW, NOW, NOW, 1)
+    duplicate_book = CryptoTopOfBook(
+        Asset.BTC,
+        Decimal("99"),
+        Decimal("10"),
+        Decimal("101"),
+        Decimal("10"),
+        123,
+        lineage,
+    )
+    state.add_book(duplicate_book)
+    state.add_book(duplicate_book)
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 77, False, lineage)
+    )
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 77, False, lineage)
+    )
+
+    result = state.build_snapshot(
+        asset=Asset.BTC,
+        current_reference=duplicate_reference,
+        observed_at=NOW,
+    )
+
+    assert result.snapshot is not None
+    assert result.diagnostics["temporal_semantics"] == "legacy_append_all"
+    assert result.diagnostics["dedup_policy"] == "none_legacy_append_all"
+    assert result.diagnostics["reference_sample_count"] == 4
+    assert result.diagnostics["book_sample_count"] == 2
+    assert result.diagnostics["trade_sample_count"] == 2
+    assert result.diagnostics["dedup_reference_skip_count"] == 0
+    assert result.diagnostics["dedup_book_skip_count"] == 0
+    assert result.diagnostics["dedup_trade_skip_count"] == 0
+    assert result.diagnostics["duplicate_book_source_identity_count"] == 1
+    assert result.diagnostics["duplicate_trade_source_identity_count"] == 1
+
+
+def test_temporal_state_reports_book_identity_conflict_without_appending() -> None:
+    state = ExternalTemporalState(
+        max_age=timedelta(seconds=10),
+        minimum_points=3,
+        deduplicate_source_identities=True,
+    )
+    for index, value in enumerate(("100", "101", "102"), start=1):
+        ts = NOW - timedelta(seconds=3 - index)
+        state.add_reference(
+            ProxyReference(
+                f"proxy-{index}",
+                "market-1",
+                Asset.BTC,
+                Decimal(value),
+                "binance-spot",
+                ts,
+                ts,
+                ts,
+            )
+        )
+    lineage = EventLineage(DataSource.BINANCE_SPOT, NOW, NOW, NOW, 1)
+    state.add_book(
+        CryptoTopOfBook(
+            Asset.BTC,
+            Decimal("99"),
+            Decimal("10"),
+            Decimal("101"),
+            Decimal("10"),
+            123,
+            lineage,
+        )
+    )
+    state.add_book(
+        CryptoTopOfBook(
+            Asset.BTC,
+            Decimal("98"),
+            Decimal("9"),
+            Decimal("102"),
+            Decimal("9"),
+            123,
+            lineage,
+        )
+    )
+    state.add_trade(
+        CryptoTrade(Asset.BTC, Decimal("100"), Decimal("1"), 77, False, lineage)
+    )
+
+    result = state.build_snapshot(
+        asset=Asset.BTC,
+        current_reference=ProxyReference(
+            "proxy-current",
+            "market-1",
+            Asset.BTC,
+            Decimal("102"),
+            "binance-spot",
+            NOW,
+            NOW,
+            NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    assert result.snapshot is not None
+    assert result.diagnostics["book_sample_count"] == 1
+    assert result.diagnostics["dedup_book_skip_count"] == 0
+    assert result.diagnostics["book_identity_conflict_count"] == 1
+
+
 def test_selected_side_requires_full_identity_matched_executable_price() -> None:
     wrong = replace(pricing("up"), token_id="other")
     assessment = assess_directional_edge(

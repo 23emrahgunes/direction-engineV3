@@ -1,5 +1,6 @@
 """Read-only dashboard snapshot assembly for V3.13."""
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -31,6 +32,11 @@ PAPER_LIST_MAX_LIMIT = 100
 DIRECTIONAL_AUDIT_EVENT_LIMIT = 5_000
 RECONCILIATION_OPEN_DETAIL_LIMIT = 100
 RECONCILIATION_RAW_DETAIL_LIMIT = 250
+P2_1_OLD_FEATURE_SCHEMA_VERSION = "v3.15.3-directional-official-ptb"
+P2_1_COMPARATOR_VERSION = "P2.1_TEMPORAL_COMPARATOR_V1"
+P2_1_CONDITIONAL_PRODUCTION_SCHEMA_VERSION = (
+    "v3.15.3-directional-official-ptb-source-dedup-v2"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +155,51 @@ def build_model_governance_status() -> dict[str, object]:
             "reason": type(exc).__name__,
         }
     return status
+
+
+def build_feature_integrity_report() -> dict[str, object]:
+    """Return a bounded P2.1 feature/temporal integrity audit payload.
+
+    This is read-only observability.  It reports the current evidence collected by
+    shadow/corpus storage and never recomputes production strategy decisions,
+    opens trades, mutates SQLite, or promotes models.
+    """
+
+    data_dir = runtime_data_dir()
+    generated_at = datetime.now(UTC)
+    corpus_report = _checkpoint_integrity_report(data_dir / "directional_corpus.sqlite3")
+    temporal_report = _temporal_integrity_report(data_dir / "shadow_evidence.sqlite3")
+    feature_delta_summary = _feature_delta_summary(temporal_report)
+    decision_impact_summary = _decision_impact_summary(temporal_report)
+    marker = "P2_1_EVIDENCE_INSUFFICIENT"
+    return {
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "status": "P2_1_FEATURE_INTEGRITY_AUDIT_READY",
+        "version": "P2.1",
+        "generated_at": generated_at.isoformat(),
+        "acceptance_marker": marker,
+        "root_cause_classification": "INSUFFICIENT_EVIDENCE",
+        "real_order_submission": False,
+        "scope": {
+            "assets": list(SUPPORTED_ASSETS),
+            "horizons": list(SUPPORTED_HORIZONS),
+            "temporal_state_scope": "asset_level_shared_across_horizons",
+            "production_execution_changed": False,
+            "model_promotion_changed": False,
+        },
+        "feature_schema_transition": {
+            "production_schema": P2_1_OLD_FEATURE_SCHEMA_VERSION,
+            "diagnostic_comparator_version": P2_1_COMPARATOR_VERSION,
+            "conditional_p2_1b_schema": P2_1_CONDITIONAL_PRODUCTION_SCHEMA_VERSION,
+            "historical_rows_rewritten": False,
+            "production_checkpoint_rows_write_dedup_v2": False,
+            "mixed_schema_training_policy": "FEATURE_SCHEMA_MISMATCH",
+        },
+        "feature_delta_summary": feature_delta_summary,
+        "decision_impact_summary": decision_impact_summary,
+        "temporal_integrity": temporal_report,
+        "checkpoint_integrity": corpus_report,
+    }
 
 
 def build_paper_reconciliation() -> dict[str, object]:
@@ -507,6 +558,347 @@ def build_directional_runtime_status() -> dict[str, object]:
         "status": "V3.15.2_DIRECTIONAL_RUNTIME_OBSERVABLE",
         "real_order_submission": False,
         "buckets": buckets,
+    }
+
+
+def _checkpoint_integrity_report(corpus_path: Path) -> dict[str, object]:
+    if not corpus_path.exists():
+        return {
+            "status": "DIRECTIONAL_CHECKPOINT_DATASET_NOT_INITIALIZED",
+            "reason": "directional_corpus.sqlite3 not found",
+            "checkpoint_row_count": 0,
+        }
+    try:
+        report = SQLiteDirectionalCorpusRepository(corpus_path).checkpoint_quality_report()
+    except sqlite3.OperationalError as exc:
+        return {
+            "status": "CHECKPOINT_SCHEMA_INCOMPATIBLE",
+            "reason": type(exc).__name__,
+            "message": str(exc),
+            "checkpoint_row_count": 0,
+        }
+    except Exception as exc:
+        return {
+            "status": "DIRECTIONAL_CHECKPOINT_DATASET_UNAVAILABLE",
+            "reason": type(exc).__name__,
+            "checkpoint_row_count": 0,
+        }
+    buckets = report.get("buckets")
+    checkpoint_row_count = 0
+    if isinstance(buckets, list):
+        for row in buckets:
+            if isinstance(row, dict):
+                checkpoint_row_count += int(row.get("row_count") or 0)
+    return dict(report) | {
+        "checkpoint_row_count": checkpoint_row_count,
+        "missing_features_remain_null": True,
+        "lookahead_policy": "feature_source_ts_must_not_exceed_feature_generated_at",
+    }
+
+
+def _int_report_field(payload: dict[str, object], key: str) -> int:
+    raw = payload.get(key, 0)
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
+    if not shadow_path.exists():
+        return {
+            "status": "SHADOW_EVIDENCE_NOT_INITIALIZED",
+            "reason": "shadow_evidence.sqlite3 not found",
+            "pipeline_event_count": 0,
+            "buckets": [],
+        }
+    shadow = SQLiteShadowRepository(shadow_path, read_only=True)
+    try:
+        events = shadow.latest_events(event_type="MARKET_DATA_PIPELINE", limit=500)
+    except Exception as exc:
+        return {
+            "status": "SHADOW_EVIDENCE_UNAVAILABLE",
+            "reason": type(exc).__name__,
+            "pipeline_event_count": 0,
+            "buckets": [],
+        }
+    buckets: list[dict[str, object]] = []
+    totals = {
+        "dedup_reference_skip_count": 0,
+        "dedup_book_skip_count": 0,
+        "dedup_trade_skip_count": 0,
+        "reference_identity_conflict_count": 0,
+        "book_identity_conflict_count": 0,
+        "duplicate_reference_source_identity_count": 0,
+        "duplicate_book_source_identity_count": 0,
+        "duplicate_trade_source_identity_count": 0,
+    }
+    seen_bucket_keys: set[str] = set()
+    for event in events:
+        bucket_key = event.get("bucket_key")
+        if bucket_key is None:
+            continue
+        bucket_key_text = str(bucket_key)
+        if bucket_key_text in seen_bucket_keys:
+            continue
+        payload_obj = event.get("payload")
+        if not isinstance(payload_obj, dict):
+            continue
+        payload = dict(payload_obj)
+        comparison_obj = payload.get("feature_integrity_comparison")
+        if not isinstance(comparison_obj, dict):
+            continue
+        comparison = dict(comparison_obj)
+        diagnostics_obj = comparison.get("diagnostic_diagnostics")
+        diagnostics = dict(diagnostics_obj) if isinstance(diagnostics_obj, dict) else {}
+        for key in totals:
+            totals[key] += int(diagnostics.get(key) or 0)
+        buckets.append(
+            {
+                "bucket_key": bucket_key_text,
+                "feature_status": payload.get("feature_status", "UNKNOWN"),
+                "comparator_version": comparison.get("version"),
+                "production_semantics": comparison.get("production_semantics"),
+                "diagnostic_semantics": comparison.get("diagnostic_semantics"),
+                "diagnostic_feature_status": comparison.get("diagnostic_feature_status"),
+                "feature_deltas": comparison.get("feature_deltas", {}),
+                "decision_impact": comparison.get("decision_impact", {}),
+                "scope": diagnostics.get("scope", "asset_level"),
+                "dedup_policy": diagnostics.get("dedup_policy", "source_identity_v1"),
+                "dedup_cache_scope": diagnostics.get("dedup_cache_scope"),
+                "dedup_retention_policy": diagnostics.get("dedup_retention_policy"),
+                "max_age_seconds": diagnostics.get("max_age_seconds"),
+                "reference_sample_count": diagnostics.get("reference_sample_count"),
+                "book_sample_count": diagnostics.get("book_sample_count"),
+                "trade_sample_count": diagnostics.get("trade_sample_count"),
+                "unique_reference_source_identity_count": diagnostics.get(
+                    "unique_reference_source_identity_count"
+                ),
+                "unique_book_source_identity_count": diagnostics.get(
+                    "unique_book_source_identity_count"
+                ),
+                "unique_trade_source_identity_count": diagnostics.get(
+                    "unique_trade_source_identity_count"
+                ),
+                "dedup_reference_skip_count": diagnostics.get("dedup_reference_skip_count", 0),
+                "dedup_book_skip_count": diagnostics.get("dedup_book_skip_count", 0),
+                "dedup_trade_skip_count": diagnostics.get("dedup_trade_skip_count", 0),
+                "reference_identity_conflict_count": diagnostics.get(
+                    "reference_identity_conflict_count", 0
+                ),
+                "book_identity_conflict_count": diagnostics.get(
+                    "book_identity_conflict_count", 0
+                ),
+                "near_duplicate_reference_count": diagnostics.get(
+                    "near_duplicate_reference_count"
+                ),
+                "near_duplicate_book_count": diagnostics.get("near_duplicate_book_count"),
+                "near_duplicate_trade_count": diagnostics.get("near_duplicate_trade_count"),
+                "flip_count": diagnostics.get("flip_count"),
+                "flip_denominator": diagnostics.get("flip_denominator"),
+            }
+        )
+        seen_bucket_keys.add(bucket_key_text)
+    total_skips = (
+        totals["dedup_reference_skip_count"]
+        + totals["dedup_book_skip_count"]
+        + totals["dedup_trade_skip_count"]
+    )
+    total_conflicts = (
+        totals["reference_identity_conflict_count"]
+        + totals["book_identity_conflict_count"]
+    )
+    duplicate_rates = {
+        "reference": _duplicate_rate(
+            buckets,
+            "dedup_reference_skip_count",
+            "reference_sample_count",
+        ),
+        "book": _duplicate_rate(buckets, "dedup_book_skip_count", "book_sample_count"),
+        "trade": _duplicate_rate(buckets, "dedup_trade_skip_count", "trade_sample_count"),
+    }
+    return {
+        "status": "TEMPORAL_SOURCE_IDENTITY_AUDIT_READY",
+        "pipeline_event_count": len(buckets),
+        "state_scope": "asset_level_shared_across_horizons",
+        "source_identity_policy": "diagnostic_shadow_comparator_only",
+        "production_temporal_semantics": "legacy_append_all",
+        "diagnostic_comparator_version": P2_1_COMPARATOR_VERSION,
+        "total_source_identity_dedup_skips": total_skips,
+        "total_source_identity_conflicts": total_conflicts,
+        "duplicate_rates": duplicate_rates,
+        "cross_horizon_reingestion": _cross_horizon_reingestion(buckets),
+        "totals": totals,
+        "buckets": buckets,
+    }
+
+
+def _feature_delta_summary(temporal_report: dict[str, object]) -> dict[str, object]:
+    buckets_obj = temporal_report.get("buckets")
+    if not isinstance(buckets_obj, list) or not buckets_obj:
+        return {
+            "status": "INSUFFICIENT_COMPARATOR_EVIDENCE",
+            "reason": "no feature_integrity_comparison events found",
+            "features": {},
+        }
+    by_feature: dict[str, list[Decimal]] = {}
+    for row_obj in buckets_obj:
+        if not isinstance(row_obj, dict):
+            continue
+        delta_obj = row_obj.get("feature_deltas")
+        if not isinstance(delta_obj, dict):
+            continue
+        features_obj = delta_obj.get("features")
+        if not isinstance(features_obj, dict):
+            continue
+        for feature_name, payload_obj in features_obj.items():
+            if not isinstance(payload_obj, dict):
+                continue
+            raw_delta = payload_obj.get("absolute_delta")
+            if raw_delta is None:
+                continue
+            try:
+                value = Decimal(str(raw_delta))
+            except Exception:
+                continue
+            by_feature.setdefault(str(feature_name), []).append(value)
+    return {
+        "status": "COMPARATOR_FEATURE_DELTA_READY" if by_feature else "NO_COMPARABLE_FEATURES",
+        "features": {
+            feature_name: _decimal_distribution(values)
+            for feature_name, values in sorted(by_feature.items())
+        },
+    }
+
+
+def _decision_impact_summary(temporal_report: dict[str, object]) -> dict[str, object]:
+    buckets_obj = temporal_report.get("buckets")
+    if not isinstance(buckets_obj, list) or not buckets_obj:
+        return {
+            "status": "INSUFFICIENT_COMPARATOR_EVIDENCE",
+            "counterfactual_trades_executed": False,
+        }
+    summary = {
+        "evaluations_compared": 0,
+        "same_decision_count": 0,
+        "different_decision_count": 0,
+        "signal_unstable_changed_count": 0,
+        "flip_rate_too_high_changed_count": 0,
+        "abstain_to_trade_candidate_count": 0,
+        "trade_candidate_to_abstain_count": 0,
+    }
+    for row_obj in buckets_obj:
+        if not isinstance(row_obj, dict):
+            continue
+        impact_obj = row_obj.get("decision_impact")
+        if not isinstance(impact_obj, dict) or impact_obj.get("evaluated") is not True:
+            continue
+        summary["evaluations_compared"] += 1
+        if impact_obj.get("same_decision") is True:
+            summary["same_decision_count"] += 1
+        else:
+            summary["different_decision_count"] += 1
+        if impact_obj.get("signal_unstable_changed") is True:
+            summary["signal_unstable_changed_count"] += 1
+        if impact_obj.get("flip_rate_too_high_changed") is True:
+            summary["flip_rate_too_high_changed_count"] += 1
+        if impact_obj.get("abstain_to_trade_candidate") is True:
+            summary["abstain_to_trade_candidate_count"] += 1
+        if impact_obj.get("trade_candidate_to_abstain") is True:
+            summary["trade_candidate_to_abstain_count"] += 1
+    return dict(summary) | {
+        "status": "COMPARATOR_DECISION_IMPACT_READY"
+        if summary["evaluations_compared"]
+        else "NO_COMPARABLE_DECISIONS",
+        "counterfactual_trades_executed": False,
+    }
+
+
+def _decimal_distribution(values: list[Decimal]) -> dict[str, object]:
+    ordered = sorted(values)
+    if not ordered:
+        return {"count": 0}
+    return {
+        "count": len(ordered),
+        "mean_absolute_delta": str(sum(ordered, Decimal("0")) / Decimal(len(ordered))),
+        "median": str(_percentile_decimal(ordered, Decimal("0.50"))),
+        "p90": str(_percentile_decimal(ordered, Decimal("0.90"))),
+        "p95": str(_percentile_decimal(ordered, Decimal("0.95"))),
+        "max": str(ordered[-1]),
+    }
+
+
+def _percentile_decimal(values: list[Decimal], percentile: Decimal) -> Decimal:
+    if len(values) == 1:
+        return values[0]
+    index = int((Decimal(len(values) - 1) * percentile).to_integral_value())
+    return values[index]
+
+
+def _duplicate_rate(
+    buckets: list[dict[str, object]],
+    duplicate_key: str,
+    sample_key: str,
+) -> dict[str, object]:
+    duplicates = sum(_int_report_field(row, duplicate_key) for row in buckets)
+    retained = sum(_int_report_field(row, sample_key) for row in buckets)
+    previous_total = duplicates + retained
+    return {
+        "duplicate_count": duplicates,
+        "retained_count": retained,
+        "previous_total_count": previous_total,
+        "rate": str(Decimal(duplicates) / Decimal(previous_total))
+        if previous_total
+        else None,
+    }
+
+
+def _cross_horizon_reingestion(buckets: list[dict[str, object]]) -> dict[str, object]:
+    by_asset: dict[str, list[dict[str, object]]] = {}
+    for row in buckets:
+        bucket_key = str(row.get("bucket_key") or "")
+        asset = bucket_key.split("-", 1)[0] if "-" in bucket_key else "UNKNOWN"
+        by_asset.setdefault(asset, []).append(row)
+    assets = {}
+    for asset, rows in by_asset.items():
+        assets[asset] = {
+            "horizon_count": len(rows),
+            "logical_appends_pre_dedup": {
+                "reference": sum(
+                    _int_report_field(row, "reference_sample_count")
+                    + _int_report_field(row, "dedup_reference_skip_count")
+                    for row in rows
+                ),
+                "book": sum(
+                    _int_report_field(row, "book_sample_count")
+                    + _int_report_field(row, "dedup_book_skip_count")
+                    for row in rows
+                ),
+                "trade": sum(
+                    _int_report_field(row, "trade_sample_count")
+                    + _int_report_field(row, "dedup_trade_skip_count")
+                    for row in rows
+                ),
+            },
+            "dedup_rejected_reingestions": {
+                "reference": sum(
+                    _int_report_field(row, "dedup_reference_skip_count") for row in rows
+                ),
+                "book": sum(_int_report_field(row, "dedup_book_skip_count") for row in rows),
+                "trade": sum(
+                    _int_report_field(row, "dedup_trade_skip_count") for row in rows
+                ),
+            },
+        }
+    return {
+        "status": "DERIVED_FROM_LATEST_BOUNDED_PIPELINE_DIAGNOSTICS",
+        "assets": assets,
     }
 
 

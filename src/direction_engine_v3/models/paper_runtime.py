@@ -210,7 +210,9 @@ def _fit_l2_logistic_bucket(
 ) -> tuple[LogisticArtifact, ReliabilityCalibrator]:
     first = records[0]
     feature_names, feature_set_version = _feature_schema(first)
-    rows = tuple(_feature_row(record, feature_names) for record in records)
+    rows = tuple(
+        _feature_row(record, feature_names, feature_set_version) for record in records
+    )
     observed_up = sum(1 for item in records if item.outcome_up)
     observed_down = len(records) - observed_up
     if observed_up == 0 or observed_down == 0:
@@ -268,8 +270,11 @@ def _feature_schema(record: DirectionalTrainingRecord) -> tuple[tuple[str, ...],
 def _feature_row(
     record: DirectionalTrainingRecord,
     feature_names: tuple[str, ...],
+    feature_set_version: str,
 ) -> tuple[float, ...]:
-    names, _version = _feature_schema(record)
+    names, version = _feature_schema(record)
+    if version != feature_set_version:
+        raise ValueError("FEATURE_SCHEMA_MISMATCH")
     if names != feature_names:
         raise ValueError("MODEL_ARTIFACT_INVALID")
     feature_vector = record.payload["feature_vector"]

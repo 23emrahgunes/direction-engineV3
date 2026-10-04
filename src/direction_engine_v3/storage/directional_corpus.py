@@ -400,6 +400,14 @@ class SQLiteDirectionalCorpusRepository:
             feature_rows = connection.execute(
                 "SELECT payload_json FROM directional_checkpoint_observations"
             ).fetchall()
+            schema_rows = connection.execute(
+                """
+                SELECT feature_schema_version,COUNT(*)
+                FROM directional_checkpoint_observations
+                GROUP BY feature_schema_version
+                ORDER BY feature_schema_version
+                """
+            ).fetchall()
         missing_counts: dict[str, int] = {}
         feature_counts: dict[str, int] = {}
         future_timestamp_violations = 0
@@ -443,6 +451,9 @@ class SQLiteDirectionalCorpusRepository:
             "checkpoint_tolerance_seconds": 10,
             "buckets": buckets,
             "duplicate_reject_count": int((duplicate_rows or (0,))[0] or 0),
+            "feature_schema_versions": {
+                str(row[0]): int(row[1] or 0) for row in schema_rows
+            },
             "missing_feature_counts": missing_counts,
             "feature_observation_counts": feature_counts,
             "future_timestamp_violations": future_timestamp_violations,

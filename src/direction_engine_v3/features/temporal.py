@@ -25,25 +25,62 @@ class TemporalFeatureResult:
 class ExternalTemporalState:
     """Per-asset bounded history; uses event timestamps and never fabricates values."""
 
-    def __init__(self, *, max_age: timedelta, minimum_points: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        max_age: timedelta,
+        minimum_points: int = 3,
+        deduplicate_source_identities: bool = False,
+    ) -> None:
         if max_age <= timedelta(0):
             raise ValueError("max_age must be positive")
         if minimum_points < 2:
             raise ValueError("minimum_points must be at least two")
         self._max_age = max_age
         self._minimum_points = minimum_points
+        self._deduplicate_source_identities = deduplicate_source_identities
         self._references: dict[Asset, deque[OfficialReference | ProxyReference]] = {}
         self._books: dict[Asset, deque[CryptoTopOfBook]] = {}
         self._trades: dict[Asset, deque[CryptoTrade]] = {}
+        self._dedup_skips: dict[Asset, dict[str, int]] = {}
+        self._identity_conflicts: dict[Asset, dict[str, int]] = {}
 
     def add_reference(self, reference: OfficialReference | ProxyReference) -> None:
-        self._references.setdefault(reference.asset, deque()).append(reference)
+        queue = self._references.setdefault(reference.asset, deque())
+        if self._deduplicate_source_identities:
+            identity = _reference_identity(reference)
+            conflict_key = _reference_conflict_key(reference)
+            for item in queue:
+                if _reference_identity(item) == identity:
+                    self._record_dedup_skip(reference.asset, "reference")
+                    return
+                if _reference_conflict_key(item) == conflict_key:
+                    self._record_identity_conflict(reference.asset, "reference")
+                    return
+        queue.append(reference)
 
     def add_book(self, book: CryptoTopOfBook) -> None:
-        self._books.setdefault(book.asset, deque()).append(book)
+        queue = self._books.setdefault(book.asset, deque())
+        if self._deduplicate_source_identities:
+            identity = _book_identity(book)
+            for item in queue:
+                if _book_identity(item) != identity:
+                    continue
+                if _book_payload(item) != _book_payload(book):
+                    self._record_identity_conflict(book.asset, "book")
+                else:
+                    self._record_dedup_skip(book.asset, "book")
+                return
+        queue.append(book)
 
     def add_trade(self, trade: CryptoTrade) -> None:
-        self._trades.setdefault(trade.asset, deque()).append(trade)
+        queue = self._trades.setdefault(trade.asset, deque())
+        if self._deduplicate_source_identities:
+            identity = _trade_identity(trade)
+            if any(_trade_identity(item) == identity for item in queue):
+                self._record_dedup_skip(trade.asset, "trade")
+                return
+        queue.append(trade)
 
     def build_snapshot(
         self,
@@ -172,9 +209,24 @@ class ExternalTemporalState:
         reference_ts = tuple(item.source_ts for item in references)
         book_ts = tuple(item.lineage.source_ts or item.lineage.recv_ts for item in books)
         trade_ts = tuple(item.lineage.source_ts or item.lineage.recv_ts for item in trades)
+        reference_identities = tuple(_reference_identity(item) for item in references)
+        book_identities = tuple(_book_identity(item) for item in books)
+        trade_identities = tuple(_trade_identity(item) for item in trades)
+        dedup_skips = self._dedup_skips.get(asset, {})
+        identity_conflicts = self._identity_conflicts.get(asset, {})
         return {
             "scope": "asset_level",
             "asset": asset.value,
+            "temporal_semantics": "source_identity_dedup_diagnostic"
+            if self._deduplicate_source_identities
+            else "legacy_append_all",
+            "dedup_policy": "source_identity_v1"
+            if self._deduplicate_source_identities
+            else "none_legacy_append_all",
+            "dedup_cache_scope": "in_memory_ephemeral_per_process",
+            "dedup_retention_policy": "bounded_by_temporal_max_age_prune_on_snapshot",
+            "max_age_seconds": self._max_age.total_seconds(),
+            "minimum_points": self._minimum_points,
             "near_duplicate_interval_seconds": 2,
             "reference_sample_count": len(references),
             "book_sample_count": len(books),
@@ -182,6 +234,25 @@ class ExternalTemporalState:
             "unique_reference_source_timestamp_count": len(set(reference_ts)),
             "unique_book_source_timestamp_count": len(set(book_ts)),
             "unique_trade_source_timestamp_count": len(set(trade_ts)),
+            "unique_reference_source_identity_count": len(set(reference_identities)),
+            "unique_book_source_identity_count": len(set(book_identities)),
+            "unique_trade_source_identity_count": len(set(trade_identities)),
+            "duplicate_reference_source_identity_count": (
+                len(reference_identities) - len(set(reference_identities))
+            ),
+            "duplicate_book_source_identity_count": (
+                len(book_identities) - len(set(book_identities))
+            ),
+            "duplicate_trade_source_identity_count": (
+                len(trade_identities) - len(set(trade_identities))
+            ),
+            "dedup_reference_skip_count": int(dedup_skips.get("reference", 0)),
+            "dedup_book_skip_count": int(dedup_skips.get("book", 0)),
+            "dedup_trade_skip_count": int(dedup_skips.get("trade", 0)),
+            "reference_identity_conflict_count": int(
+                identity_conflicts.get("reference", 0)
+            ),
+            "book_identity_conflict_count": int(identity_conflicts.get("book", 0)),
             "near_duplicate_reference_count": _near_duplicate_count(reference_ts),
             "near_duplicate_book_count": _near_duplicate_count(book_ts),
             "near_duplicate_trade_count": _near_duplicate_count(trade_ts),
@@ -194,6 +265,14 @@ class ExternalTemporalState:
             "flip_count": flip_count,
             "flip_denominator": max(len(signs) - 1, 1),
         }
+
+    def _record_dedup_skip(self, asset: Asset, kind: str) -> None:
+        by_kind = self._dedup_skips.setdefault(asset, {})
+        by_kind[kind] = int(by_kind.get(kind, 0)) + 1
+
+    def _record_identity_conflict(self, asset: Asset, kind: str) -> None:
+        by_kind = self._identity_conflicts.setdefault(asset, {})
+        by_kind[kind] = int(by_kind.get(kind, 0)) + 1
 
 
 def _return(previous: Decimal, current: Decimal) -> Decimal:
@@ -215,3 +294,43 @@ def _near_duplicate_count(timestamps: tuple[datetime, ...]) -> int:
         for left, right in pairwise(ordered)
         if timedelta(0) <= right - left <= timedelta(seconds=2)
     )
+
+
+def _reference_identity(
+    reference: OfficialReference | ProxyReference,
+) -> tuple[str, str, str, str, str]:
+    return (
+        str(reference.source),
+        reference.asset.value,
+        reference.source_ts.isoformat(),
+        str(reference.value),
+        reference.kind.value,
+    )
+
+
+def _reference_conflict_key(
+    reference: OfficialReference | ProxyReference,
+) -> tuple[str, str, str, str]:
+    return (
+        str(reference.source),
+        reference.asset.value,
+        reference.source_ts.isoformat(),
+        reference.kind.value,
+    )
+
+
+def _book_identity(book: CryptoTopOfBook) -> tuple[str, str, int]:
+    return (book.lineage.source.value, book.asset.value, book.update_id)
+
+
+def _book_payload(book: CryptoTopOfBook) -> tuple[str, str, str, str]:
+    return (
+        str(book.bid_price),
+        str(book.bid_quantity),
+        str(book.ask_price),
+        str(book.ask_quantity),
+    )
+
+
+def _trade_identity(trade: CryptoTrade) -> tuple[str, str, int]:
+    return (trade.lineage.source.value, trade.asset.value, trade.trade_id)
