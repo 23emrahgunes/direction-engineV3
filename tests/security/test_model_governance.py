@@ -9,6 +9,8 @@ from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS, MarketBuck
 from direction_engine_v3.models import (
     PAPER_RESEARCH_BASELINE_MODEL_VERSION,
     ModelExecutionPermission,
+    ModelGovernanceDecision,
+    ModelGovernanceState,
     calibration,
     contracts,
     directional_paper_governance_decision,
@@ -87,3 +89,47 @@ def test_paper_research_baseline_has_no_paper_execution_permission() -> None:
     assert decision.execution_permission is ModelExecutionPermission.NONE
     assert decision.reason == "MODEL_NOT_PROMOTED"
     assert decision.as_dict()["real_order_submission"] is False
+
+
+def test_limited_paper_permission_is_exact_bucket_and_model_scoped() -> None:
+    promoted_bucket = MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES)
+    promoted_model = "PAPER_LOGISTIC:BTC:5m:v2"
+    promoted = {
+        (promoted_bucket, promoted_model): ModelGovernanceDecision(
+            promoted_bucket,
+            ModelGovernanceState.LIMITED_PAPER,
+            ModelExecutionPermission.LIMITED_PAPER,
+            "PROMOTED_MODEL_AUTHORIZED",
+            promoted_model,
+            "promotion-1",
+        )
+    }
+    forecast = ProbabilityForecast(
+        "market",
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.60"),
+        Decimal("0.40"),
+        promoted_model,
+        "calibration-v2",
+        "features",
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    accepted = directional_paper_governance_decision(
+        promoted_bucket,
+        forecast,
+        promoted,
+    )
+    rejected_other_bucket = directional_paper_governance_decision(
+        MarketBucket(Asset.ETH, Horizon.FIVE_MINUTES),
+        forecast,
+        promoted,
+    )
+
+    assert accepted.paper_execution_allowed is True
+    assert accepted.execution_permission is ModelExecutionPermission.LIMITED_PAPER
+    assert accepted.promotion_id == "promotion-1"
+    assert rejected_other_bucket.paper_execution_allowed is False
+    assert rejected_other_bucket.reason == "MODEL_NOT_PROMOTED"

@@ -103,6 +103,52 @@ def test_directional_corpus_training_ready_query_is_indexed_and_boundable(tmp_pa
     assert "idx_directional_corpus_condition_observed" in indexes
 
 
+def test_directional_checkpoint_capture_is_idempotent_and_official_labeled(
+    tmp_path,
+) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+
+    first = repository.save_checkpoint_observation(
+        checkpoint_id="checkpoint-1",
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition",
+        checkpoint_target_tte_seconds=60,
+        feature_schema_version="feature-set",
+        observed_at=NOW,
+        actual_tte_seconds=58,
+        payload=_training_payload(),
+    )
+    second = repository.save_checkpoint_observation(
+        checkpoint_id="checkpoint-duplicate",
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id="condition",
+        checkpoint_target_tte_seconds=60,
+        feature_schema_version="feature-set",
+        observed_at=NOW + timedelta(seconds=1),
+        actual_tte_seconds=57,
+        payload=_training_payload(),
+    )
+
+    assert second.checkpoint_id == first.checkpoint_id
+    updated = repository.attach_verified_outcome_to_condition_once(
+        condition_id="condition",
+        outcome={"settlement_source_kind": "OFFICIAL", "outcome_up": True},
+        official_resolved_at=NOW + timedelta(minutes=5),
+        attached_at=NOW + timedelta(minutes=6),
+    )
+    report = repository.checkpoint_quality_report()
+
+    assert updated == 1
+    assert repository.get_checkpoint(first.checkpoint_id).outcome_attached is True  # type: ignore[union-attr]
+    assert report["duplicate_reject_count"] == 0
+    assert report["future_timestamp_violations"] == 0
+    assert report["buckets"][0]["row_count"] == 1
+    assert report["buckets"][0]["labeled_row_count"] == 1
+
+
 def test_paper_registry_reports_exact_bucket_insufficient_sample_without_fallback(
     tmp_path,
 ) -> None:
@@ -187,7 +233,60 @@ def test_paper_research_baseline_rejects_polymarket_alpha_feature() -> None:
         paper_research_baseline_forecast(features, generated_at=NOW)
 
 
-def _training_payload() -> dict[str, object]:
+def test_paper_registry_rejects_degenerate_single_class_model(tmp_path) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+    for index in range(4):
+        repository.save_pre_outcome(
+            record_id=f"single-class-{index}",
+            asset=Asset.BTC,
+            horizon=Horizon.FIVE_MINUTES,
+            condition_id=f"condition-{index}",
+            observed_at=NOW + timedelta(seconds=index),
+            payload=_training_payload(value=f"0.0{index + 1}"),
+        )
+        repository.attach_verified_outcome_once(
+            record_id=f"single-class-{index}",
+            outcome={"settlement_source_kind": "OFFICIAL", "outcome_up": True},
+            attached_at=NOW + timedelta(minutes=5),
+        )
+
+    result = load_paper_registry_from_corpus(repository, minimum_samples=4)
+    report = result.report_for(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+
+    assert report.state == "REJECTED"
+    assert report.rejection_reasons == ("DEGENERATE_MODEL_SINGLE_CLASS",)
+
+
+def test_paper_registry_trains_non_degenerate_l2_shadow_candidate(tmp_path) -> None:
+    repository = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    repository.initialize()
+    for index in range(6):
+        repository.save_pre_outcome(
+            record_id=f"varied-{index}",
+            asset=Asset.BTC,
+            horizon=Horizon.FIVE_MINUTES,
+            condition_id=f"condition-{index}",
+            observed_at=NOW + timedelta(seconds=index),
+            payload=_training_payload(value=str(Decimal(index + 1) / Decimal("100"))),
+        )
+        repository.attach_verified_outcome_once(
+            record_id=f"varied-{index}",
+            outcome={"settlement_source_kind": "OFFICIAL", "outcome_up": index >= 3},
+            attached_at=NOW + timedelta(minutes=5),
+        )
+
+    result = load_paper_registry_from_corpus(repository, minimum_samples=6)
+    report = result.report_for(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+    state = result.registry.state_for(MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES))
+
+    assert report.state == "SHADOW_CANDIDATE"
+    assert report.reason == "PAPER_BUCKET_CHALLENGER_READY"
+    assert state.artifact is not None
+    assert any(coefficient != Decimal("0") for coefficient in state.artifact.coefficients)
+
+
+def _training_payload(*, value: str = "0.01") -> dict[str, object]:
     return {
         "feature_vector": {
             "market_id": "market",
@@ -198,7 +297,7 @@ def _training_payload() -> dict[str, object]:
             "features": [
                 {
                     "name": "ptb_normalized_distance",
-                    "value": "0.01",
+                    "value": value,
                     "source": "BINANCE_EXTERNAL_FEATURES",
                     "source_ts": NOW.isoformat(),
                 }

@@ -1,6 +1,7 @@
 """Persistence, ledger, and repository-interface boundary."""
 
 from direction_engine_v3.storage.directional_corpus import (
+    DirectionalCheckpointRecord,
     DirectionalCorpusRecord,
     DirectionalTrainingRecord,
     SQLiteDirectionalCorpusRepository,
@@ -16,6 +17,7 @@ from direction_engine_v3.storage.paper import (
 )
 
 __all__ = [
+    "DirectionalCheckpointRecord",
     "DirectionalCorpusRecord",
     "DirectionalTrainingRecord",
     "PaperAbstainRecord",

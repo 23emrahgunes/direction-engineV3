@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from math import exp, log
 
 from direction_engine_v3.domain import Asset, FeatureVector, Horizon, ProbabilityForecast
 from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS, MarketBucket
@@ -37,6 +38,7 @@ class PaperBucketTrainingReport:
     reason: str
     model_version: str | None = None
     calibration_version: str | None = None
+    rejection_reasons: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -48,6 +50,7 @@ class PaperBucketTrainingReport:
             "reason": self.reason,
             "model_version": self.model_version,
             "calibration_version": self.calibration_version,
+            "rejection_reasons": list(self.rejection_reasons),
             "live_ready": False,
         }
 
@@ -112,7 +115,29 @@ def load_paper_registry_from_corpus(
                 )
             )
             continue
-        artifact, calibrator = _fit_intercept_only_bucket(bucket, records)
+        try:
+            artifact, calibrator = _fit_l2_logistic_bucket(bucket, records)
+        except ValueError as exc:
+            readiness = CalibrationReadiness(
+                bucket.asset,
+                bucket.horizon,
+                "REJECTED",
+                count,
+                False,
+            )
+            states.append(BucketModelState(bucket, readiness))
+            reports.append(
+                PaperBucketTrainingReport(
+                    bucket.asset,
+                    bucket.horizon,
+                    count,
+                    minimum_samples,
+                    "REJECTED",
+                    str(exc),
+                    rejection_reasons=(str(exc),),
+                )
+            )
+            continue
         readiness = CalibrationReadiness(
             bucket.asset,
             bucket.horizon,
@@ -128,7 +153,7 @@ def load_paper_registry_from_corpus(
                 count,
                 minimum_samples,
                 "SHADOW_CANDIDATE",
-                "PAPER_BUCKET_MODEL_READY",
+                "PAPER_BUCKET_CHALLENGER_READY",
                 artifact.model_version,
                 calibrator.calibration_version,
             )
@@ -179,31 +204,34 @@ def paper_research_baseline_forecast(
     return forecast, readiness
 
 
-def _fit_intercept_only_bucket(
+def _fit_l2_logistic_bucket(
     bucket: MarketBucket,
     records: tuple[DirectionalTrainingRecord, ...],
 ) -> tuple[LogisticArtifact, ReliabilityCalibrator]:
     first = records[0]
-    payload = first.payload
-    feature_vector = payload["feature_vector"]
-    if not isinstance(feature_vector, dict):
-        raise ValueError("training payload feature_vector must be an object")
-    features = feature_vector["features"]
-    if not isinstance(features, list):
-        raise ValueError("training payload features must be a list")
-    feature_names = tuple(
-        str(item["name"]) for item in features if isinstance(item, dict)
-    )
+    feature_names, feature_set_version = _feature_schema(first)
+    rows = tuple(_feature_row(record, feature_names) for record in records)
     observed_up = sum(1 for item in records if item.outcome_up)
+    observed_down = len(records) - observed_up
+    if observed_up == 0 or observed_down == 0:
+        raise ValueError("DEGENERATE_MODEL_SINGLE_CLASS")
+    if all(
+        len({row[index] for row in rows}) <= 1
+        for index in range(len(feature_names))
+    ):
+        raise ValueError("DEGENERATE_MODEL_NEAR_ZERO_VARIANCE")
+    coefficients, intercept = _fit_l2_coefficients(
+        rows,
+        tuple(record.outcome_up for record in records),
+    )
     base_rate = Decimal(observed_up) / Decimal(len(records))
     base_rate = _clamp(base_rate, _MIN_PROBABILITY, _MAX_PROBABILITY)
-    odds = base_rate / (_ONE - base_rate)
     artifact = LogisticArtifact(
         model_version=f"{PAPER_TRAINED_MODEL_VERSION_PREFIX}:{bucket.asset.value}:{bucket.horizon.value}",
-        feature_set_version=str(feature_vector["feature_set_version"]),
+        feature_set_version=feature_set_version,
         feature_names=feature_names,
-        coefficients=tuple(_ZERO for _ in feature_names),
-        intercept=odds.ln(),
+        coefficients=coefficients,
+        intercept=intercept,
         schema_hash=feature_schema_hash(feature_names),
     )
     latest_observed_at = max(item.observed_at for item in records)
@@ -218,6 +246,81 @@ def _fit_intercept_only_bucket(
         trained_through=latest_observed_at,
     )
     return artifact, calibrator
+
+
+def _feature_schema(record: DirectionalTrainingRecord) -> tuple[tuple[str, ...], str]:
+    feature_vector = record.payload.get("feature_vector")
+    if not isinstance(feature_vector, dict):
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    feature_set_version = feature_vector.get("feature_set_version")
+    features = feature_vector.get("features")
+    if not isinstance(feature_set_version, str) or not feature_set_version:
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    if not isinstance(features, list) or not features:
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    names = tuple(str(item.get("name")) for item in features if isinstance(item, dict))
+    if len(names) != len(features):
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    feature_schema_hash(names)
+    return names, feature_set_version
+
+
+def _feature_row(
+    record: DirectionalTrainingRecord,
+    feature_names: tuple[str, ...],
+) -> tuple[float, ...]:
+    names, _version = _feature_schema(record)
+    if names != feature_names:
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    feature_vector = record.payload["feature_vector"]
+    if not isinstance(feature_vector, dict):
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    features = feature_vector["features"]
+    if not isinstance(features, list):
+        raise ValueError("MODEL_ARTIFACT_INVALID")
+    values = []
+    for item in features:
+        if not isinstance(item, dict) or item.get("value") is None:
+            raise ValueError("MODEL_ARTIFACT_INVALID")
+        values.append(float(Decimal(str(item["value"]))))
+    return tuple(values)
+
+
+def _fit_l2_coefficients(
+    rows: tuple[tuple[float, ...], ...],
+    labels: tuple[bool, ...],
+    *,
+    iterations: int = 300,
+    learning_rate: float = 0.05,
+    l2_penalty: float = 0.01,
+) -> tuple[tuple[Decimal, ...], Decimal]:
+    width = len(rows[0])
+    coefficients = [0.0] * width
+    positive_rate = sum(1 for label in labels if label) / len(labels)
+    intercept = log(positive_rate / (1.0 - positive_rate))
+    for _ in range(iterations):
+        gradients = [0.0] * width
+        intercept_gradient = 0.0
+        for row, label in zip(rows, labels, strict=True):
+            score = intercept + sum(
+                coefficient * value
+                for coefficient, value in zip(coefficients, row, strict=True)
+            )
+            probability = 1.0 / (1.0 + exp(-max(-40.0, min(40.0, score))))
+            error = probability - float(label)
+            intercept_gradient += error
+            for index, value in enumerate(row):
+                gradients[index] += error * value
+        scale = 1.0 / len(rows)
+        intercept -= learning_rate * intercept_gradient * scale
+        for index in range(width):
+            coefficients[index] -= learning_rate * (
+                gradients[index] * scale + l2_penalty * coefficients[index]
+            )
+    return (
+        tuple(Decimal(str(coefficient)) for coefficient in coefficients),
+        Decimal(str(intercept)),
+    )
 
 
 def _clamp(value: Decimal, lower: Decimal, upper: Decimal) -> Decimal:

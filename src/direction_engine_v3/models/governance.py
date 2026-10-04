@@ -1,5 +1,6 @@
 """PAPER-only model governance and execution-permission contracts."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -20,11 +21,18 @@ class ModelExecutionPermission(StrEnum):
 
 class ModelGovernanceState(StrEnum):
     RESEARCH_ONLY = "RESEARCH_ONLY"
+    CHALLENGER = "CHALLENGER"
     SHADOW_ONLY = "SHADOW_ONLY"
+    SHADOW_CANDIDATE = "SHADOW_CANDIDATE"
+    SHADOW_PROMOTED = "SHADOW_PROMOTED"
+    LIMITED_PAPER = "LIMITED_PAPER"
+    PAPER_PROMOTED = "PAPER_PROMOTED"
     HISTORICAL_RESEARCH_ONLY = "HISTORICAL_RESEARCH_ONLY"
     SUSPECT = "SUSPECT"
     NON_PROMOTABLE = "NON_PROMOTABLE"
     REJECTED = "REJECTED"
+    QUARANTINED = "QUARANTINED"
+    RETIRED = "RETIRED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,7 @@ class ModelGovernanceDecision:
 def directional_paper_governance_decision(
     bucket: MarketBucket,
     forecast: ProbabilityForecast | None,
+    promoted_models: Mapping[tuple[MarketBucket, str], ModelGovernanceDecision] | None = None,
 ) -> ModelGovernanceDecision:
     """Return the PAPER execution permission for a Directional model.
 
@@ -70,6 +79,19 @@ def directional_paper_governance_decision(
     """
 
     model_version = None if forecast is None else forecast.model_version
+    if model_version is not None and promoted_models is not None:
+        promoted = promoted_models.get((bucket, model_version))
+        if promoted is not None:
+            if not promoted.paper_execution_allowed:
+                return promoted
+            return ModelGovernanceDecision(
+                bucket=bucket,
+                state=promoted.state,
+                execution_permission=promoted.execution_permission,
+                reason="PROMOTED_MODEL_AUTHORIZED",
+                model_version=model_version,
+                promotion_id=promoted.promotion_id,
+            )
     if model_version == PAPER_RESEARCH_BASELINE_MODEL_VERSION:
         state = ModelGovernanceState.HISTORICAL_RESEARCH_ONLY
         reason = "MODEL_NOT_PROMOTED"

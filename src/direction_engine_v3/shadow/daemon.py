@@ -157,6 +157,8 @@ _PAPER_POOR_PERFORMANCE_REDUCED_STAKE_USDC = Decimal("0.75")
 _PAPER_SETTLEMENT_SCAN_TIMEOUT_SECONDS = 20.0
 _BUCKET_COLLECTION_TIMEOUT_SECONDS = 75.0
 _PAPER_MODEL_MAX_TRAINING_RECORDS_PER_BUCKET = 2_000
+_DIRECTIONAL_CHECKPOINT_TARGETS_SECONDS = (120, 90, 60, 45)
+_DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS = 10
 _ASSET_NAME = {
     Asset.BTC: "bitcoin",
     Asset.ETH: "ethereum",
@@ -1889,6 +1891,63 @@ class ShadowDaemon:
                 "price_to_beat": _price_to_beat_payload(state.price_to_beat),
                 "directional_reason": reason,
                 "model_state": model_status.state.value,
+                "label": _PAPER_LABEL,
+            },
+        )
+        self._save_directional_checkpoint_observation(state, cycle_id=cycle_id)
+
+    def _save_directional_checkpoint_observation(
+        self,
+        state: ShadowMarketState,
+        *,
+        cycle_id: str,
+    ) -> None:
+        if (
+            self._directional_corpus_repository is None
+            or state.discovery is None
+            or state.directional_features is None
+        ):
+            return
+        market = state.discovery.market
+        tte = market.window_end - state.observed_at
+        actual_tte_seconds = round(tte.total_seconds())
+        target = next(
+            (
+                item
+                for item in _DIRECTIONAL_CHECKPOINT_TARGETS_SECONDS
+                if abs(actual_tte_seconds - item)
+                <= _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS
+            ),
+            None,
+        )
+        if target is None:
+            return
+        feature_schema_version = state.directional_features.feature_set_version
+        self._directional_corpus_repository.save_checkpoint_observation(
+            checkpoint_id=(
+                f"{cycle_id}:directional-checkpoint:{state.bucket.asset.value}:"
+                f"{state.bucket.horizon.value}:{target}:{market.condition_id}:"
+                f"{feature_schema_version}"
+            ),
+            asset=state.bucket.asset,
+            horizon=state.bucket.horizon,
+            condition_id=market.condition_id,
+            checkpoint_target_tte_seconds=target,
+            feature_schema_version=feature_schema_version,
+            observed_at=state.observed_at,
+            actual_tte_seconds=actual_tte_seconds,
+            payload={
+                "market_id": market.market_id,
+                "window_start": market.window_start,
+                "window_end": market.window_end,
+                "checkpoint_target_tte_seconds": target,
+                "checkpoint_tolerance_seconds": _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS,
+                "actual_tte_seconds": actual_tte_seconds,
+                "feature_vector": _feature_vector_payload(state.directional_features),
+                "price_to_beat": _price_to_beat_payload(state.price_to_beat),
+                "official_reference_ready": state.official_reference is not None,
+                "proxy_reference_ready": state.proxy_reference is not None,
+                "book_ready": state.up_book is not None and state.down_book is not None,
                 "label": _PAPER_LABEL,
             },
         )

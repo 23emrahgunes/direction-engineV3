@@ -24,7 +24,7 @@ from direction_engine_v3.observability import (
     ReadinessReport,
 )
 from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteShadowRepository
-from direction_engine_v3.storage import SQLitePaperRepository
+from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 
 PAPER_LIST_DEFAULT_LIMIT = 25
 PAPER_LIST_MAX_LIMIT = 100
@@ -131,7 +131,24 @@ def build_paper_summary() -> dict[str, object]:
 
 
 def build_model_governance_status() -> dict[str, object]:
-    return default_directional_governance_status()
+    status = default_directional_governance_status()
+    corpus_path = runtime_data_dir() / "directional_corpus.sqlite3"
+    if not corpus_path.exists():
+        status["dataset_quality"] = {
+            "status": "DIRECTIONAL_CHECKPOINT_DATASET_NOT_INITIALIZED",
+            "reason": "directional_corpus.sqlite3 not found",
+        }
+        return status
+    try:
+        status["dataset_quality"] = SQLiteDirectionalCorpusRepository(
+            corpus_path
+        ).checkpoint_quality_report()
+    except Exception as exc:
+        status["dataset_quality"] = {
+            "status": "DIRECTIONAL_CHECKPOINT_DATASET_UNAVAILABLE",
+            "reason": type(exc).__name__,
+        }
+    return status
 
 
 def build_paper_reconciliation() -> dict[str, object]:
