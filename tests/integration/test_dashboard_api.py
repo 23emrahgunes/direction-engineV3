@@ -273,6 +273,18 @@ def test_feature_integrity_endpoint_reports_bounded_duplicate_evidence(
                             }
                         },
                     },
+                },
+            },
+            observed_at=observed_at + timedelta(seconds=index),
+        )
+        repository.append_event(
+            event_id=f"strategy-{index}",
+            window_id="window",
+            event_type="STRATEGY_EVALUATION",
+            bucket_key=bucket_key,
+            payload={
+                "strategy": "DIRECTIONAL_EDGE",
+                "feature_integrity_comparison": {
                     "decision_impact": {
                         "evaluated": True,
                         "same_decision": index != 0,
@@ -312,6 +324,8 @@ async def _assert_feature_integrity_endpoint_reports_duplicate_evidence() -> Non
     assert temporal["production_temporal_semantics"] == "legacy_append_all"
     assert temporal["total_source_identity_dedup_skips"] == 9
     assert temporal["total_source_identity_conflicts"] == 1
+    assert temporal["decision_impact_source_status"] == "STRATEGY_EVALUATION_READY"
+    assert temporal["decision_impact_bucket_count"] == 3
     assert temporal["duplicate_rates"]["trade"] == {
         "duplicate_count": 3,
         "retained_count": 6,

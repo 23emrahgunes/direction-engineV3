@@ -1,6 +1,7 @@
 """Read-only dashboard snapshot assembly for V3.13."""
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -628,6 +629,15 @@ def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
             "pipeline_event_count": 0,
             "buckets": [],
         }
+    try:
+        strategy_events = shadow.latest_events(event_type="STRATEGY_EVALUATION", limit=500)
+        decision_impact_by_bucket = _latest_comparator_decision_impact_by_bucket(
+            strategy_events
+        )
+        decision_impact_source_status = "STRATEGY_EVALUATION_READY"
+    except Exception:
+        decision_impact_by_bucket = {}
+        decision_impact_source_status = "STRATEGY_EVALUATION_UNAVAILABLE"
     buckets: list[dict[str, object]] = []
     totals = {
         "dedup_reference_skip_count": 0,
@@ -659,6 +669,14 @@ def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
         diagnostics = dict(diagnostics_obj) if isinstance(diagnostics_obj, dict) else {}
         for key in totals:
             totals[key] += int(diagnostics.get(key) or 0)
+        decision_impact_obj = decision_impact_by_bucket.get(bucket_key_text)
+        if decision_impact_obj is None:
+            pipeline_impact_obj = comparison.get("decision_impact")
+            decision_impact_obj = (
+                dict(pipeline_impact_obj)
+                if isinstance(pipeline_impact_obj, dict)
+                else {}
+            )
         buckets.append(
             {
                 "bucket_key": bucket_key_text,
@@ -668,7 +686,7 @@ def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
                 "diagnostic_semantics": comparison.get("diagnostic_semantics"),
                 "diagnostic_feature_status": comparison.get("diagnostic_feature_status"),
                 "feature_deltas": comparison.get("feature_deltas", {}),
-                "decision_impact": comparison.get("decision_impact", {}),
+                "decision_impact": decision_impact_obj,
                 "scope": diagnostics.get("scope", "asset_level"),
                 "dedup_policy": diagnostics.get("dedup_policy", "source_identity_v1"),
                 "dedup_cache_scope": diagnostics.get("dedup_cache_scope"),
@@ -726,6 +744,8 @@ def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
     return {
         "status": "TEMPORAL_SOURCE_IDENTITY_AUDIT_READY",
         "pipeline_event_count": len(buckets),
+        "decision_impact_source_status": decision_impact_source_status,
+        "decision_impact_bucket_count": len(decision_impact_by_bucket),
         "state_scope": "asset_level_shared_across_horizons",
         "source_identity_policy": "diagnostic_shadow_comparator_only",
         "production_temporal_semantics": "legacy_append_all",
@@ -737,6 +757,29 @@ def _temporal_integrity_report(shadow_path: Path) -> dict[str, object]:
         "totals": totals,
         "buckets": buckets,
     }
+
+
+def _latest_comparator_decision_impact_by_bucket(
+    events: Sequence[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    impacts: dict[str, dict[str, object]] = {}
+    for event in events:
+        bucket_key = event.get("bucket_key")
+        if bucket_key is None:
+            continue
+        bucket_key_text = str(bucket_key)
+        if bucket_key_text in impacts:
+            continue
+        payload_obj = event.get("payload")
+        if not isinstance(payload_obj, dict):
+            continue
+        comparison_obj = payload_obj.get("feature_integrity_comparison")
+        if not isinstance(comparison_obj, dict):
+            continue
+        impact_obj = comparison_obj.get("decision_impact")
+        if isinstance(impact_obj, dict):
+            impacts[bucket_key_text] = dict(impact_obj)
+    return impacts
 
 
 def _feature_delta_summary(temporal_report: dict[str, object]) -> dict[str, object]:
