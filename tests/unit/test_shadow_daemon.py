@@ -148,7 +148,9 @@ class HangingSettlementProbe:
         return {}
 
 
-def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) -> None:
+def test_shadow_daemon_records_evaluations_and_blocks_unpromoted_directional_paper(
+    tmp_path,
+) -> None:
     paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
     shadow = SQLiteShadowRepository(tmp_path / "shadow.sqlite3")
     paper.initialize()
@@ -178,18 +180,28 @@ def test_shadow_daemon_records_evaluations_abstains_and_paper_trade(tmp_path) ->
     assert first.book_observations == 2
     assert first.strategy_evaluations >= 3
     assert first.abstain_records >= 11
-    assert first.paper_trades == 2
+    assert first.paper_trades == 1
     assert second.paper_trades == 1
     trades = paper.trades()
-    assert len(trades) == 2
-    assert any(
-        item.reason == "DIRECTIONAL_POSITION_ALREADY_OPEN" for item in paper.abstains()
+    abstains = paper.abstains()
+    assert len(trades) == 1
+    assert not any(item.strategy == "DIRECTIONAL_EDGE" for item in trades)
+    assert any(item.reason == "MODEL_NOT_PROMOTED" for item in abstains)
+    directional_event = next(
+        item
+        for item in shadow.events_since(
+            event_type="STRATEGY_EVALUATION",
+            observed_at=NOW - timedelta(seconds=1),
+            limit=20,
+        )
+        if item["payload"]["strategy"] == "DIRECTIONAL_EDGE"
     )
-    directional = next(item for item in trades if item.strategy == "DIRECTIONAL_EDGE")
-    assert directional.label == "PAPER / SHADOW — NO REAL ORDER"
-    assert directional.payload["model_version"] == "PAPER_RESEARCH_BASELINE"
-    assert directional.payload["real_order_submission"] is False
-    assert paper.summary()["open_positions"] == 2
+    assert directional_event["payload"]["model_version"] == "PAPER_RESEARCH_BASELINE"
+    assert directional_event["payload"]["model_governance_state"] == "HISTORICAL_RESEARCH_ONLY"
+    assert directional_event["payload"]["execution_permission"] == "NONE"
+    assert directional_event["payload"]["governance_rejection_reason"] == "MODEL_NOT_PROMOTED"
+    assert directional_event["payload"]["real_order_submission"] is False
+    assert paper.summary()["open_positions"] == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
 
 
@@ -518,12 +530,9 @@ def test_paper_drawdown_brake_reduces_directional_stake_without_stopping_cycle(
     assert result.markets_discovered == 1
     assert shadow.event_counts()["REAL_SHADOW_CYCLE"] == 1
     trades = paper.trades(strategy="DIRECTIONAL_EDGE", status="OPEN")
-    assert len(trades) == 1
-    assert trades[0].payload["risk_brake_active"] is False
-    assert trades[0].payload["risk_stake_reduced"] is True
-    assert trades[0].payload["risk_stake_reduction_reason"] == "PAPER_DRAWDOWN_BRAKE_ACTIVE"
-    assert trades[0].payload["paper_current_equity"] == "30.00"
-    assert trades[0].payload["cost_basis_usdc"] == "0.75"
+    assert trades == ()
+    abstains = paper.abstains(strategy="DIRECTIONAL_EDGE")
+    assert any(item.reason == "MODEL_NOT_PROMOTED" for item in abstains)
 
 
 def test_paper_open_exposure_brake_blocks_new_directional_fill(tmp_path) -> None:

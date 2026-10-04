@@ -85,6 +85,7 @@ from direction_engine_v3.models import (
     CalibrationReadiness,
     ShadowBucketModelStatus,
     ShadowModelState,
+    directional_paper_governance_decision,
     load_paper_registry_from_corpus,
     paper_research_baseline_forecast,
 )
@@ -1183,20 +1184,49 @@ class ShadowDaemon:
         trade_recorded = False
         directional_execution: dict[str, object] = {}
         execution_abstains = 0
+        governance = directional_paper_governance_decision(state.bucket, forecast)
         if assessment.action is DecisionAction.TRADE:
-            trade_recorded, directional_execution, execution_abstains = (
-                self._execute_directional_paper(
+            if governance.paper_execution_allowed:
+                trade_recorded, directional_execution, execution_abstains = (
+                    self._execute_directional_paper(
+                        state,
+                        cycle_id=cycle_id,
+                        assessment=assessment,
+                        up_pricing=up_pricing,
+                        down_pricing=down_pricing,
+                        forecast=forecast,
+                        calibration_version=calibration.calibration_version
+                        if calibration is not None
+                        else None,
+                    )
+                )
+            else:
+                directional_execution = {
+                    "router_status": governance.reason,
+                    "model_governance_state": governance.state.value,
+                    "execution_permission": governance.execution_permission.value,
+                    "promotion_id": governance.promotion_id,
+                    "governance_rejection_reason": governance.reason,
+                    "real_order_submission": False,
+                }
+                execution_abstains = self._record_abstain(
                     state,
                     cycle_id=cycle_id,
-                    assessment=assessment,
-                    up_pricing=up_pricing,
-                    down_pricing=down_pricing,
-                    forecast=forecast,
-                    calibration_version=calibration.calibration_version
-                    if calibration is not None
-                    else None,
+                    strategy=StrategyKind.DIRECTIONAL_EDGE,
+                    reason=governance.reason,
+                    payload={
+                        "market_id": assessment.market_id,
+                        "candidate_id": None
+                        if assessment.candidate is None
+                        else assessment.candidate.candidate_id,
+                        "label": _PAPER_LABEL,
+                        "model_version": None if forecast is None else forecast.model_version,
+                        "calibration_version": None
+                        if calibration is None
+                        else calibration.calibration_version,
+                        **governance.as_dict(),
+                    },
                 )
-            )
         decision_audit = build_directional_decision_audit(
             state.discovery.market,
             state.price_to_beat,
@@ -1266,6 +1296,12 @@ class ShadowDaemon:
                 "binance_hourly": dict(state.binance_hourly_status or {}),
                 "corpus_sample_count": corpus_count,
                 "training_report": self._paper_model_result.report_for(state.bucket).as_dict(),
+                "model_governance_state": governance.state.value,
+                "execution_permission": governance.execution_permission.value,
+                "promotion_id": governance.promotion_id,
+                "governance_rejection_reason": governance.reason
+                if not governance.paper_execution_allowed
+                else None,
                 "real_order_submission": False,
             },
             observed_at=state.observed_at,

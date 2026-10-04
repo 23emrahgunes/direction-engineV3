@@ -46,6 +46,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/shadow/status"),
         ("GET", "/api/directional/status"),
         ("GET", "/api/directional/audit"),
+        ("GET", "/api/model/governance"),
     }
     assert all(method == "GET" for method, _path in routes)
 
@@ -105,7 +106,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "Settlement / Data Health" in body
     assert "12 Bucket Live Status / Performance" in body
     assert "Abstains / Rejections" in body
-    assert "Structural Arb / Data / Read-only API Status" in body
+    assert "Model Governance / Structural Arb / Data / Read-only API Status" in body
     assert "Raw JSON" in body
     assert "<pre id=\"overview\"" not in body
     assert "Loading..." not in body
@@ -131,6 +132,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "/api/paper/trades?strategy=DIRECTIONAL_EDGE&limit=25" in body
     assert "/api/paper/abstains?limit=25" in body
     assert "/api/directional/status" in body
+    assert "/api/model/governance" in body
     assert "/api/shadow/status" in body
     assert "/api/dashboard" in body
 

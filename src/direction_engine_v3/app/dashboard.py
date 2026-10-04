@@ -15,6 +15,7 @@ from direction_engine_v3.config import (
 )
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS
+from direction_engine_v3.models import default_directional_governance_status
 from direction_engine_v3.observability import (
     ComponentHealth,
     HealthStatus,
@@ -127,6 +128,10 @@ def runtime_data_dir() -> Path:
 def build_paper_summary() -> dict[str, object]:
     repository = _paper_repository()
     return repository.summary()
+
+
+def build_model_governance_status() -> dict[str, object]:
+    return default_directional_governance_status()
 
 
 def build_paper_reconciliation() -> dict[str, object]:

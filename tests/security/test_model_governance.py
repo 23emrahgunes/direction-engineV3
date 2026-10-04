@@ -1,9 +1,22 @@
 """Security boundaries for probability artifacts and promotion readiness."""
 
 import inspect
+from datetime import UTC, datetime
+from decimal import Decimal
 
-from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS
-from direction_engine_v3.models import calibration, contracts, empty_registry, logistic, registry
+from direction_engine_v3.domain import Asset, Horizon, ProbabilityForecast
+from direction_engine_v3.market_data import SUPPORTED_MARKET_BUCKETS, MarketBucket
+from direction_engine_v3.models import (
+    PAPER_RESEARCH_BASELINE_MODEL_VERSION,
+    ModelExecutionPermission,
+    calibration,
+    contracts,
+    directional_paper_governance_decision,
+    empty_registry,
+    governance,
+    logistic,
+    registry,
+)
 
 
 def test_unpromoted_registry_fails_closed_for_all_twelve_buckets() -> None:
@@ -18,7 +31,7 @@ def test_unpromoted_registry_fails_closed_for_all_twelve_buckets() -> None:
 def test_model_package_has_no_network_order_or_unsafe_artifact_loading() -> None:
     source = "\n".join(
         inspect.getsource(module).lower()
-        for module in (calibration, contracts, logistic, registry)
+        for module in (calibration, contracts, governance, logistic, registry)
     )
 
     for forbidden in (
@@ -31,3 +44,46 @@ def test_model_package_has_no_network_order_or_unsafe_artifact_loading() -> None
         "joblib",
     ):
         assert forbidden not in source
+
+
+def test_p2_0_default_directional_governance_denies_paper_for_all_buckets() -> None:
+    status = governance.default_directional_governance_status()
+
+    assert status["real_order_submission"] is False
+    assert len(status["buckets"]) == 12
+    assert {
+        (item["asset"], item["horizon"], item["execution_permission"])
+        for item in status["buckets"]
+    } == {
+        (bucket.asset.value, bucket.horizon.value, ModelExecutionPermission.NONE.value)
+        for bucket in SUPPORTED_MARKET_BUCKETS
+    }
+    assert all(
+        item["governance_rejection_reason"] == "MODEL_NOT_PROMOTED"
+        for item in status["buckets"]
+    )
+
+
+def test_paper_research_baseline_has_no_paper_execution_permission() -> None:
+    forecast = ProbabilityForecast(
+        "market",
+        Asset.BTC,
+        Horizon.FIVE_MINUTES,
+        Decimal("0.60"),
+        Decimal("0.40"),
+        PAPER_RESEARCH_BASELINE_MODEL_VERSION,
+        "PAPER_RESEARCH_BASELINE_UNPROMOTABLE",
+        "features",
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    decision = directional_paper_governance_decision(
+        MarketBucket(Asset.BTC, Horizon.FIVE_MINUTES),
+        forecast,
+    )
+
+    assert decision.paper_execution_allowed is False
+    assert decision.execution_permission is ModelExecutionPermission.NONE
+    assert decision.reason == "MODEL_NOT_PROMOTED"
+    assert decision.as_dict()["real_order_submission"] is False
