@@ -9,13 +9,13 @@ Start SHA: `254dea0`
 | Phase | Status | Commit | Deploy | Acceptance |
 |---|---|---|---|---|
 | P2.0.0 Directional PAPER → SHADOW_ONLY | ACCEPTED_RUNTIME | `3ac4b913568ba94e45e798448f2bdb0accb7ad5c` | Deploy PAPER #60 success | `P2_0_0_SHADOW_ONLY_ACCEPTED` |
-| P2.0.1 Fixed-checkpoint supervised dataset | PASSED_LOCAL | pending | required | checkpoint capture implemented; no historical backfill |
-| P2.0.2 Champion/challenger registry | PASSED_LOCAL | pending | required | bucket exact, fail-closed permissions |
-| P2.0.3 Real feature-trained challengers | PASSED_LOCAL | pending | required | dependency-free L2 logistic challenger; degenerate rejection |
+| P2.0.1 Fixed-checkpoint supervised dataset | ACCEPTED_RUNTIME | `03f7019` | Deploy PAPER #61 success | checkpoint capture live; no historical backfill |
+| P2.0.2 Champion/challenger registry | ACCEPTED_RUNTIME | `03f7019` | Deploy PAPER #61 success | bucket exact, fail-closed permissions |
+| P2.0.3 Real feature-trained challengers | ACCEPTED_RUNTIME | `03f7019` | Deploy PAPER #61 success | dependency-free L2 logistic challenger; degenerate rejection |
 | P2.0.4 Chronological walk-forward | PASSED_LOCAL | existing + tests | no runtime deploy alone | condition-isolated framework retained |
 | P2.0.5 Calibration + after-cost EV | PASSED_LOCAL | existing + tests | no runtime deploy alone | calibration/economic gates retained |
-| P2.0.6 Promotion governance | PASSED_LOCAL | pending | required | no real promotion without gates |
-| P2.0.7 Limited PAPER canary | NO_QUALIFIED_MODEL | pending | conditional | `P2_0_7_NO_QUALIFIED_MODEL` |
+| P2.0.6 Promotion governance | ACCEPTED_RUNTIME | `03f7019` | Deploy PAPER #61 success | no real promotion without gates |
+| P2.0.7 Limited PAPER canary | NO_QUALIFIED_MODEL | `03f7019` | conditional | `P2_0_7_NO_QUALIFIED_MODEL` |
 
 ## P2.0.0 Evidence
 
@@ -54,6 +54,11 @@ Start SHA: `254dea0`
   near-zero-variance datasets as `DEGENERATE_MODEL_*`.
 - Promotion permission remains exact to `(bucket, model_version)` and defaults to `NONE`.
 - No real model is promoted from the current data; Directional remains SHADOW_ONLY.
+- GitHub CI #62 for `03f7019` completed successfully.
+- GitHub Deploy PAPER #61 for `03f7019` completed successfully; the deploy script
+  validates exact checkout by comparing VPS `git rev-parse HEAD` to the expected SHA.
+- Runtime dataset quality after deploy reports live checkpoint rows for 5m buckets,
+  duplicate rejects `0`, missing feature counts `{}`, and future timestamp violations `0`.
 
 ## Latest Local Validation
 
@@ -78,6 +83,4 @@ Start SHA: `254dea0`
 
 ## Open Items
 
-- Commit and push P2.0.1–P2.0.7 local framework changes.
-- Let GitHub CI and PAPER deploy validate the exact new SHA.
 - Collect real checkpoint observations; do not promote until real data satisfies gates.
