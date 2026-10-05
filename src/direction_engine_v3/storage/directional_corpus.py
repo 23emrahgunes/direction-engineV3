@@ -48,6 +48,18 @@ class DirectionalCheckpointRecord:
     outcome_attached: bool
 
 
+@dataclass(frozen=True, slots=True)
+class DirectionalCheckpointLabelCandidate:
+    condition_id: str
+    asset: Asset
+    horizon: Horizon
+    market_id: str | None
+    window_start: datetime | None
+    window_end: datetime | None
+    checkpoint_row_count: int
+    unlabeled_row_count: int
+
+
 class SQLiteDirectionalCorpusRepository:
     """Stores what was known before settlement, then immutable outcome evidence."""
 
@@ -129,6 +141,13 @@ class SQLiteDirectionalCorpusRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_directional_checkpoint_condition
                 ON directional_checkpoint_observations(condition_id, observed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_directional_checkpoint_unlabeled_condition
+                ON directional_checkpoint_observations(condition_id, asset, horizon, observed_at)
+                WHERE outcome_json IS NULL
                 """
             )
 
@@ -408,6 +427,26 @@ class SQLiteDirectionalCorpusRepository:
                 ORDER BY feature_schema_version
                 """
             ).fetchall()
+            totals_row = connection.execute(
+                """
+                SELECT COUNT(*),
+                       SUM(CASE WHEN outcome_json IS NOT NULL THEN 1 ELSE 0 END),
+                       COUNT(DISTINCT condition_id),
+                       COUNT(DISTINCT CASE WHEN outcome_json IS NOT NULL THEN condition_id END)
+                FROM directional_checkpoint_observations
+                """
+            ).fetchone()
+            multi_label_row = connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT condition_id,COUNT(DISTINCT outcome_json) AS label_count
+                    FROM directional_checkpoint_observations
+                    WHERE outcome_json IS NOT NULL
+                    GROUP BY condition_id
+                    HAVING label_count > 1
+                )
+                """
+            ).fetchone()
         missing_counts: dict[str, int] = {}
         feature_counts: dict[str, int] = {}
         future_timestamp_violations = 0
@@ -445,10 +484,29 @@ class SQLiteDirectionalCorpusRepository:
             }
             for row in rows
         ]
+        total_rows = int((totals_row or (0, 0, 0, 0))[0] or 0)
+        labeled_rows = int((totals_row or (0, 0, 0, 0))[1] or 0)
+        unique_conditions = int((totals_row or (0, 0, 0, 0))[2] or 0)
+        labeled_unique_conditions = int((totals_row or (0, 0, 0, 0))[3] or 0)
+        unlabeled_rows = total_rows - labeled_rows
+        unlabeled_unique_conditions = unique_conditions - labeled_unique_conditions
         return {
             "status": "DIRECTIONAL_CHECKPOINT_DATASET_READY",
             "checkpoint_targets_seconds": [120, 90, 60, 45],
             "checkpoint_tolerance_seconds": 10,
+            "total_rows": total_rows,
+            "labeled_rows": labeled_rows,
+            "unlabeled_rows": unlabeled_rows,
+            "unique_conditions": unique_conditions,
+            "labeled_unique_conditions": labeled_unique_conditions,
+            "unlabeled_unique_conditions": unlabeled_unique_conditions,
+            "label_coverage_rows": str(labeled_rows / total_rows) if total_rows else "0",
+            "label_coverage_conditions": (
+                str(labeled_unique_conditions / unique_conditions)
+                if unique_conditions
+                else "0"
+            ),
+            "multi_label_condition_count": int((multi_label_row or (0,))[0] or 0),
             "buckets": buckets,
             "duplicate_reject_count": int((duplicate_rows or (0,))[0] or 0),
             "feature_schema_versions": {
@@ -458,6 +516,47 @@ class SQLiteDirectionalCorpusRepository:
             "feature_observation_counts": feature_counts,
             "future_timestamp_violations": future_timestamp_violations,
         }
+
+    def pending_checkpoint_label_candidates(
+        self, *, now: datetime, limit: int
+    ) -> tuple[DirectionalCheckpointLabelCandidate, ...]:
+        require_utc("now", now)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id,asset,horizon,payload_json,
+                       COUNT(*) AS checkpoint_row_count,
+                       SUM(CASE WHEN outcome_json IS NULL THEN 1 ELSE 0 END)
+                           AS unlabeled_row_count,
+                       MIN(observed_at) AS first_observed_at
+                FROM directional_checkpoint_observations
+                WHERE outcome_json IS NULL
+                GROUP BY condition_id,asset,horizon
+                ORDER BY first_observed_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        candidates: list[DirectionalCheckpointLabelCandidate] = []
+        for row in rows:
+            payload = json.loads(str(row[3]))
+            if not isinstance(payload, dict):
+                payload = {}
+            candidates.append(
+                DirectionalCheckpointLabelCandidate(
+                    condition_id=str(row[0]),
+                    asset=Asset(str(row[1])),
+                    horizon=Horizon(str(row[2])),
+                    market_id=_optional_text(payload.get("market_id")),
+                    window_start=_optional_datetime(payload.get("window_start")),
+                    window_end=_optional_datetime(payload.get("window_end")),
+                    checkpoint_row_count=int(row[4] or 0),
+                    unlabeled_row_count=int(row[5] or 0),
+                )
+            )
+        return tuple(candidates)
 
     def records_for_condition(self, condition_id: str) -> tuple[DirectionalCorpusRecord, ...]:
         require_text("condition_id", condition_id)
@@ -639,6 +738,12 @@ def _optional_datetime(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 
 def _is_training_ready_payload(payload: Mapping[str, object]) -> bool:

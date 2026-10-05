@@ -7,6 +7,7 @@ import pytest
 
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.settlement import (
+    DirectionalCheckpointLabeler,
     GammaOfficialSettlementResolver,
     OfficialSettlementStatus,
     PaperSettlementService,
@@ -881,6 +882,79 @@ def test_settlement_pass_is_bounded_per_cycle(tmp_path):
     assert result["settlement_checked"] == 1
 
 
+def test_checkpoint_condition_without_paper_trade_gets_official_label(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    for target in (120, 90, 60, 45):
+        _checkpoint(corpus, target=target)
+    service = PaperSettlementService(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=Resolver(_official("DOWN")),
+        clock=Clock(),
+    )
+
+    result = asyncio.run(service.run_once())
+    report = corpus.checkpoint_quality_report()
+
+    assert result["settlement_checked"] == 0
+    assert result["corpus_label_conditions_attempted"] == 1
+    assert result["corpus_label_conditions_resolved"] == 1
+    assert result["corpus_label_rows_attached"] == 4
+    assert report["labeled_rows"] == 4
+    assert report["labeled_unique_conditions"] == 1
+    assert report["multi_label_condition_count"] == 0
+
+
+def test_checkpoint_labeler_leaves_unresolved_condition_unlabeled(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    _checkpoint(corpus)
+    labeler = DirectionalCheckpointLabeler(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=Resolver(_official("UP") | {"closed": False, "active": True}),
+        clock=Clock(),
+    )
+
+    result = asyncio.run(labeler.run_once())
+    report = corpus.checkpoint_quality_report()
+
+    assert result["corpus_label_conditions_waiting"] == 1
+    assert result["corpus_label_rows_attached"] == 0
+    assert report["labeled_rows"] == 0
+    assert report["unlabeled_rows"] == 1
+
+
+def test_checkpoint_labeler_is_bounded_by_condition(tmp_path):
+    paper = _paper(tmp_path)
+    corpus = _corpus(tmp_path)
+    _checkpoint(corpus, condition_id="condition-1", market_id="market-1")
+    _checkpoint(corpus, condition_id="condition-2", market_id="market-2")
+    labeler = DirectionalCheckpointLabeler(
+        paper_repository=paper,
+        corpus_repository=corpus,
+        resolver=Resolver(
+            {
+                "condition-1": _official("UP", condition_id="condition-1", market_id="market-1"),
+                "condition-2": _official(
+                    "DOWN", condition_id="condition-2", market_id="market-2"
+                ),
+            }
+        ),
+        clock=Clock(),
+        max_conditions_per_pass=1,
+    )
+
+    result = asyncio.run(labeler.run_once())
+    report = corpus.checkpoint_quality_report()
+
+    assert result["corpus_label_conditions_attempted"] == 1
+    assert result["corpus_label_rows_attached"] == 1
+    assert report["labeled_unique_conditions"] == 1
+    assert report["unlabeled_unique_conditions"] == 1
+
+
 def test_effective_identity_summary_uses_overlay_without_mutating_snapshot(tmp_path):
     paper = _paper(tmp_path)
     paper.save_trade_snapshot(
@@ -941,6 +1015,31 @@ def _corpus(tmp_path) -> SQLiteDirectionalCorpusRepository:
     repo = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
     repo.initialize()
     return repo
+
+
+def _checkpoint(
+    corpus: SQLiteDirectionalCorpusRepository,
+    *,
+    condition_id: str = "condition-1",
+    market_id: str = "market-1",
+    target: int = 60,
+) -> None:
+    corpus.save_checkpoint_observation(
+        checkpoint_id=f"checkpoint:{condition_id}:{target}",
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        condition_id=condition_id,
+        checkpoint_target_tte_seconds=target,
+        feature_schema_version="test",
+        observed_at=NOW - timedelta(minutes=2),
+        actual_tte_seconds=target,
+        payload=_training_payload()
+        | {
+            "market_id": market_id,
+            "window_start": (NOW - timedelta(minutes=5)).isoformat(),
+            "window_end": (NOW - timedelta(minutes=1)).isoformat(),
+        },
+    )
 
 
 def _trade(

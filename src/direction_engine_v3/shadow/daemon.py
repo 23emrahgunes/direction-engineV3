@@ -2898,6 +2898,7 @@ async def run_daemon(
             resolver=GammaOfficialSettlementResolver(transport, clock),
             clock=clock,
             max_trades_per_pass=1,
+            max_corpus_label_conditions_per_pass=1,
         )
         data_client = PublicShadowDataClient(
             transport,

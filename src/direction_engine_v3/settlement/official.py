@@ -14,7 +14,11 @@ from direction_engine_v3.adapters.polymarket.market_data import GAMMA_MARKETS_UR
 from direction_engine_v3.domain import Asset, Horizon, OutcomeSide
 from direction_engine_v3.domain._validation import require_text, require_utc
 from direction_engine_v3.market_data import MarketDataSchemaError
-from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
+from direction_engine_v3.storage import (
+    DirectionalCheckpointLabelCandidate,
+    SQLiteDirectionalCorpusRepository,
+    SQLitePaperRepository,
+)
 from direction_engine_v3.storage.paper import PaperTradeSnapshot
 
 GAMMA_MARKET_BY_ID_URL = "https://gamma-api.polymarket.com/markets/{market_id}"
@@ -130,6 +134,238 @@ class GammaOfficialSettlementResolver:
 PolymarketOfficialSettlementResolver = GammaOfficialSettlementResolver
 
 
+class DirectionalCheckpointLabeler:
+    """Bounded official-outcome label pass for SHADOW checkpoint observations."""
+
+    def __init__(
+        self,
+        *,
+        corpus_repository: SQLiteDirectionalCorpusRepository,
+        paper_repository: SQLitePaperRepository,
+        resolver: GammaOfficialSettlementResolver,
+        clock: _Clock,
+        max_conditions_per_pass: int = 25,
+    ) -> None:
+        if max_conditions_per_pass < 1:
+            raise ValueError("max_conditions_per_pass must be positive")
+        self._corpus = corpus_repository
+        self._paper = paper_repository
+        self._resolver = resolver
+        self._clock = clock
+        self._max_conditions = max_conditions_per_pass
+
+    async def run_once(self) -> dict[str, object]:
+        now = self._clock.utc_now()
+        candidates = self._corpus.pending_checkpoint_label_candidates(
+            now=now,
+            limit=self._max_conditions,
+        )
+        attempted = resolved = waiting = blocked = conflicts = rows_attached = 0
+        up_labels = down_labels = 0
+        errors: list[str] = []
+        last_successful_label_at: str | None = None
+        for candidate in candidates:
+            attempted += 1
+            if candidate.window_end is None or candidate.market_id is None:
+                blocked += 1
+                reason = "CORPUS_LABEL_BLOCKED:IDENTITY_INCOMPLETE"
+                errors.append(f"{candidate.condition_id}:{reason}")
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=_evidence_hash(
+                        {
+                            "condition_id": candidate.condition_id,
+                            "reason": reason,
+                            "labeler": "DIRECTIONAL_CHECKPOINT_LABELER",
+                        }
+                    ),
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    payload={
+                        "condition_id": candidate.condition_id,
+                        "asset": candidate.asset.value,
+                        "horizon": candidate.horizon.value,
+                        "market_id": candidate.market_id,
+                        "window_end": candidate.window_end.isoformat()
+                        if candidate.window_end is not None
+                        else None,
+                        "unlabeled_row_count": candidate.unlabeled_row_count,
+                        "real_order_submission": False,
+                    },
+                )
+                continue
+            if candidate.window_end > now:
+                waiting += 1
+                reason = "WAITING_FOR_RESOLUTION:WINDOW_NOT_ENDED"
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=_evidence_hash(
+                        {
+                            "condition_id": candidate.condition_id,
+                            "window_end": candidate.window_end.isoformat(),
+                            "reason": reason,
+                            "labeler": "DIRECTIONAL_CHECKPOINT_LABELER",
+                        }
+                    ),
+                    state="PENDING",
+                    now=now,
+                    reason=reason,
+                    payload={
+                        "condition_id": candidate.condition_id,
+                        "market_id": candidate.market_id,
+                        "window_end": candidate.window_end.isoformat(),
+                        "unlabeled_row_count": candidate.unlabeled_row_count,
+                        "real_order_submission": False,
+                    },
+                )
+                continue
+            try:
+                result = await self._resolver.resolve(
+                    condition_id=candidate.condition_id,
+                    asset=candidate.asset,
+                    horizon=candidate.horizon,
+                    expected_market_id=candidate.market_id,
+                )
+            except Exception as exc:
+                blocked += 1
+                reason = f"CORPUS_LABEL_BLOCKED:{type(exc).__name__}"
+                errors.append(f"{candidate.condition_id}:{type(exc).__name__}")
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=_evidence_hash(
+                        {
+                            "condition_id": candidate.condition_id,
+                            "reason": reason,
+                            "labeler": "DIRECTIONAL_CHECKPOINT_LABELER",
+                        }
+                    ),
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    payload={"error": _safe_error_text(exc), "real_order_submission": False},
+                )
+                continue
+            if result.status is OfficialSettlementStatus.SETTLEMENT_PENDING:
+                waiting += 1
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=result.evidence_hash,
+                    state="PENDING",
+                    now=now,
+                    reason=result.reason,
+                    payload=_label_task_payload(candidate, result),
+                )
+                continue
+            if result.status is OfficialSettlementStatus.VOID or result.winning_side is None:
+                blocked += 1
+                reason = f"CORPUS_LABEL_BLOCKED:{result.reason}"
+                errors.append(f"{candidate.condition_id}:{result.reason}")
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=result.evidence_hash,
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    payload=_label_task_payload(candidate, result),
+                )
+                continue
+            if result.resolved_at is None:
+                blocked += 1
+                reason = "CORPUS_LABEL_BLOCKED:RESOLUTION_TIME_UNAVAILABLE"
+                errors.append(f"{candidate.condition_id}:{reason}")
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=result.evidence_hash,
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    payload=_label_task_payload(candidate, result),
+                )
+                continue
+            try:
+                attached = self._corpus.attach_verified_outcome_to_condition_once(
+                    condition_id=result.condition_id,
+                    official_resolved_at=result.resolved_at,
+                    attached_at=now,
+                    outcome=_corpus_outcome_payload(result, now),
+                )
+            except RuntimeError as exc:
+                reason = (
+                    "OFFICIAL_LABEL_CONFLICT"
+                    if "conflicting official outcome" in str(exc)
+                    else f"CORPUS_LABEL_BLOCKED:{type(exc).__name__}"
+                )
+                blocked += 1
+                if reason == "OFFICIAL_LABEL_CONFLICT":
+                    conflicts += 1
+                errors.append(f"{candidate.condition_id}:{reason}")
+                self._record_label_task(
+                    condition_id=candidate.condition_id,
+                    evidence_hash=result.evidence_hash,
+                    state="BLOCKED_RETRYABLE",
+                    now=now,
+                    reason=reason,
+                    payload=_label_task_payload(candidate, result)
+                    | {"error": _safe_error_text(exc)},
+                )
+                continue
+            resolved += 1
+            rows_attached += attached
+            if result.winning_side is OutcomeSide.UP:
+                up_labels += 1
+            else:
+                down_labels += 1
+            last_successful_label_at = now.isoformat()
+            self._record_label_task(
+                condition_id=candidate.condition_id,
+                evidence_hash=result.evidence_hash,
+                state="LABELED",
+                now=now,
+                reason="CORPUS_LABEL_ATTACHED",
+                payload=_label_task_payload(candidate, result) | {"rows_attached": attached},
+                next_attempt_at=None,
+            )
+        return {
+            "corpus_label_conditions_attempted": attempted,
+            "corpus_label_conditions_resolved": resolved,
+            "corpus_label_conditions_waiting": waiting,
+            "corpus_label_conditions_blocked": blocked,
+            "corpus_label_rows_attached": rows_attached,
+            "corpus_label_up_conditions": up_labels,
+            "corpus_label_down_conditions": down_labels,
+            "corpus_label_conflicts": conflicts,
+            "last_label_scan_at": now.isoformat(),
+            "last_successful_label_at": last_successful_label_at,
+            "last_label_error": errors[-1] if errors else None,
+        }
+
+    def _record_label_task(
+        self,
+        *,
+        condition_id: str,
+        evidence_hash: str,
+        state: str,
+        now: datetime,
+        reason: str,
+        payload: Mapping[str, object],
+        next_attempt_at: datetime | None = None,
+    ) -> None:
+        self._paper.save_corpus_label_task(
+            condition_id=condition_id,
+            evidence_hash=evidence_hash,
+            state=state,
+            attempted_at=now,
+            next_attempt_at=(
+                next_attempt_at if next_attempt_at is not None else now + timedelta(minutes=5)
+            )
+            if state != "LABELED"
+            else None,
+            reason=reason,
+            payload=dict(payload) | {"labeler": "DIRECTIONAL_CHECKPOINT_LABELER"},
+        )
+
+
 class PaperSettlementService:
     """Bounded idempotent settlement pass for Directional PAPER trades."""
 
@@ -143,11 +379,13 @@ class PaperSettlementService:
         max_trades_per_pass: int = 25,
         max_conditions_per_pass: int | None = None,
         max_trades_per_condition: int = 500,
+        max_corpus_label_conditions_per_pass: int = 25,
     ) -> None:
         self._paper = paper_repository
         self._corpus = corpus_repository
         self._resolver = resolver
         self._clock = clock
+        self._max_corpus_label_conditions = max_corpus_label_conditions_per_pass
         self._max_conditions = (
             max_trades_per_pass if max_conditions_per_pass is None else max_conditions_per_pass
         )
@@ -156,6 +394,8 @@ class PaperSettlementService:
             raise ValueError("max_conditions_per_pass must be positive")
         if self._max_trades_per_condition < 1:
             raise ValueError("max_trades_per_condition must be positive")
+        if self._max_corpus_label_conditions < 1:
+            raise ValueError("max_corpus_label_conditions_per_pass must be positive")
 
     async def run_once(self) -> dict[str, object]:
         now = self._clock.utc_now()
@@ -271,6 +511,27 @@ class PaperSettlementService:
             condition_ids=tuple(grouped.keys()),
             now=now,
         )
+        label_summary: dict[str, object] = {
+            "corpus_label_conditions_attempted": 0,
+            "corpus_label_conditions_resolved": 0,
+            "corpus_label_conditions_waiting": 0,
+            "corpus_label_conditions_blocked": 0,
+            "corpus_label_rows_attached": 0,
+            "corpus_label_up_conditions": 0,
+            "corpus_label_down_conditions": 0,
+            "corpus_label_conflicts": 0,
+            "last_label_scan_at": now.isoformat(),
+            "last_successful_label_at": None,
+            "last_label_error": None,
+        }
+        if self._corpus is not None:
+            label_summary = await DirectionalCheckpointLabeler(
+                corpus_repository=self._corpus,
+                paper_repository=self._paper,
+                resolver=self._resolver,
+                clock=self._clock,
+                max_conditions_per_pass=self._max_corpus_label_conditions,
+            ).run_once()
         return {
             "settlement_checked": checked,
             "settlement_pending": pending,
@@ -286,6 +547,7 @@ class PaperSettlementService:
             "last_settlement_check_at": now.isoformat(),
             "last_settlement_error": errors[-1] if errors else None,
             **queue_summary,
+            **label_summary,
         }
 
     def _record_attempt(
@@ -872,6 +1134,57 @@ def _settlement_evidence(
             if key in clob_raw
         }
         | {"tokens": clob_tokens},
+    }
+
+
+def _corpus_outcome_payload(
+    result: OfficialSettlementResult, attached_at: datetime
+) -> dict[str, object]:
+    if result.winning_side is None:
+        raise RuntimeError("corpus label requires a winning side")
+    if result.resolved_at is None:
+        raise RuntimeError("corpus label requires official resolved_at")
+    return {
+        "settlement_source_kind": "OFFICIAL",
+        "source": result.source,
+        "condition_id": result.condition_id,
+        "market_id": result.market_id,
+        "outcome_up": result.winning_side is OutcomeSide.UP,
+        "winning_side": result.winning_side.value,
+        "official_resolved_at": result.resolved_at.isoformat(),
+        "attached_at": attached_at.isoformat(),
+        "evidence_hash": result.evidence_hash,
+    }
+
+
+def _label_task_payload(
+    candidate: DirectionalCheckpointLabelCandidate,
+    result: OfficialSettlementResult,
+) -> dict[str, object]:
+    return {
+        "condition_id": candidate.condition_id,
+        "market_id": candidate.market_id,
+        "asset": candidate.asset.value,
+        "horizon": candidate.horizon.value,
+        "window_start": candidate.window_start.isoformat()
+        if candidate.window_start is not None
+        else None,
+        "window_end": candidate.window_end.isoformat()
+        if candidate.window_end is not None
+        else None,
+        "checkpoint_row_count": candidate.checkpoint_row_count,
+        "unlabeled_row_count": candidate.unlabeled_row_count,
+        "settlement_source_kind": result.settlement_source_kind,
+        "source": result.source,
+        "status": result.status.value,
+        "reason": result.reason,
+        "winning_side": result.winning_side.value if result.winning_side is not None else None,
+        "official_resolved_at": result.resolved_at.isoformat()
+        if result.resolved_at is not None
+        else None,
+        "official_resolution_observed_at": result.observed_at.isoformat(),
+        "evidence_hash": result.evidence_hash,
+        "real_order_submission": False,
     }
 
 

@@ -1,6 +1,7 @@
 """Official PAPER settlement services for burn-in."""
 
 from direction_engine_v3.settlement.official import (
+    DirectionalCheckpointLabeler,
     GammaOfficialSettlementResolver,
     OfficialSettlementResult,
     OfficialSettlementStatus,
@@ -11,6 +12,7 @@ from direction_engine_v3.settlement.official import (
 )
 
 __all__ = [
+    "DirectionalCheckpointLabeler",
     "GammaOfficialSettlementResolver",
     "OfficialSettlementResult",
     "OfficialSettlementStatus",
