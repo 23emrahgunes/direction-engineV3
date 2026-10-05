@@ -13,6 +13,8 @@ from aiohttp import web
 
 from direction_engine_v3.app.dashboard import (
     build_dashboard_snapshot,
+    build_directional_corpus_labels,
+    build_directional_corpus_readiness,
     build_directional_decision_audit,
     build_directional_runtime_status,
     build_feature_integrity_report,
@@ -226,6 +228,20 @@ async def directional_audit(request: web.Request) -> web.Response:
     )
 
 
+async def directional_corpus_labels(request: web.Request) -> web.Response:
+    return await _json_from_builder(
+        request,
+        build_directional_corpus_labels,
+        limit=request.query.get("limit"),
+        asset=request.query.get("asset"),
+        horizon=request.query.get("horizon"),
+    )
+
+
+async def directional_corpus_readiness(request: web.Request) -> web.Response:
+    return await _json_from_builder(request, build_directional_corpus_readiness)
+
+
 async def model_governance(request: web.Request) -> web.Response:
     return await _json_from_builder(request, build_model_governance_status)
 
@@ -254,6 +270,14 @@ def create_app() -> web.Application:
     app.router.add_get("/api/shadow/status", shadow_status, allow_head=False)
     app.router.add_get("/api/directional/status", directional_status, allow_head=False)
     app.router.add_get("/api/directional/audit", directional_audit, allow_head=False)
+    app.router.add_get(
+        "/api/directional/corpus/labels", directional_corpus_labels, allow_head=False
+    )
+    app.router.add_get(
+        "/api/directional/corpus/readiness",
+        directional_corpus_readiness,
+        allow_head=False,
+    )
     app.router.add_get("/api/model/governance", model_governance, allow_head=False)
     app.router.add_get("/api/feature/integrity", feature_integrity, allow_head=False)
     return app

@@ -684,6 +684,96 @@ class SQLitePaperRepository:
             ).fetchone()
         return None if row is None else _corpus_label_task_from_row(row)
 
+    def corpus_label_task_summary(self, *, limit: int = 25) -> dict[str, object]:
+        """Return bounded read-only corpus labeler throughput/backlog evidence."""
+
+        bounded_limit = min(max(limit, 1), 100)
+        if not self._path.exists():
+            return {
+                "status": "PAPER_LABEL_TASKS_NOT_INITIALIZED",
+                "total_tasks": 0,
+                "state_counts": {},
+                "reason_counts": {},
+                "recent_tasks": [],
+            }
+        with sqlite3.connect(self._path) as connection:
+            try:
+                totals = connection.execute(
+                    "SELECT COUNT(*),SUM(attempt_count) FROM paper_corpus_label_tasks"
+                ).fetchone()
+                state_rows = connection.execute(
+                    """
+                    SELECT state,COUNT(*)
+                    FROM paper_corpus_label_tasks
+                    GROUP BY state
+                    ORDER BY state
+                    """
+                ).fetchall()
+                reason_rows = connection.execute(
+                    """
+                    SELECT last_reason,COUNT(*)
+                    FROM paper_corpus_label_tasks
+                    GROUP BY last_reason
+                    ORDER BY last_reason
+                    """
+                ).fetchall()
+                recent_rows = connection.execute(
+                    """
+                    SELECT condition_id,evidence_hash,state,last_attempt_at,next_attempt_at,
+                           attempt_count,last_reason,payload_json
+                    FROM paper_corpus_label_tasks
+                    ORDER BY last_attempt_at DESC
+                    LIMIT ?
+                    """,
+                    (bounded_limit,),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                return {
+                    "status": "PAPER_LABEL_TASKS_SCHEMA_UNAVAILABLE",
+                    "reason": type(exc).__name__,
+                    "total_tasks": 0,
+                    "state_counts": {},
+                    "reason_counts": {},
+                    "recent_tasks": [],
+                }
+        recent_tasks = []
+        for row in recent_rows:
+            payload = json.loads(str(row[7]))
+            if not isinstance(payload, dict):
+                payload = {}
+            recent_tasks.append(
+                {
+                    "condition_id": str(row[0]),
+                    "evidence_hash": str(row[1]),
+                    "state": str(row[2]),
+                    "last_attempt_at": None if row[3] is None else str(row[3]),
+                    "next_attempt_at": None if row[4] is None else str(row[4]),
+                    "attempt_count": int(row[5] or 0),
+                    "last_reason": None if row[6] is None else str(row[6]),
+                    "market_id": payload.get("market_id"),
+                    "asset": payload.get("asset"),
+                    "horizon": payload.get("horizon"),
+                    "resolver_status": payload.get("status"),
+                    "resolver_reason": payload.get("reason"),
+                    "rows_attached": payload.get("rows_attached"),
+                }
+            )
+        return {
+            "status": "PAPER_CORPUS_LABEL_TASKS_READY",
+            "total_tasks": int((totals or (0, 0))[0] or 0),
+            "total_attempts": int((totals or (0, 0))[1] or 0),
+            "state_counts": {str(row[0]): int(row[1] or 0) for row in state_rows},
+            "reason_counts": {
+                str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in reason_rows
+            },
+            "recent_tasks": recent_tasks,
+            "batch_policy": {
+                "default_max_conditions_per_pass": 1,
+                "hard_max_conditions_per_pass": 10,
+                "changed_in_p2_2b": False,
+            },
+        }
+
     def save_identity_overlay_once(
         self,
         *,

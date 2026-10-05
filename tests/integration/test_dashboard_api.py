@@ -6,7 +6,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from direction_engine_v3.app import build_dashboard_snapshot, create_app
 from direction_engine_v3.app import server as dashboard_server
+from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.shadow.storage import SQLiteShadowRepository
+from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
 
 
 def test_dashboard_snapshot_preserves_scope_and_live_defaults() -> None:
@@ -46,6 +48,8 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/shadow/status"),
         ("GET", "/api/directional/status"),
         ("GET", "/api/directional/audit"),
+        ("GET", "/api/directional/corpus/labels"),
+        ("GET", "/api/directional/corpus/readiness"),
         ("GET", "/api/model/governance"),
         ("GET", "/api/feature/integrity"),
     }
@@ -108,9 +112,13 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "12 Bucket Live Status / Performance" in body
     assert "Abstains / Rejections" in body
     assert (
-        "Model Governance / Feature Integrity / Structural Arb / Data / Read-only API Status"
+        "Model Governance / Corpus Readiness / Feature Integrity / Structural Arb / "
+        "Data / Read-only API Status"
         in body
     )
+    assert "P2.2B Corpus Readiness" in body
+    assert "/api/directional/corpus/readiness" in body
+    assert "/api/directional/corpus/labels?limit=20" in body
     assert "P2.1 Feature Integrity" in body
     assert "/api/feature/integrity" in body
     assert "Raw JSON" in body
@@ -139,6 +147,7 @@ async def _assert_dashboard_root_serves_existing_read_only_html() -> None:
     assert "/api/paper/abstains?limit=25" in body
     assert "/api/directional/status" in body
     assert "/api/model/governance" in body
+    assert "/api/directional/corpus/readiness" in body
     assert "/api/shadow/status" in body
     assert "/api/dashboard" in body
 
@@ -308,6 +317,80 @@ def test_feature_integrity_endpoint_reports_bounded_duplicate_evidence(
     asyncio.run(_assert_feature_integrity_endpoint_reports_duplicate_evidence())
 
 
+def test_directional_corpus_endpoints_are_bounded_read_only_and_training_safe(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "directional_corpus.sqlite3")
+    corpus.initialize()
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    for index, target in enumerate((120, 90, 60, 45)):
+        corpus.save_checkpoint_observation(
+            checkpoint_id=f"checkpoint-{target}",
+            asset=Asset.BTC,
+            horizon=Horizon.FIVE_MINUTES,
+            condition_id="condition-btc-1",
+            checkpoint_target_tte_seconds=target,
+            feature_schema_version="v3.15.3-directional-official-ptb",
+            observed_at=observed_at + timedelta(seconds=index),
+            actual_tte_seconds=target,
+            payload={
+                "market_id": "market-btc-1",
+                "window_start": (observed_at - timedelta(minutes=5)).isoformat(),
+                "window_end": (observed_at - timedelta(minutes=1)).isoformat(),
+                "feature_vector": {
+                    "feature_set_version": "v3.15.3-directional-official-ptb",
+                    "generated_at": observed_at.isoformat(),
+                    "features": [
+                        {
+                            "name": "short_return",
+                            "value": str(index + 1),
+                            "source_ts": observed_at.isoformat(),
+                        },
+                        {
+                            "name": "spot_perp_basis",
+                            "value": "0",
+                            "source_ts": observed_at.isoformat(),
+                        },
+                    ],
+                },
+                "price_to_beat": {"persistence_id": "ptb-1", "value": "1"},
+            },
+        )
+    corpus.attach_verified_outcome_to_condition_once(
+        condition_id="condition-btc-1",
+        outcome={
+            "settlement_source_kind": "OFFICIAL",
+            "settlement_source": "POLYMARKET_OFFICIAL_METADATA",
+            "outcome_up": True,
+            "winning_side": "UP",
+            "official_resolved_at": (observed_at + timedelta(minutes=1)).isoformat(),
+            "evidence_hash": "official-hash",
+        },
+        official_resolved_at=observed_at + timedelta(minutes=1),
+        attached_at=observed_at + timedelta(minutes=2),
+    )
+    paper.save_corpus_label_task(
+        condition_id="condition-btc-1",
+        evidence_hash="official-hash",
+        state="LABELED",
+        attempted_at=observed_at + timedelta(minutes=2),
+        next_attempt_at=None,
+        reason="LABELED",
+        payload={
+            "asset": "BTC",
+            "horizon": "5m",
+            "market_id": "market-btc-1",
+            "status": "SETTLEMENT_READY",
+            "rows_attached": 4,
+        },
+    )
+
+    asyncio.run(_assert_directional_corpus_endpoints())
+
+
 async def _assert_feature_integrity_endpoint_reports_duplicate_evidence() -> None:
     app = create_app()
     client = TestClient(TestServer(app))
@@ -346,6 +429,61 @@ async def _assert_feature_integrity_endpoint_reports_duplicate_evidence() -> Non
     assert payload["decision_impact_summary"]["evaluations_compared"] == 3
     assert payload["decision_impact_summary"]["different_decision_count"] == 1
     assert payload["decision_impact_summary"]["abstain_to_trade_candidate_count"] == 1
+
+
+async def _assert_directional_corpus_endpoints() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        labels_response = await client.get(
+            "/api/directional/corpus/labels?limit=500&asset=BTC&horizon=5m"
+        )
+        labels_payload = await labels_response.json()
+        readiness_response = await client.get("/api/directional/corpus/readiness")
+        readiness_payload = await readiness_response.json()
+    finally:
+        await client.close()
+
+    assert labels_response.status == 200
+    assert labels_payload["status"] == "DIRECTIONAL_CORPUS_LABELS_READY"
+    assert labels_payload["real_order_submission"] is False
+    assert labels_payload["limit"] == 100
+    assert labels_payload["hard_max_limit"] == 100
+    assert labels_payload["label_count"] == 1
+    label = labels_payload["labels"][0]
+    assert label["condition_id"] == "condition-btc-1"
+    assert label["market_id"] == "market-btc-1"
+    assert label["official_outcome"] == "UP"
+    assert label["resolution_source"] == "POLYMARKET_OFFICIAL_METADATA"
+    assert label["evidence_hash"] == "official-hash"
+    assert label["checkpoint_row_count"] == 4
+    assert label["dataset_schema_version"] == "directional_checkpoint_observations:v1"
+
+    assert readiness_response.status == 200
+    assert readiness_payload["real_order_submission"] is False
+    assert readiness_payload["training_started"] is False
+    assert readiness_payload["model_promotion_changed"] is False
+    assert readiness_payload["paper_execution_permission_changed"] is False
+    assert readiness_payload["labeler"]["state_counts"] == {"LABELED": 1}
+    assert readiness_payload["labeler"]["batch_policy"] == {
+        "default_max_conditions_per_pass": 1,
+        "hard_max_conditions_per_pass": 10,
+        "changed_in_p2_2b": False,
+    }
+    buckets = readiness_payload["corpus"]["buckets"]
+    assert len(buckets) == 12
+    btc = next(row for row in buckets if row["asset"] == "BTC" and row["horizon"] == "5m")
+    assert btc["unique_conditions"] == 1
+    assert btc["labeled_unique_conditions"] == 1
+    assert btc["up_labeled_conditions"] == 1
+    assert btc["down_labeled_conditions"] == 0
+    assert btc["eligible_unique_conditions"] == 1
+    assert btc["label_coverage_eligible_conditions"] == "1.0"
+    assert btc["placeholder_zero_features"] == ["spot_perp_basis"]
+    assert btc["future_timestamp_violations"] == 0
+    assert btc["official_label_conflict_count"] == 0
+    assert btc["readiness_state"] == "INSUFFICIENT_UNIQUE_CONDITIONS"
 
 
 async def _assert_builder_exception_returns_payload_with_http_200() -> None:

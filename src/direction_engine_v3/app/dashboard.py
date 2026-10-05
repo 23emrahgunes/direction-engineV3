@@ -38,6 +38,8 @@ P2_1_COMPARATOR_VERSION = "P2.1_TEMPORAL_COMPARATOR_V1"
 P2_1_CONDITIONAL_PRODUCTION_SCHEMA_VERSION = (
     "v3.15.3-directional-official-ptb-source-dedup-v2"
 )
+P2_2B_LABEL_DEFAULT_LIMIT = 20
+P2_2B_LABEL_MAX_LIMIT = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +158,121 @@ def build_model_governance_status() -> dict[str, object]:
             "reason": type(exc).__name__,
         }
     return status
+
+
+def build_directional_corpus_labels(
+    *, limit: str | None = None, asset: str | None = None, horizon: str | None = None
+) -> dict[str, object]:
+    bounded_limit = _safe_limit(
+        limit,
+        default=P2_2B_LABEL_DEFAULT_LIMIT,
+        maximum=P2_2B_LABEL_MAX_LIMIT,
+    )
+    corpus_path = runtime_data_dir() / "directional_corpus.sqlite3"
+    if not corpus_path.exists():
+        return {
+            "status": "DIRECTIONAL_CORPUS_LABELS_NOT_INITIALIZED",
+            "version": "P2.2B",
+            "real_order_submission": False,
+            "limit": bounded_limit,
+            "labels": [],
+        }
+    try:
+        asset_filter = _asset_filter(asset)
+        horizon_filter = _horizon_filter(horizon)
+        labels = SQLiteDirectionalCorpusRepository(
+            corpus_path
+        ).recent_labeled_conditions(
+            limit=bounded_limit,
+            asset=asset_filter,
+            horizon=horizon_filter,
+        )
+    except sqlite3.OperationalError as exc:
+        return {
+            "status": "DIRECTIONAL_CORPUS_LABELS_SCHEMA_UNAVAILABLE",
+            "version": "P2.2B",
+            "reason": type(exc).__name__,
+            "message": str(exc),
+            "real_order_submission": False,
+            "limit": bounded_limit,
+            "labels": [],
+        }
+    except ValueError as exc:
+        return {
+            "status": "DIRECTIONAL_CORPUS_LABELS_BAD_REQUEST",
+            "version": "P2.2B",
+            "reason": str(exc),
+            "real_order_submission": False,
+            "limit": bounded_limit,
+            "labels": [],
+        }
+    return {
+        "status": "DIRECTIONAL_CORPUS_LABELS_READY",
+        "version": "P2.2B",
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "real_order_submission": False,
+        "limit": bounded_limit,
+        "filters": {
+            "asset": None if asset_filter is None else asset_filter.value,
+            "horizon": None if horizon_filter is None else horizon_filter.value,
+        },
+        "labels": list(labels),
+        "label_count": len(labels),
+        "bounded": True,
+        "hard_max_limit": P2_2B_LABEL_MAX_LIMIT,
+    }
+
+
+def build_directional_corpus_readiness() -> dict[str, object]:
+    corpus_path = runtime_data_dir() / "directional_corpus.sqlite3"
+    if not corpus_path.exists():
+        corpus_report: dict[str, object] = {
+            "status": "DIRECTIONAL_CORPUS_READINESS_NOT_INITIALIZED",
+            "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+            "real_order_submission": False,
+            "buckets": [],
+            "training_ready_buckets": [],
+            "blockers": ["directional_corpus.sqlite3 not found"],
+        }
+    else:
+        try:
+            corpus_report = SQLiteDirectionalCorpusRepository(
+                corpus_path
+            ).training_readiness_report()
+        except sqlite3.OperationalError as exc:
+            corpus_report = {
+                "status": "DIRECTIONAL_CORPUS_READINESS_SCHEMA_UNAVAILABLE",
+                "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+                "reason": type(exc).__name__,
+                "message": str(exc),
+                "real_order_submission": False,
+                "buckets": [],
+                "training_ready_buckets": [],
+                "blockers": ["checkpoint schema unavailable"],
+            }
+        except Exception as exc:
+            corpus_report = {
+                "status": "DIRECTIONAL_CORPUS_READINESS_UNAVAILABLE",
+                "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+                "reason": type(exc).__name__,
+                "real_order_submission": False,
+                "buckets": [],
+                "training_ready_buckets": [],
+                "blockers": ["corpus readiness unavailable"],
+            }
+    label_tasks = _label_task_summary()
+    return {
+        "status": corpus_report.get("status", "DIRECTIONAL_CORPUS_READINESS_READY"),
+        "version": "P2.2B",
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "real_order_submission": False,
+        "training_started": False,
+        "model_promotion_changed": False,
+        "paper_execution_permission_changed": False,
+        "corpus": corpus_report,
+        "labeler": label_tasks,
+        "readiness_marker": _corpus_readiness_marker(corpus_report),
+    }
 
 
 def build_feature_integrity_report() -> dict[str, object]:
@@ -1160,6 +1277,65 @@ def _paper_repository() -> SQLitePaperRepository:
     repository = SQLitePaperRepository(runtime_data_dir() / "paper.sqlite3")
     repository.initialize()
     return repository
+
+
+def _label_task_summary() -> dict[str, object]:
+    paper_path = runtime_data_dir() / "paper.sqlite3"
+    if not paper_path.exists():
+        return {
+            "status": "PAPER_LABEL_TASKS_NOT_INITIALIZED",
+            "total_tasks": 0,
+            "state_counts": {},
+            "reason_counts": {},
+            "recent_tasks": [],
+            "batch_policy": {
+                "default_max_conditions_per_pass": 1,
+                "hard_max_conditions_per_pass": 10,
+                "changed_in_p2_2b": False,
+            },
+        }
+    try:
+        return SQLitePaperRepository(paper_path).corpus_label_task_summary(limit=25)
+    except Exception as exc:
+        return {
+            "status": "PAPER_LABEL_TASKS_UNAVAILABLE",
+            "reason": type(exc).__name__,
+            "total_tasks": 0,
+            "state_counts": {},
+            "reason_counts": {},
+            "recent_tasks": [],
+        }
+
+
+def _corpus_readiness_marker(corpus_report: dict[str, object]) -> str:
+    buckets = corpus_report.get("buckets")
+    if not isinstance(buckets, list) or not buckets:
+        return "P2_2B_CORPUS_MATURATION_PARTIAL"
+    if any(
+        isinstance(bucket, dict)
+        and bucket.get("readiness_state") == "DATA_INTEGRITY_BLOCKED"
+        for bucket in buckets
+    ):
+        return "P2_2B_CORPUS_MATURATION_BLOCKED"
+    return "P2_2B_CORPUS_MATURATION_ACCEPTED"
+
+
+def _asset_filter(raw: str | None) -> Asset | None:
+    if raw is None or not raw or raw.upper() == "ALL":
+        return None
+    try:
+        return Asset(raw.upper())
+    except ValueError as exc:
+        raise ValueError("asset must be one of BTC, ETH, SOL, XRP") from exc
+
+
+def _horizon_filter(raw: str | None) -> Horizon | None:
+    if raw is None or not raw or raw == "ALL":
+        return None
+    try:
+        return Horizon(raw)
+    except ValueError as exc:
+        raise ValueError("horizon must be one of 5m, 15m, 1h") from exc
 
 
 def _bounded_reconciliation_payload(payload: dict[str, object]) -> dict[str, object]:

@@ -1,11 +1,13 @@
 """Immutable Directional training-ready observation storage."""
 
 import json
+import math
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.domain._validation import require_text, require_utc
@@ -517,6 +519,255 @@ class SQLiteDirectionalCorpusRepository:
             "future_timestamp_violations": future_timestamp_violations,
         }
 
+    def recent_labeled_conditions(
+        self,
+        *,
+        limit: int = 20,
+        asset: Asset | None = None,
+        horizon: Horizon | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Return bounded official-label proof grouped by condition.
+
+        This is read-only operator evidence.  It deliberately returns unique
+        conditions instead of raw checkpoint rows so one condition with four
+        checkpoints cannot look like four independent labels.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        bounded_limit = min(limit, 100)
+        clauses = ["outcome_json IS NOT NULL"]
+        params: list[object] = []
+        if asset is not None:
+            clauses.append("asset=?")
+            params.append(asset.value)
+        if horizon is not None:
+            clauses.append("horizon=?")
+            params.append(horizon.value)
+        where = " AND ".join(clauses)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT condition_id,asset,horizon,
+                       MIN(observed_at),
+                       MAX(outcome_attached_at),
+                       COUNT(*),
+                       GROUP_CONCAT(DISTINCT feature_schema_version),
+                       MIN(outcome_json),
+                       MIN(payload_json)
+                FROM directional_checkpoint_observations
+                WHERE {where}
+                GROUP BY condition_id,asset,horizon
+                ORDER BY MAX(outcome_attached_at) DESC, condition_id ASC
+                LIMIT ?
+                """,
+                (*params, bounded_limit),
+            ).fetchall()
+        results: list[dict[str, object]] = []
+        for row in rows:
+            outcome = _safe_json_object(str(row[7] or "{}"))
+            payload = _safe_json_object(str(row[8] or "{}"))
+            official_outcome = _label_from_outcome(outcome)
+            results.append(
+                {
+                    "condition_id": str(row[0]),
+                    "market_id": _optional_text(payload.get("market_id")),
+                    "asset": str(row[1]),
+                    "horizon": str(row[2]),
+                    "window_start": _iso_or_none(_optional_datetime(payload.get("window_start"))),
+                    "window_end": _iso_or_none(_optional_datetime(payload.get("window_end"))),
+                    "official_outcome": official_outcome,
+                    "resolution_source": outcome.get("settlement_source")
+                    or outcome.get("settlement_source_kind"),
+                    "resolved_at": outcome.get("official_resolved_at"),
+                    "label_attached_at": None if row[4] is None else str(row[4]),
+                    "evidence_hash": outcome.get("evidence_hash"),
+                    "checkpoint_row_count": int(row[5] or 0),
+                    "feature_schema_versions": sorted(
+                        item for item in str(row[6] or "").split(",") if item
+                    ),
+                    "dataset_schema_version": "directional_checkpoint_observations:v1",
+                    "source_kind": outcome.get("settlement_source_kind"),
+                }
+            )
+        return tuple(results)
+
+    def training_readiness_report(self, *, now: datetime | None = None) -> dict[str, object]:
+        """Return conservative training-readiness evidence by asset x horizon.
+
+        The report is diagnostic only.  It never trains, promotes, opens PAPER
+        trades, rewrites labels, or treats checkpoint rows as independent
+        resolved markets.
+        """
+
+        observed_now = now or datetime.now(UTC)
+        require_utc("now", observed_now)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT asset,horizon,condition_id,checkpoint_target_tte_seconds,
+                       feature_schema_version,observed_at,actual_tte_seconds,
+                       payload_json,outcome_json,outcome_attached_at
+                FROM directional_checkpoint_observations
+                ORDER BY observed_at ASC
+                """
+            ).fetchall()
+        by_bucket: dict[tuple[str, str], dict[str, Any]] = {
+            (asset.value, horizon.value): _empty_readiness_bucket(asset, horizon)
+            for asset in Asset
+            for horizon in Horizon
+        }
+        condition_state: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            asset_value = str(row[0])
+            horizon_value = str(row[1])
+            key = (asset_value, horizon_value)
+            bucket = by_bucket.setdefault(
+                key, _empty_readiness_bucket(Asset(asset_value), Horizon(horizon_value))
+            )
+            condition_id = str(row[2])
+            target = int(row[3] or 0)
+            feature_schema = str(row[4])
+            observed_at = datetime.fromisoformat(str(row[5]))
+            actual_tte = None if row[6] is None else int(row[6])
+            payload = _safe_json_object(str(row[7]))
+            outcome = _safe_json_object(str(row[8])) if row[8] is not None else None
+            row_key = (asset_value, horizon_value, condition_id)
+            state = condition_state.setdefault(
+                row_key,
+                {
+                    "condition_id": condition_id,
+                    "asset": asset_value,
+                    "horizon": horizon_value,
+                    "row_count": 0,
+                    "targets": set(),
+                    "labeled": False,
+                    "labels": set(),
+                    "window_end": _optional_datetime(payload.get("window_end")),
+                    "first_observed_at": observed_at,
+                    "last_observed_at": observed_at,
+                },
+            )
+            state["row_count"] = int(state["row_count"]) + 1
+            cast_targets = state["targets"]
+            if isinstance(cast_targets, set):
+                cast_targets.add(target)
+            state["last_observed_at"] = observed_at
+            if outcome is not None:
+                state["labeled"] = True
+                label = _label_from_outcome(outcome)
+                if label is not None:
+                    labels = state["labels"]
+                    if isinstance(labels, set):
+                        labels.add(label)
+            bucket["row_count"] = _int_field(bucket, "row_count") + 1
+            feature_schema_counts = cast(dict[str, int], bucket["feature_schema_counts"])
+            feature_schema_counts[feature_schema] = (
+                int(feature_schema_counts.get(feature_schema, 0)) + 1
+            )
+            if outcome is not None:
+                bucket["labeled_row_count"] = _int_field(bucket, "labeled_row_count") + 1
+                dataset_schema_counts = cast(dict[str, int], bucket["dataset_schema_counts"])
+                dataset_schema_counts["directional_checkpoint_observations:v1"] = (
+                    int(dataset_schema_counts.get(
+                        "directional_checkpoint_observations:v1", 0
+                    ))
+                    + 1
+                )
+            if actual_tte is None:
+                bucket["missing_actual_tte_count"] = (
+                    _int_field(bucket, "missing_actual_tte_count") + 1
+                )
+            else:
+                error = abs(actual_tte - target)
+                timing = cast(dict[str, int], bucket["checkpoint_timing_error_seconds"])
+                timing["count"] = int(timing.get("count", 0)) + 1
+                timing["max"] = max(int(timing.get("max", 0)), error)
+                timing["within_tolerance_count"] = (
+                    int(timing.get("within_tolerance_count", 0)) + (1 if error <= 10 else 0)
+                )
+            target_counts = cast(dict[str, int], bucket["checkpoint_target_counts"])
+            target_counts[str(target)] = int(target_counts.get(str(target), 0)) + 1
+            _accumulate_feature_quality(bucket, payload, observed_at)
+        for state in condition_state.values():
+            key = (str(state["asset"]), str(state["horizon"]))
+            bucket = by_bucket[key]
+            bucket["unique_conditions"] = _int_field(bucket, "unique_conditions") + 1
+            first_observed_at = state.get("first_observed_at")
+            last_observed_at = state.get("last_observed_at")
+            if isinstance(first_observed_at, datetime):
+                current = bucket.get("first_observed_at")
+                bucket["first_observed_at"] = (
+                    first_observed_at
+                    if not isinstance(current, datetime) or first_observed_at < current
+                    else current
+                )
+            if isinstance(last_observed_at, datetime):
+                current = bucket.get("last_observed_at")
+                bucket["last_observed_at"] = (
+                    last_observed_at
+                    if not isinstance(current, datetime) or last_observed_at > current
+                    else current
+                )
+            labels_obj = state.get("labels")
+            labels = labels_obj if isinstance(labels_obj, set) else set()
+            if len(labels) > 1:
+                bucket["official_label_conflict_count"] = (
+                    _int_field(bucket, "official_label_conflict_count") + 1
+                )
+            if state.get("labeled"):
+                bucket["labeled_unique_conditions"] = (
+                    _int_field(bucket, "labeled_unique_conditions") + 1
+                )
+                if "UP" in labels:
+                    bucket["up_labeled_conditions"] = (
+                        _int_field(bucket, "up_labeled_conditions") + 1
+                    )
+                if "DOWN" in labels:
+                    bucket["down_labeled_conditions"] = (
+                        _int_field(bucket, "down_labeled_conditions") + 1
+                    )
+                continue
+            window_end = state.get("window_end")
+            if isinstance(window_end, datetime) and window_end <= observed_now:
+                bucket["eligible_unlabeled_conditions"] = (
+                    _int_field(bucket, "eligible_unlabeled_conditions") + 1
+                )
+            else:
+                bucket["active_or_unknown_unlabeled_conditions"] = (
+                    _int_field(bucket, "active_or_unknown_unlabeled_conditions") + 1
+                )
+        buckets = []
+        blockers: list[str] = []
+        for asset in Asset:
+            for horizon in Horizon:
+                bucket = by_bucket[(asset.value, horizon.value)]
+                _finalize_readiness_bucket(bucket)
+                buckets.append(bucket)
+                if bucket["readiness_state"] != "TRAINING_READY":
+                    blockers.append(f"{asset.value}-{horizon.value}:{bucket['readiness_state']}")
+        return {
+            "status": "DIRECTIONAL_CORPUS_READINESS_READY",
+            "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+            "generated_at": observed_now.isoformat(),
+            "real_order_submission": False,
+            "training_started": False,
+            "model_promotion_changed": False,
+            "paper_execution_permission_changed": False,
+            "minimum_labeled_unique_conditions": 100,
+            "minimum_class_count_per_side": 20,
+            "minimum_eligible_label_coverage": "0.80",
+            "checkpoint_targets_seconds": [120, 90, 60, 45],
+            "checkpoint_tolerance_seconds": 10,
+            "buckets": buckets,
+            "training_ready_buckets": [
+                f"{row['asset']}-{row['horizon']}"
+                for row in buckets
+                if row["readiness_state"] == "TRAINING_READY"
+            ],
+            "blockers": blockers[:50],
+        }
+
     def pending_checkpoint_label_candidates(
         self, *, now: datetime, limit: int
     ) -> tuple[DirectionalCheckpointLabelCandidate, ...]:
@@ -744,6 +995,198 @@ def _optional_text(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _safe_json_object(raw: str) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _label_from_outcome(outcome: Mapping[str, object]) -> str | None:
+    winning_side = outcome.get("winning_side")
+    if winning_side in {"UP", "DOWN"}:
+        return str(winning_side)
+    outcome_up = outcome.get("outcome_up")
+    if outcome_up is True:
+        return "UP"
+    if outcome_up is False:
+        return "DOWN"
+    return None
+
+
+def _empty_readiness_bucket(asset: Asset, horizon: Horizon) -> dict[str, Any]:
+    return {
+        "asset": asset.value,
+        "horizon": horizon.value,
+        "row_count": 0,
+        "unique_conditions": 0,
+        "labeled_row_count": 0,
+        "labeled_unique_conditions": 0,
+        "up_labeled_conditions": 0,
+        "down_labeled_conditions": 0,
+        "eligible_unlabeled_conditions": 0,
+        "active_or_unknown_unlabeled_conditions": 0,
+        "eligible_unique_conditions": 0,
+        "label_coverage_eligible_conditions": "0",
+        "checkpoint_target_counts": {},
+        "checkpoint_timing_error_seconds": {
+            "count": 0,
+            "within_tolerance_count": 0,
+            "max": 0,
+        },
+        "feature_schema_counts": {},
+        "dataset_schema_counts": {},
+        "missing_feature_counts": {},
+        "feature_observation_counts": {},
+        "placeholder_zero_features": [],
+        "non_finite_feature_count": 0,
+        "zero_variance_features": [],
+        "future_timestamp_violations": 0,
+        "missing_actual_tte_count": 0,
+        "official_label_conflict_count": 0,
+        "first_observed_at": None,
+        "last_observed_at": None,
+        "_feature_values": {},
+        "readiness_state": "COLLECTING",
+    }
+
+
+def _accumulate_feature_quality(
+    bucket: dict[str, Any], payload: Mapping[str, object], observed_at: datetime
+) -> None:
+    feature_vector = payload.get("feature_vector")
+    if not isinstance(feature_vector, dict):
+        _increment_nested_int(bucket, "missing_feature_counts", "feature_vector")
+        return
+    generated_at = _optional_datetime(feature_vector.get("generated_at")) or observed_at
+    features = feature_vector.get("features")
+    if not isinstance(features, list) or not features:
+        _increment_nested_int(bucket, "missing_feature_counts", "features")
+        return
+    values_by_name = bucket["_feature_values"]
+    if not isinstance(values_by_name, dict):
+        values_by_name = {}
+        bucket["_feature_values"] = values_by_name
+    for item in features:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "UNKNOWN")
+        _increment_nested_int(bucket, "feature_observation_counts", name)
+        value = item.get("value")
+        if value is None:
+            _increment_nested_int(bucket, "missing_feature_counts", name)
+        numeric = _optional_float(value)
+        if numeric is None:
+            if value is not None:
+                bucket["non_finite_feature_count"] = (
+                    _int_field(bucket, "non_finite_feature_count") + 1
+                )
+        else:
+            values = values_by_name.setdefault(name, [])
+            if isinstance(values, list):
+                values.append(numeric)
+        if name == "spot_perp_basis" and numeric == 0.0:
+            placeholders = bucket["placeholder_zero_features"]
+            if isinstance(placeholders, list) and name not in placeholders:
+                placeholders.append(name)
+        source_ts = _optional_datetime(item.get("source_ts"))
+        if source_ts is not None and source_ts > generated_at:
+            bucket["future_timestamp_violations"] = (
+                _int_field(bucket, "future_timestamp_violations") + 1
+            )
+
+
+def _increment_nested_int(bucket: dict[str, Any], field: str, key: str) -> None:
+    values = bucket[field]
+    if not isinstance(values, dict):
+        values = {}
+        bucket[field] = values
+    values[key] = int(values.get(key, 0)) + 1
+
+
+def _int_field(bucket: Mapping[str, object], field: str) -> int:
+    value = bucket.get(field, 0)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        numeric = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _finalize_readiness_bucket(bucket: dict[str, Any]) -> None:
+    labeled = _int_field(bucket, "labeled_unique_conditions")
+    eligible_unlabeled = _int_field(bucket, "eligible_unlabeled_conditions")
+    eligible_total = labeled + eligible_unlabeled
+    bucket["eligible_unique_conditions"] = eligible_total
+    bucket["label_coverage_eligible_conditions"] = (
+        str(labeled / eligible_total) if eligible_total else "0"
+    )
+    first = bucket.get("first_observed_at")
+    last = bucket.get("last_observed_at")
+    bucket["first_observed_at"] = _iso_or_none(first if isinstance(first, datetime) else None)
+    bucket["last_observed_at"] = _iso_or_none(last if isinstance(last, datetime) else None)
+    timing = bucket["checkpoint_timing_error_seconds"]
+    if isinstance(timing, dict):
+        count = int(timing.get("count", 0))
+        within = int(timing.get("within_tolerance_count", 0))
+        timing["within_tolerance_rate"] = str(within / count) if count else "0"
+    values_by_name = bucket.pop("_feature_values", {})
+    zero_variance: list[str] = []
+    if isinstance(values_by_name, dict):
+        for name, values in values_by_name.items():
+            if isinstance(values, list) and len(values) > 1 and len(set(values)) <= 1:
+                zero_variance.append(str(name))
+    bucket["zero_variance_features"] = sorted(zero_variance)
+    state = "TRAINING_READY"
+    if _int_field(bucket, "official_label_conflict_count") > 0 or _int_field(
+        bucket, "future_timestamp_violations"
+    ) > 0:
+        state = "DATA_INTEGRITY_BLOCKED"
+    elif len(bucket["feature_schema_counts"]) > 1:
+        state = "SCHEMA_INCOMPATIBLE"
+    elif _int_field(bucket, "non_finite_feature_count") > 0:
+        state = "FEATURE_COMPLETENESS_FAILED"
+    elif zero_variance and labeled >= 2:
+        state = "FEATURE_VARIANCE_FAILED"
+    elif labeled <= 0:
+        state = "COLLECTING"
+    elif eligible_total and labeled / eligible_total < 0.8:
+        state = "LABEL_COVERAGE_INSUFFICIENT"
+    elif labeled < 100:
+        state = "INSUFFICIENT_UNIQUE_CONDITIONS"
+    elif _int_field(bucket, "up_labeled_conditions") < 20 or _int_field(
+        bucket, "down_labeled_conditions"
+    ) < 20:
+        state = "SEVERE_CLASS_IMBALANCE"
+    else:
+        target_counts = bucket["checkpoint_target_counts"]
+        if not isinstance(target_counts, dict) or any(
+            int(target_counts.get(str(target), 0)) <= 0 for target in (120, 90, 60, 45)
+        ):
+            state = "CHECKPOINT_COVERAGE_INSUFFICIENT"
+    bucket["readiness_state"] = state
 
 
 def _is_training_ready_payload(payload: Mapping[str, object]) -> bool:
