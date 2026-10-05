@@ -483,7 +483,166 @@ async def _assert_directional_corpus_endpoints() -> None:
     assert btc["placeholder_zero_features"] == ["spot_perp_basis"]
     assert btc["future_timestamp_violations"] == 0
     assert btc["official_label_conflict_count"] == 0
+    assert btc["variance_failed_features"] == []
+    assert btc["failing_features"] == []
+    assert "INSUFFICIENT_UNIQUE_CONDITIONS" in btc["all_failed_gates"]
     assert btc["readiness_state"] == "INSUFFICIENT_UNIQUE_CONDITIONS"
+
+
+def test_p2_2c_readiness_variance_policy_excludes_placeholders_and_names_failures(
+    tmp_path,
+) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "directional_corpus.sqlite3")
+    corpus.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+
+    _write_labeled_checkpoint_conditions(
+        corpus,
+        observed_at=observed_at,
+        condition_count=100,
+        features_for_index=lambda index: {
+            "short_return": "0.000000001" if index % 2 else "0.000000002",
+            "spot_perp_basis": "0",
+        },
+    )
+
+    report = corpus.training_readiness_report(now=observed_at + timedelta(hours=1))
+    assert report["policy_version"] == "DIRECTIONAL_CORPUS_READINESS_V2"
+    btc = _bucket(report, Asset.BTC, Horizon.FIVE_MINUTES)
+    assert btc["readiness_state"] == "TRAINING_READY"
+    assert btc["primary_reason"] == "TRAINING_READY"
+    assert btc["all_failed_gates"] == []
+    assert btc["placeholder_zero_features"] == ["spot_perp_basis"]
+    assert "spot_perp_basis" in btc["zero_variance_features"]
+    assert btc["variance_failed_features"] == []
+    assert btc["failing_features"] == []
+    assert btc["feature_statistics"]["short_return"]["all_rows"]["unique"] == 2
+    assert btc["feature_statistics"]["short_return"]["all_rows"]["stddev"] is not None
+    assert (
+        btc["feature_classifications"]["spot_perp_basis"]
+        == "PLACEHOLDER_NON_SIGNAL"
+    )
+
+    failing = SQLiteDirectionalCorpusRepository(
+        tmp_path / "directional_corpus_required_constant.sqlite3"
+    )
+    failing.initialize()
+    _write_labeled_checkpoint_conditions(
+        failing,
+        observed_at=observed_at,
+        condition_count=100,
+        features_for_index=lambda _index: {
+            "short_return": "1",
+            "spot_perp_basis": "0",
+        },
+    )
+    failing_report = failing.training_readiness_report(
+        now=observed_at + timedelta(hours=1)
+    )
+    failing_btc = _bucket(failing_report, Asset.BTC, Horizon.FIVE_MINUTES)
+    assert failing_btc["readiness_state"] == "FEATURE_VARIANCE_FAILED"
+    assert failing_btc["primary_reason"] == "FEATURE_VARIANCE_FAILED"
+    assert failing_btc["variance_failed_features"] == ["short_return"]
+    assert failing_btc["failing_features"][0]["name"] == "short_return"
+    assert failing_btc["failing_features"][0]["classification"] == (
+        "REQUIRED_SIGNAL_FEATURE"
+    )
+    assert "FEATURE_VARIANCE_FAILED" in failing_btc["all_failed_gates"]
+
+
+def test_p2_2c_readiness_reason_precedence_uses_sample_before_variance(
+    tmp_path,
+) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "directional_corpus.sqlite3")
+    corpus.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    _write_labeled_checkpoint_conditions(
+        corpus,
+        observed_at=observed_at,
+        condition_count=7,
+        asset=Asset.XRP,
+        horizon=Horizon.ONE_HOUR,
+        features_for_index=lambda _index: {
+            "short_return": "1",
+            "spot_perp_basis": "0",
+        },
+    )
+
+    report = corpus.training_readiness_report(now=observed_at + timedelta(hours=2))
+    xrp = _bucket(report, Asset.XRP, Horizon.ONE_HOUR)
+    assert xrp["readiness_state"] == "INSUFFICIENT_UNIQUE_CONDITIONS"
+    assert xrp["primary_reason"] == "INSUFFICIENT_UNIQUE_CONDITIONS"
+    assert "FEATURE_VARIANCE_FAILED" in xrp["all_failed_gates"]
+    assert xrp["variance_failed_features"] == ["short_return"]
+
+
+def _write_labeled_checkpoint_conditions(
+    corpus: SQLiteDirectionalCorpusRepository,
+    *,
+    observed_at: datetime,
+    condition_count: int,
+    features_for_index,
+    asset: Asset = Asset.BTC,
+    horizon: Horizon = Horizon.FIVE_MINUTES,
+) -> None:
+    for index in range(condition_count):
+        condition_id = f"{asset.value}-{horizon.value}-condition-{index}"
+        label_up = index % 2 == 0
+        for target in (120, 90, 60, 45):
+            corpus.save_checkpoint_observation(
+                checkpoint_id=f"{condition_id}-{target}",
+                asset=asset,
+                horizon=horizon,
+                condition_id=condition_id,
+                checkpoint_target_tte_seconds=target,
+                feature_schema_version="v3.15.3-directional-official-ptb",
+                observed_at=observed_at + timedelta(seconds=index, milliseconds=target),
+                actual_tte_seconds=target,
+                payload={
+                    "market_id": f"market-{condition_id}",
+                    "window_start": (observed_at - timedelta(minutes=10)).isoformat(),
+                    "window_end": (observed_at - timedelta(minutes=1)).isoformat(),
+                    "feature_vector": {
+                        "feature_set_version": "v3.15.3-directional-official-ptb",
+                        "generated_at": observed_at.isoformat(),
+                        "features": [
+                            {
+                                "name": name,
+                                "value": value,
+                                "source_ts": observed_at.isoformat(),
+                            }
+                            for name, value in features_for_index(index).items()
+                        ],
+                    },
+                },
+            )
+        official_resolved_at = observed_at + timedelta(hours=1)
+        corpus.attach_verified_outcome_to_condition_once(
+            condition_id=condition_id,
+            outcome={
+                "settlement_source_kind": "OFFICIAL",
+                "settlement_source": "POLYMARKET_OFFICIAL_METADATA",
+                "outcome_up": label_up,
+                "winning_side": "UP" if label_up else "DOWN",
+                "official_resolved_at": official_resolved_at.isoformat(),
+                "evidence_hash": f"hash-{condition_id}",
+            },
+            official_resolved_at=official_resolved_at,
+            attached_at=official_resolved_at + timedelta(minutes=1),
+        )
+
+
+def _bucket(report: dict[str, object], asset: Asset, horizon: Horizon) -> dict[str, object]:
+    buckets = report["buckets"]
+    assert isinstance(buckets, list)
+    bucket = next(
+        row
+        for row in buckets
+        if isinstance(row, dict)
+        and row["asset"] == asset.value
+        and row["horizon"] == horizon.value
+    )
+    return bucket
 
 
 async def _assert_builder_exception_returns_payload_with_http_200() -> None:

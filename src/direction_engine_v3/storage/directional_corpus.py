@@ -12,6 +12,33 @@ from typing import Any, cast
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.domain._validation import require_text, require_utc
 
+READINESS_POLICY_VERSION = "DIRECTIONAL_CORPUS_READINESS_V2"
+MINIMUM_LABELED_UNIQUE_CONDITIONS = 100
+MINIMUM_CLASS_COUNT_PER_SIDE = 20
+MINIMUM_ELIGIBLE_LABEL_COVERAGE = 0.80
+CHECKPOINT_TARGETS_SECONDS = (120, 90, 60, 45)
+CHECKPOINT_TOLERANCE_SECONDS = 10
+
+PLACEHOLDER_NON_SIGNAL_FEATURES = frozenset({"spot_perp_basis"})
+REQUIRED_SIGNAL_FEATURES = frozenset(
+    {
+        "ptb_normalized_distance",
+        "tte_fraction",
+        "short_return",
+        "medium_return",
+        "momentum",
+        "realized_volatility",
+        "volatility_acceleration",
+        "trade_imbalance",
+        "external_book_imbalance",
+        "microprice_distance",
+        "signal_stability",
+        "flip_rate",
+        "regime_score",
+    }
+)
+DERIVED_DIAGNOSTIC_FEATURES = frozenset({"signal_stability", "flip_rate"})
+
 
 @dataclass(frozen=True, slots=True)
 class DirectionalCorpusRecord:
@@ -688,7 +715,13 @@ class SQLiteDirectionalCorpusRepository:
                 )
             target_counts = cast(dict[str, int], bucket["checkpoint_target_counts"])
             target_counts[str(target)] = int(target_counts.get(str(target), 0)) + 1
-            _accumulate_feature_quality(bucket, payload, observed_at)
+            _accumulate_feature_quality(
+                bucket,
+                payload,
+                observed_at,
+                outcome=outcome,
+                checkpoint_target=target,
+            )
         for state in condition_state.values():
             key = (str(state["asset"]), str(state["horizon"]))
             bucket = by_bucket[key]
@@ -748,17 +781,17 @@ class SQLiteDirectionalCorpusRepository:
                     blockers.append(f"{asset.value}-{horizon.value}:{bucket['readiness_state']}")
         return {
             "status": "DIRECTIONAL_CORPUS_READINESS_READY",
-            "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+            "policy_version": READINESS_POLICY_VERSION,
             "generated_at": observed_now.isoformat(),
             "real_order_submission": False,
             "training_started": False,
             "model_promotion_changed": False,
             "paper_execution_permission_changed": False,
-            "minimum_labeled_unique_conditions": 100,
-            "minimum_class_count_per_side": 20,
-            "minimum_eligible_label_coverage": "0.80",
-            "checkpoint_targets_seconds": [120, 90, 60, 45],
-            "checkpoint_tolerance_seconds": 10,
+            "minimum_labeled_unique_conditions": MINIMUM_LABELED_UNIQUE_CONDITIONS,
+            "minimum_class_count_per_side": MINIMUM_CLASS_COUNT_PER_SIDE,
+            "minimum_eligible_label_coverage": str(MINIMUM_ELIGIBLE_LABEL_COVERAGE),
+            "checkpoint_targets_seconds": list(CHECKPOINT_TARGETS_SECONDS),
+            "checkpoint_tolerance_seconds": CHECKPOINT_TOLERANCE_SECONDS,
             "buckets": buckets,
             "training_ready_buckets": [
                 f"{row['asset']}-{row['horizon']}"
@@ -1048,18 +1081,35 @@ def _empty_readiness_bucket(asset: Asset, horizon: Horizon) -> dict[str, Any]:
         "placeholder_zero_features": [],
         "non_finite_feature_count": 0,
         "zero_variance_features": [],
+        "variance_gate_features": sorted(REQUIRED_SIGNAL_FEATURES),
+        "variance_failed_features": [],
+        "failing_features": [],
+        "feature_classifications": {},
+        "feature_statistics": {},
+        "checkpoint_feature_statistics": {},
+        "outcome_feature_statistics": {},
+        "all_failed_gates": [],
+        "primary_reason": "COLLECTING",
         "future_timestamp_violations": 0,
         "missing_actual_tte_count": 0,
         "official_label_conflict_count": 0,
         "first_observed_at": None,
         "last_observed_at": None,
         "_feature_values": {},
+        "_labeled_feature_values": {},
+        "_checkpoint_feature_values": {},
+        "_outcome_feature_values": {},
         "readiness_state": "COLLECTING",
     }
 
 
 def _accumulate_feature_quality(
-    bucket: dict[str, Any], payload: Mapping[str, object], observed_at: datetime
+    bucket: dict[str, Any],
+    payload: Mapping[str, object],
+    observed_at: datetime,
+    *,
+    outcome: Mapping[str, object] | None = None,
+    checkpoint_target: int | None = None,
 ) -> None:
     feature_vector = payload.get("feature_vector")
     if not isinstance(feature_vector, dict):
@@ -1074,6 +1124,19 @@ def _accumulate_feature_quality(
     if not isinstance(values_by_name, dict):
         values_by_name = {}
         bucket["_feature_values"] = values_by_name
+    labeled_values_by_name = bucket["_labeled_feature_values"]
+    if not isinstance(labeled_values_by_name, dict):
+        labeled_values_by_name = {}
+        bucket["_labeled_feature_values"] = labeled_values_by_name
+    checkpoint_values_by_name = bucket["_checkpoint_feature_values"]
+    if not isinstance(checkpoint_values_by_name, dict):
+        checkpoint_values_by_name = {}
+        bucket["_checkpoint_feature_values"] = checkpoint_values_by_name
+    outcome_values_by_name = bucket["_outcome_feature_values"]
+    if not isinstance(outcome_values_by_name, dict):
+        outcome_values_by_name = {}
+        bucket["_outcome_feature_values"] = outcome_values_by_name
+    label = _label_from_outcome(outcome) if outcome is not None else None
     for item in features:
         if not isinstance(item, dict):
             continue
@@ -1092,6 +1155,23 @@ def _accumulate_feature_quality(
             values = values_by_name.setdefault(name, [])
             if isinstance(values, list):
                 values.append(numeric)
+            if outcome is not None:
+                labeled_values = labeled_values_by_name.setdefault(name, [])
+                if isinstance(labeled_values, list):
+                    labeled_values.append(numeric)
+            if checkpoint_target is not None:
+                target_key = str(checkpoint_target)
+                target_values = checkpoint_values_by_name.setdefault(target_key, {})
+                if isinstance(target_values, dict):
+                    values_for_target = target_values.setdefault(name, [])
+                    if isinstance(values_for_target, list):
+                        values_for_target.append(numeric)
+            if label is not None:
+                label_values = outcome_values_by_name.setdefault(label, {})
+                if isinstance(label_values, dict):
+                    values_for_label = label_values.setdefault(name, [])
+                    if isinstance(values_for_label, list):
+                        values_for_label.append(numeric)
         if name == "spot_perp_basis" and numeric == 0.0:
             placeholders = bucket["placeholder_zero_features"]
             if isinstance(placeholders, list) and name not in placeholders:
@@ -1153,40 +1233,195 @@ def _finalize_readiness_bucket(bucket: dict[str, Any]) -> None:
         within = int(timing.get("within_tolerance_count", 0))
         timing["within_tolerance_rate"] = str(within / count) if count else "0"
     values_by_name = bucket.pop("_feature_values", {})
+    labeled_values_by_name = bucket.pop("_labeled_feature_values", {})
+    checkpoint_values_by_name = bucket.pop("_checkpoint_feature_values", {})
+    outcome_values_by_name = bucket.pop("_outcome_feature_values", {})
     zero_variance: list[str] = []
+    variance_failed_features: list[str] = []
+    feature_statistics: dict[str, object] = {}
     if isinstance(values_by_name, dict):
         for name, values in values_by_name.items():
-            if isinstance(values, list) and len(values) > 1 and len(set(values)) <= 1:
-                zero_variance.append(str(name))
+            if not isinstance(values, list):
+                continue
+            name_text = str(name)
+            stats = _numeric_distribution(values)
+            feature_statistics[name_text] = {
+                "classification": _feature_classification(name_text),
+                "all_rows": stats,
+                "labeled_rows": _numeric_distribution(
+                    labeled_values_by_name.get(name_text, [])
+                    if isinstance(labeled_values_by_name, dict)
+                    else []
+                ),
+                "variance_gate": name_text in REQUIRED_SIGNAL_FEATURES,
+                "placeholder_non_signal": name_text in PLACEHOLDER_NON_SIGNAL_FEATURES,
+                "current_threshold": "unique_values > 1",
+            }
+            if len(values) > 1 and len(set(values)) <= 1:
+                zero_variance.append(name_text)
+                if name_text in REQUIRED_SIGNAL_FEATURES:
+                    variance_failed_features.append(name_text)
     bucket["zero_variance_features"] = sorted(zero_variance)
-    state = "TRAINING_READY"
+    bucket["variance_failed_features"] = sorted(variance_failed_features)
+    bucket["feature_statistics"] = feature_statistics
+    bucket["feature_classifications"] = {
+        name: _feature_classification(name)
+        for name in sorted(set(feature_statistics) | PLACEHOLDER_NON_SIGNAL_FEATURES)
+    }
+    bucket["checkpoint_feature_statistics"] = _nested_distribution(checkpoint_values_by_name)
+    bucket["outcome_feature_statistics"] = _nested_distribution(outcome_values_by_name)
+    bucket["failing_features"] = [
+        _failing_feature_detail(name, feature_statistics.get(name, {}))
+        for name in sorted(variance_failed_features)
+    ]
+    failed_gates: list[str] = []
     if _int_field(bucket, "official_label_conflict_count") > 0 or _int_field(
         bucket, "future_timestamp_violations"
     ) > 0:
-        state = "DATA_INTEGRITY_BLOCKED"
-    elif len(bucket["feature_schema_counts"]) > 1:
-        state = "SCHEMA_INCOMPATIBLE"
-    elif _int_field(bucket, "non_finite_feature_count") > 0:
-        state = "FEATURE_COMPLETENESS_FAILED"
-    elif zero_variance and labeled >= 2:
-        state = "FEATURE_VARIANCE_FAILED"
-    elif labeled <= 0:
-        state = "COLLECTING"
-    elif eligible_total and labeled / eligible_total < 0.8:
-        state = "LABEL_COVERAGE_INSUFFICIENT"
-    elif labeled < 100:
-        state = "INSUFFICIENT_UNIQUE_CONDITIONS"
-    elif _int_field(bucket, "up_labeled_conditions") < 20 or _int_field(
-        bucket, "down_labeled_conditions"
-    ) < 20:
-        state = "SEVERE_CLASS_IMBALANCE"
-    else:
-        target_counts = bucket["checkpoint_target_counts"]
-        if not isinstance(target_counts, dict) or any(
-            int(target_counts.get(str(target), 0)) <= 0 for target in (120, 90, 60, 45)
-        ):
-            state = "CHECKPOINT_COVERAGE_INSUFFICIENT"
+        failed_gates.append("DATA_INTEGRITY_BLOCKED")
+    if len(bucket["feature_schema_counts"]) > 1:
+        failed_gates.append("SCHEMA_INCOMPATIBLE")
+    if _int_field(bucket, "non_finite_feature_count") > 0:
+        failed_gates.append("FEATURE_COMPLETENESS_FAILED")
+    if labeled <= 0:
+        failed_gates.append("COLLECTING")
+    if 0 < labeled < MINIMUM_LABELED_UNIQUE_CONDITIONS:
+        failed_gates.append("INSUFFICIENT_UNIQUE_CONDITIONS")
+    if labeled > 0 and (
+        _int_field(bucket, "up_labeled_conditions") < MINIMUM_CLASS_COUNT_PER_SIDE
+        or _int_field(bucket, "down_labeled_conditions") < MINIMUM_CLASS_COUNT_PER_SIDE
+    ):
+        failed_gates.append("SEVERE_CLASS_IMBALANCE")
+    if eligible_total and labeled / eligible_total < MINIMUM_ELIGIBLE_LABEL_COVERAGE:
+        failed_gates.append("LABEL_COVERAGE_INSUFFICIENT")
+    target_counts = bucket["checkpoint_target_counts"]
+    if not isinstance(target_counts, dict) or any(
+        int(target_counts.get(str(target), 0)) <= 0 for target in CHECKPOINT_TARGETS_SECONDS
+    ):
+        failed_gates.append("CHECKPOINT_COVERAGE_INSUFFICIENT")
+    if variance_failed_features and labeled >= 2:
+        failed_gates.append("FEATURE_VARIANCE_FAILED")
+    state = "TRAINING_READY"
+    for candidate in (
+        "DATA_INTEGRITY_BLOCKED",
+        "SCHEMA_INCOMPATIBLE",
+        "FEATURE_COMPLETENESS_FAILED",
+        "COLLECTING",
+        "INSUFFICIENT_UNIQUE_CONDITIONS",
+        "SEVERE_CLASS_IMBALANCE",
+        "LABEL_COVERAGE_INSUFFICIENT",
+        "CHECKPOINT_COVERAGE_INSUFFICIENT",
+        "FEATURE_VARIANCE_FAILED",
+    ):
+        if candidate in failed_gates:
+            state = candidate
+            break
+    bucket["all_failed_gates"] = failed_gates
+    bucket["primary_reason"] = state
     bucket["readiness_state"] = state
+
+
+def _feature_classification(name: str) -> str:
+    if name in PLACEHOLDER_NON_SIGNAL_FEATURES:
+        return "PLACEHOLDER_NON_SIGNAL"
+    if name in DERIVED_DIAGNOSTIC_FEATURES:
+        return "DERIVED_DIAGNOSTIC"
+    if name in REQUIRED_SIGNAL_FEATURES:
+        return "REQUIRED_SIGNAL_FEATURE"
+    return "UNKNOWN"
+
+
+def _numeric_distribution(values: object) -> dict[str, object]:
+    numeric_values = [
+        float(value)
+        for value in values
+        if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value)
+    ] if isinstance(values, list) else []
+    count = len(numeric_values)
+    if count == 0:
+        return {
+            "n": 0,
+            "non_null_n": 0,
+            "unique": 0,
+            "mean": None,
+            "stddev": None,
+            "min": None,
+            "p10": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "p90": None,
+            "max": None,
+            "zero_count": 0,
+            "non_zero_count": 0,
+        }
+    sorted_values = sorted(numeric_values)
+    mean = sum(sorted_values) / count
+    variance = sum((value - mean) ** 2 for value in sorted_values) / count
+    zero_count = sum(1 for value in sorted_values if value == 0.0)
+    return {
+        "n": count,
+        "non_null_n": count,
+        "unique": len(set(sorted_values)),
+        "mean": _finite_float(mean),
+        "stddev": _finite_float(math.sqrt(variance)),
+        "min": _finite_float(sorted_values[0]),
+        "p10": _finite_float(_percentile(sorted_values, 0.10)),
+        "p25": _finite_float(_percentile(sorted_values, 0.25)),
+        "median": _finite_float(_percentile(sorted_values, 0.50)),
+        "p75": _finite_float(_percentile(sorted_values, 0.75)),
+        "p90": _finite_float(_percentile(sorted_values, 0.90)),
+        "max": _finite_float(sorted_values[-1]),
+        "zero_count": zero_count,
+        "non_zero_count": count - zero_count,
+    }
+
+
+def _percentile(sorted_values: list[float], quantile: float) -> float:
+    if not sorted_values:
+        return math.nan
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[int(position)]
+    fraction = position - lower
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction
+
+
+def _finite_float(value: float) -> float | None:
+    return value if math.isfinite(value) else None
+
+
+def _nested_distribution(values_by_group: object) -> dict[str, dict[str, object]]:
+    if not isinstance(values_by_group, dict):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for group, values_by_name in values_by_group.items():
+        if not isinstance(values_by_name, dict):
+            continue
+        result[str(group)] = {
+            str(name): _numeric_distribution(values)
+            for name, values in values_by_name.items()
+        }
+    return result
+
+
+def _failing_feature_detail(name: str, stats_obj: object) -> dict[str, object]:
+    stats = stats_obj if isinstance(stats_obj, dict) else {}
+    rows_obj = stats.get("all_rows")
+    all_rows = rows_obj if isinstance(rows_obj, dict) else {}
+    return {
+        "name": name,
+        "classification": _feature_classification(name),
+        "n": all_rows.get("n"),
+        "unique": all_rows.get("unique"),
+        "stddev": all_rows.get("stddev"),
+        "threshold": "unique_values > 1",
+        "gate_status": "FAIL",
+    }
 
 
 def _is_training_ready_payload(payload: Mapping[str, object]) -> bool:

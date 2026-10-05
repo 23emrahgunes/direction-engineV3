@@ -26,7 +26,11 @@ from direction_engine_v3.observability import (
     ReadinessReport,
 )
 from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteShadowRepository
-from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
+from direction_engine_v3.storage import SQLitePaperRepository
+from direction_engine_v3.storage.directional_corpus import (
+    READINESS_POLICY_VERSION,
+    SQLiteDirectionalCorpusRepository,
+)
 
 PAPER_LIST_DEFAULT_LIMIT = 25
 PAPER_LIST_MAX_LIMIT = 100
@@ -228,7 +232,7 @@ def build_directional_corpus_readiness() -> dict[str, object]:
     if not corpus_path.exists():
         corpus_report: dict[str, object] = {
             "status": "DIRECTIONAL_CORPUS_READINESS_NOT_INITIALIZED",
-            "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+            "policy_version": READINESS_POLICY_VERSION,
             "real_order_submission": False,
             "buckets": [],
             "training_ready_buckets": [],
@@ -242,7 +246,7 @@ def build_directional_corpus_readiness() -> dict[str, object]:
         except sqlite3.OperationalError as exc:
             corpus_report = {
                 "status": "DIRECTIONAL_CORPUS_READINESS_SCHEMA_UNAVAILABLE",
-                "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+                "policy_version": READINESS_POLICY_VERSION,
                 "reason": type(exc).__name__,
                 "message": str(exc),
                 "real_order_submission": False,
@@ -253,7 +257,7 @@ def build_directional_corpus_readiness() -> dict[str, object]:
         except Exception as exc:
             corpus_report = {
                 "status": "DIRECTIONAL_CORPUS_READINESS_UNAVAILABLE",
-                "policy_version": "DIRECTIONAL_CORPUS_READINESS_V1",
+                "policy_version": READINESS_POLICY_VERSION,
                 "reason": type(exc).__name__,
                 "real_order_submission": False,
                 "buckets": [],
