@@ -18,6 +18,9 @@ MINIMUM_CLASS_COUNT_PER_SIDE = 20
 MINIMUM_ELIGIBLE_LABEL_COVERAGE = 0.80
 CHECKPOINT_TARGETS_SECONDS = (120, 90, 60, 45)
 CHECKPOINT_TOLERANCE_SECONDS = 10
+SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION = "SOL5M_PROSPECTIVE_EVIDENCE_V1"
+SOL5M_PROSPECTIVE_MINIMUM_LABELED_CONDITIONS = 100
+SOL5M_PROSPECTIVE_MINIMUM_PRICING_COVERAGE = 0.80
 
 PLACEHOLDER_NON_SIGNAL_FEATURES = frozenset({"spot_perp_basis"})
 REQUIRED_SIGNAL_FEATURES = frozenset(
@@ -103,11 +106,24 @@ class DirectionalUnlabeledCheckpointCondition:
     unlabeled_row_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class Sol5mProspectiveEvidenceRecord:
+    evidence_id: str
+    condition_id: str
+    observed_at: datetime
+    payload: Mapping[str, object]
+    outcome_attached: bool
+
+
 class SQLiteDirectionalCorpusRepository:
     """Stores what was known before settlement, then immutable outcome evidence."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def initialize(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +206,55 @@ class SQLiteDirectionalCorpusRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_directional_checkpoint_unlabeled_condition
                 ON directional_checkpoint_observations(condition_id, asset, horizon, observed_at)
+                WHERE outcome_json IS NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sol5m_prospective_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    horizon TEXT NOT NULL,
+                    checkpoint_target_tte_seconds INTEGER NOT NULL,
+                    evidence_schema_version TEXT NOT NULL,
+                    feature_schema_version TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    model_artifact_checksum TEXT,
+                    observed_at TEXT NOT NULL,
+                    actual_tte_seconds INTEGER,
+                    predicted_side TEXT,
+                    raw_model_probability REAL,
+                    calibrated_probability REAL,
+                    selected_probability REAL,
+                    selected_side_executable_cost REAL,
+                    up_executable_cost REAL,
+                    down_executable_cost REAL,
+                    pricing_status TEXT NOT NULL,
+                    timing_status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    outcome_json TEXT,
+                    outcome_attached_at TEXT,
+                    UNIQUE(
+                        condition_id,
+                        checkpoint_target_tte_seconds,
+                        model_id,
+                        evidence_schema_version
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sol5m_prospective_observed
+                ON sol5m_prospective_evidence(observed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sol5m_prospective_unlabeled
+                ON sol5m_prospective_evidence(condition_id, observed_at)
                 WHERE outcome_json IS NULL
                 """
             )
@@ -380,7 +445,324 @@ class SQLiteDirectionalCorpusRepository:
                     (encoded, attached_at.isoformat(), str(checkpoint_id)),
                 )
                 updated += 1
+            prospective_rows = connection.execute(
+                """
+                SELECT evidence_id,observed_at,outcome_json
+                FROM sol5m_prospective_evidence
+                WHERE condition_id=?
+                """,
+                (condition_id,),
+            ).fetchall()
+            for evidence_id, observed_at_raw, existing in prospective_rows:
+                observed_at = datetime.fromisoformat(str(observed_at_raw))
+                if observed_at >= official_resolved_at:
+                    continue
+                if existing is not None:
+                    if str(existing) != encoded:
+                        raise RuntimeError(
+                            "conflicting official outcome for prospective evidence"
+                        )
+                    continue
+                connection.execute(
+                    """
+                    UPDATE sol5m_prospective_evidence
+                    SET outcome_json=?, outcome_attached_at=?
+                    WHERE evidence_id=?
+                    """,
+                    (encoded, attached_at.isoformat(), str(evidence_id)),
+                )
+                updated += 1
         return updated
+
+    def save_sol5m_prospective_evidence(
+        self,
+        *,
+        evidence_id: str,
+        condition_id: str,
+        market_id: str,
+        checkpoint_target_tte_seconds: int,
+        evidence_schema_version: str,
+        feature_schema_version: str,
+        model_id: str,
+        model_artifact_checksum: str | None,
+        observed_at: datetime,
+        actual_tte_seconds: int | None,
+        predicted_side: str | None,
+        raw_model_probability: float | None,
+        calibrated_probability: float | None,
+        selected_probability: float | None,
+        selected_side_executable_cost: float | None,
+        up_executable_cost: float | None,
+        down_executable_cost: float | None,
+        pricing_status: str,
+        timing_status: str,
+        payload: Mapping[str, object],
+    ) -> Sol5mProspectiveEvidenceRecord:
+        require_text("evidence_id", evidence_id)
+        require_text("condition_id", condition_id)
+        require_text("market_id", market_id)
+        require_text("evidence_schema_version", evidence_schema_version)
+        require_text("feature_schema_version", feature_schema_version)
+        require_text("model_id", model_id)
+        require_text("pricing_status", pricing_status)
+        require_text("timing_status", timing_status)
+        require_utc("observed_at", observed_at)
+        if checkpoint_target_tte_seconds != 45:
+            raise ValueError("SOL-5m prospective evidence captures only the 45s checkpoint")
+        encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO sol5m_prospective_evidence
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
+                """,
+                (
+                    evidence_id,
+                    condition_id,
+                    market_id,
+                    Asset.SOL.value,
+                    Horizon.FIVE_MINUTES.value,
+                    checkpoint_target_tte_seconds,
+                    evidence_schema_version,
+                    feature_schema_version,
+                    model_id,
+                    model_artifact_checksum,
+                    observed_at.isoformat(),
+                    actual_tte_seconds,
+                    predicted_side,
+                    raw_model_probability,
+                    calibrated_probability,
+                    selected_probability,
+                    selected_side_executable_cost,
+                    up_executable_cost,
+                    down_executable_cost,
+                    pricing_status,
+                    timing_status,
+                    encoded,
+                ),
+            )
+        stored = self.get_sol5m_prospective_evidence(evidence_id)
+        if stored is None:
+            stored = self.get_sol5m_prospective_evidence_by_key(
+                condition_id=condition_id,
+                checkpoint_target_tte_seconds=checkpoint_target_tte_seconds,
+                model_id=model_id,
+                evidence_schema_version=evidence_schema_version,
+            )
+        if stored is None:
+            raise RuntimeError("SOL-5m prospective evidence was not persisted")
+        return stored
+
+    def get_sol5m_prospective_evidence(
+        self, evidence_id: str
+    ) -> Sol5mProspectiveEvidenceRecord | None:
+        require_text("evidence_id", evidence_id)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                """
+                SELECT condition_id,observed_at,payload_json,outcome_json
+                FROM sol5m_prospective_evidence WHERE evidence_id=?
+                """,
+                (evidence_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Sol5mProspectiveEvidenceRecord(
+            evidence_id=evidence_id,
+            condition_id=str(row[0]),
+            observed_at=datetime.fromisoformat(str(row[1])),
+            payload=json.loads(str(row[2])),
+            outcome_attached=row[3] is not None,
+        )
+
+    def get_sol5m_prospective_evidence_by_key(
+        self,
+        *,
+        condition_id: str,
+        checkpoint_target_tte_seconds: int,
+        model_id: str,
+        evidence_schema_version: str,
+    ) -> Sol5mProspectiveEvidenceRecord | None:
+        require_text("condition_id", condition_id)
+        require_text("model_id", model_id)
+        require_text("evidence_schema_version", evidence_schema_version)
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                """
+                SELECT evidence_id,condition_id,observed_at,payload_json,outcome_json
+                FROM sol5m_prospective_evidence
+                WHERE condition_id=? AND checkpoint_target_tte_seconds=?
+                  AND model_id=? AND evidence_schema_version=?
+                """,
+                (
+                    condition_id,
+                    checkpoint_target_tte_seconds,
+                    model_id,
+                    evidence_schema_version,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return Sol5mProspectiveEvidenceRecord(
+            evidence_id=str(row[0]),
+            condition_id=str(row[1]),
+            observed_at=datetime.fromisoformat(str(row[2])),
+            payload=json.loads(str(row[3])),
+            outcome_attached=row[4] is not None,
+        )
+
+    def sol5m_prospective_evidence_summary(self) -> dict[str, object]:
+        with sqlite3.connect(self._path) as connection:
+            try:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*),
+                           COUNT(DISTINCT condition_id),
+                           SUM(CASE WHEN outcome_json IS NOT NULL THEN 1 ELSE 0 END),
+                           COUNT(DISTINCT CASE WHEN outcome_json IS NOT NULL THEN condition_id END),
+                           SUM(
+                               CASE WHEN selected_side_executable_cost IS NOT NULL
+                               THEN 1 ELSE 0 END
+                           ),
+                           MIN(observed_at),
+                           MAX(observed_at)
+                    FROM sol5m_prospective_evidence
+                    """
+                ).fetchone()
+                label_rows = connection.execute(
+                    """
+                    SELECT outcome_json,COUNT(DISTINCT condition_id)
+                    FROM sol5m_prospective_evidence
+                    WHERE outcome_json IS NOT NULL
+                    GROUP BY outcome_json
+                    """
+                ).fetchall()
+                status_rows = connection.execute(
+                    """
+                    SELECT pricing_status,COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    GROUP BY pricing_status
+                    ORDER BY pricing_status
+                    """
+                ).fetchall()
+                blocker_rows = connection.execute(
+                    """
+                    SELECT timing_status,COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    GROUP BY timing_status
+                    ORDER BY timing_status
+                    """
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {
+                    "status": "SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_UNAVAILABLE",
+                    "schema_version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+                    "real_order_submission": False,
+                    "marker": "SOL5M_PROSPECTIVE_EVIDENCE_BLOCKED",
+                    "reason": "TABLE_UNAVAILABLE",
+                }
+        total_rows = int((row or (0,))[0] or 0)
+        unique_conditions = int((row or (0, 0))[1] or 0)
+        labeled_rows = int((row or (0, 0, 0))[2] or 0)
+        labeled_unique = int((row or (0, 0, 0, 0))[3] or 0)
+        priced_rows = int((row or (0, 0, 0, 0, 0))[4] or 0)
+        pricing_coverage = priced_rows / total_rows if total_rows else 0.0
+        label_counts = {"UP": 0, "DOWN": 0}
+        for outcome_raw, count in label_rows:
+            label = _label_from_outcome(_safe_json_object(str(outcome_raw or "{}")))
+            if label in label_counts:
+                label_counts[label] += int(count or 0)
+        marker = (
+            "SOL5M_PROSPECTIVE_EVIDENCE_CAPTURE_ACCEPTED"
+            if total_rows > 0
+            else "SOL5M_PROSPECTIVE_EVIDENCE_COLLECTING"
+        )
+        if labeled_unique < SOL5M_PROSPECTIVE_MINIMUM_LABELED_CONDITIONS:
+            evaluation_state = "COLLECTING"
+        elif pricing_coverage < SOL5M_PROSPECTIVE_MINIMUM_PRICING_COVERAGE:
+            evaluation_state = "INSUFFICIENT_PRICING_COVERAGE"
+        else:
+            evaluation_state = "READY_FOR_PROSPECTIVE_EVALUATION"
+        return {
+            "status": "SOL5M_PROSPECTIVE_EVIDENCE_READY",
+            "schema_version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+            "asset": Asset.SOL.value,
+            "horizon": Horizon.FIVE_MINUTES.value,
+            "checkpoint_target_tte_seconds": 45,
+            "minimum_labeled_unique_conditions": (
+                SOL5M_PROSPECTIVE_MINIMUM_LABELED_CONDITIONS
+            ),
+            "minimum_pricing_coverage": str(SOL5M_PROSPECTIVE_MINIMUM_PRICING_COVERAGE),
+            "total_rows": total_rows,
+            "unique_conditions": unique_conditions,
+            "labeled_rows": labeled_rows,
+            "labeled_unique_conditions": labeled_unique,
+            "up_labeled_conditions": label_counts["UP"],
+            "down_labeled_conditions": label_counts["DOWN"],
+            "priced_rows": priced_rows,
+            "pricing_coverage": str(pricing_coverage),
+            "first_observed_at": None if row is None else row[5],
+            "latest_observed_at": None if row is None else row[6],
+            "pricing_status_counts": {
+                str(status): int(count or 0) for status, count in status_rows
+            },
+            "timing_status_counts": {
+                str(status): int(count or 0) for status, count in blocker_rows
+            },
+            "evaluation_state": evaluation_state,
+            "marker": marker,
+            "real_order_submission": False,
+        }
+
+    def recent_sol5m_prospective_evidence(
+        self, *, limit: int = 20
+    ) -> tuple[dict[str, object], ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        bounded_limit = min(limit, 100)
+        with sqlite3.connect(self._path) as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT evidence_id,condition_id,market_id,observed_at,
+                           predicted_side,calibrated_probability,
+                           selected_side_executable_cost,pricing_status,
+                           timing_status,outcome_json,outcome_attached_at,
+                           payload_json
+                    FROM sol5m_prospective_evidence
+                    ORDER BY observed_at DESC, condition_id ASC
+                    LIMIT ?
+                    """,
+                    (bounded_limit,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return ()
+        samples: list[dict[str, object]] = []
+        for row in rows:
+            outcome = (
+                None
+                if row[9] is None
+                else _label_from_outcome(_safe_json_object(str(row[9])))
+            )
+            payload = _safe_json_object(str(row[11] or "{}"))
+            samples.append(
+                {
+                    "evidence_id": str(row[0]),
+                    "condition_id": str(row[1]),
+                    "market_id": str(row[2]),
+                    "observed_at": str(row[3]),
+                    "predicted_side": row[4],
+                    "calibrated_probability": row[5],
+                    "selected_side_executable_cost": row[6],
+                    "pricing_status": str(row[7]),
+                    "timing_status": str(row[8]),
+                    "official_outcome": outcome,
+                    "outcome_attached_at": row[10],
+                    "model_id": payload.get("model_id"),
+                    "artifact_checksum": payload.get("artifact_checksum"),
+                }
+            )
+        return tuple(samples)
 
     def get_checkpoint(self, checkpoint_id: str) -> DirectionalCheckpointRecord | None:
         require_text("checkpoint_id", checkpoint_id)
@@ -1042,11 +1424,6 @@ class SQLiteDirectionalCorpusRepository:
             payload=json.loads(str(row[4])),
             outcome_attached=row[5] is not None,
         )
-
-    @property
-    def path(self) -> Path:
-        return self._path
-
 
 def _jsonable(value: object) -> object:
     from decimal import Decimal

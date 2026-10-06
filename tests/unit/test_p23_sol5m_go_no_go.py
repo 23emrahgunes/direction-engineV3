@@ -3,11 +3,21 @@ from datetime import UTC, datetime, timedelta
 from direction_engine_v3.domain import Asset, Horizon
 from direction_engine_v3.evaluation.sol5m_go_no_go import (
     FEATURE_NAMES,
+    P2_3_SOL5M_ACCEPTED_CODE_SHA,
+    P2_3_SOL5M_PROSPECTIVE_CUTOFF,
+    P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT,
     load_sol5m_dataset,
+    materialize_sol5m_frozen_challenger,
     render_markdown_report,
     run_sol5m_go_no_go,
 )
+from direction_engine_v3.evaluation.sol5m_prospective import (
+    run_sol5m_prospective_evaluation,
+)
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository
+from direction_engine_v3.storage.directional_corpus import (
+    SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+)
 
 NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 
@@ -131,6 +141,131 @@ def test_p23_uncertainty_reports_insufficient_pricing_without_fabrication(tmp_pa
     assert result.uncertainty.after_cost_ev_p50 is None
     assert result.final_challenger is not None
     assert result.final_challenger.after_cost_ev is None
+
+
+def test_p23_frozen_challenger_fails_closed_on_fingerprint_mismatch(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    for index in range(120):
+        _write_condition(corpus, index=index, asset=Asset.SOL, horizon=Horizon.FIVE_MINUTES)
+
+    challenger = materialize_sol5m_frozen_challenger(
+        tmp_path / "corpus.sqlite3",
+        code_sha=P2_3_SOL5M_ACCEPTED_CODE_SHA,
+        cutoff_observed_at=NOW + timedelta(days=1),
+    )
+
+    assert challenger.ready is False
+    assert challenger.reason == "P2_3_DATASET_FINGERPRINT_MISMATCH"
+    assert challenger.spec["expected_p2_3_dataset_fingerprint"] == (
+        P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT
+    )
+    assert challenger.spec["execution_permission"] == "NONE"
+
+
+def test_sol5m_prospective_evidence_is_future_only_idempotent_and_labeled(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    observed_at = P2_3_SOL5M_PROSPECTIVE_CUTOFF + timedelta(minutes=5)
+    corpus.save_sol5m_prospective_evidence(
+        evidence_id="evidence-1",
+        condition_id="sol5m-future-1",
+        market_id="market-sol5m-future-1",
+        checkpoint_target_tte_seconds=45,
+        evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+        feature_schema_version="v3.15.3-directional-official-ptb",
+        model_id="P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY",
+        model_artifact_checksum="checksum",
+        observed_at=observed_at,
+        actual_tte_seconds=45,
+        predicted_side="UP",
+        raw_model_probability=0.52,
+        calibrated_probability=0.54,
+        selected_probability=0.54,
+        selected_side_executable_cost=0.42,
+        up_executable_cost=0.42,
+        down_executable_cost=0.61,
+        pricing_status="CHECKPOINT_EXECUTABLE_PRICING_READY",
+        timing_status="CHECKPOINT_45S_WITHIN_TOLERANCE",
+        payload={"model_id": "P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY"},
+    )
+    corpus.save_sol5m_prospective_evidence(
+        evidence_id="evidence-duplicate",
+        condition_id="sol5m-future-1",
+        market_id="market-sol5m-future-1",
+        checkpoint_target_tte_seconds=45,
+        evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+        feature_schema_version="v3.15.3-directional-official-ptb",
+        model_id="P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY",
+        model_artifact_checksum="checksum",
+        observed_at=observed_at,
+        actual_tte_seconds=45,
+        predicted_side="UP",
+        raw_model_probability=0.52,
+        calibrated_probability=0.54,
+        selected_probability=0.54,
+        selected_side_executable_cost=0.42,
+        up_executable_cost=0.42,
+        down_executable_cost=0.61,
+        pricing_status="CHECKPOINT_EXECUTABLE_PRICING_READY",
+        timing_status="CHECKPOINT_45S_WITHIN_TOLERANCE",
+        payload={"model_id": "P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY"},
+    )
+    attached = corpus.attach_verified_outcome_to_condition_once(
+        condition_id="sol5m-future-1",
+        outcome={
+            "settlement_source_kind": "OFFICIAL",
+            "settlement_source": "POLYMARKET_OFFICIAL_METADATA",
+            "outcome_up": True,
+            "winning_side": "UP",
+            "official_resolved_at": (observed_at + timedelta(minutes=5)).isoformat(),
+            "evidence_hash": "proof",
+        },
+        official_resolved_at=observed_at + timedelta(minutes=5),
+        attached_at=observed_at + timedelta(minutes=6),
+    )
+
+    summary = corpus.sol5m_prospective_evidence_summary()
+    samples = corpus.recent_sol5m_prospective_evidence(limit=5)
+    assert attached == 1
+    assert summary["total_rows"] == 1
+    assert summary["labeled_unique_conditions"] == 1
+    assert summary["pricing_coverage"] == "1.0"
+    assert samples[0]["official_outcome"] == "UP"
+
+
+def test_sol5m_prospective_evaluator_collects_without_fabricating_go_no_go(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    observed_at = P2_3_SOL5M_PROSPECTIVE_CUTOFF + timedelta(minutes=5)
+    corpus.save_sol5m_prospective_evidence(
+        evidence_id="evidence-1",
+        condition_id="sol5m-future-1",
+        market_id="market-sol5m-future-1",
+        checkpoint_target_tte_seconds=45,
+        evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+        feature_schema_version="v3.15.3-directional-official-ptb",
+        model_id="P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY",
+        model_artifact_checksum="checksum",
+        observed_at=observed_at,
+        actual_tte_seconds=45,
+        predicted_side="UP",
+        raw_model_probability=0.52,
+        calibrated_probability=0.54,
+        selected_probability=0.54,
+        selected_side_executable_cost=None,
+        up_executable_cost=None,
+        down_executable_cost=None,
+        pricing_status="SELECTED_SIDE_PRICING_MISSING",
+        timing_status="CHECKPOINT_45S_WITHIN_TOLERANCE",
+        payload={"model_id": "P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY"},
+    )
+
+    result = run_sol5m_prospective_evaluation(tmp_path / "corpus.sqlite3")
+
+    assert result.marker == "SOL5M_PROSPECTIVE_EVIDENCE_COLLECTING"
+    assert result.brier is None
+    assert "COLLECTING_MINIMUM_LABELED_CONDITIONS" in result.failed_gates
 
 
 def test_p23_rejects_leakage_before_training(tmp_path) -> None:

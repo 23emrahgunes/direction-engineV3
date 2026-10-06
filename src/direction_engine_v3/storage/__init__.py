@@ -5,6 +5,7 @@ from direction_engine_v3.storage.directional_corpus import (
     DirectionalCheckpointRecord,
     DirectionalCorpusRecord,
     DirectionalTrainingRecord,
+    Sol5mProspectiveEvidenceRecord,
     SQLiteDirectionalCorpusRepository,
 )
 from direction_engine_v3.storage.paper import (
@@ -29,5 +30,6 @@ __all__ = [
     "PaperTradeSnapshot",
     "SQLiteDirectionalCorpusRepository",
     "SQLitePaperRepository",
+    "Sol5mProspectiveEvidenceRecord",
     "StoredExecution",
 ]

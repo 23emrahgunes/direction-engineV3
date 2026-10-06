@@ -24,6 +24,7 @@ from direction_engine_v3.app.dashboard import (
     build_paper_reconciliation,
     build_paper_summary,
     build_shadow_status,
+    build_sol5m_prospective_evidence,
     get_paper_trade,
     list_paper_abstains,
     list_paper_trades,
@@ -261,6 +262,14 @@ async def feature_integrity(request: web.Request) -> web.Response:
     return await _json_from_builder(request, build_feature_integrity_report)
 
 
+async def sol5m_prospective_evidence(request: web.Request) -> web.Response:
+    return await _json_from_builder(
+        request,
+        build_sol5m_prospective_evidence,
+        limit=request.query.get("limit"),
+    )
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.cleanup_ctx.append(dashboard_api_executor)
@@ -296,6 +305,11 @@ def create_app() -> web.Application:
     )
     app.router.add_get("/api/model/governance", model_governance, allow_head=False)
     app.router.add_get("/api/feature/integrity", feature_integrity, allow_head=False)
+    app.router.add_get(
+        "/api/directional/sol5m/prospective-evidence",
+        sol5m_prospective_evidence,
+        allow_head=False,
+    )
     return app
 
 

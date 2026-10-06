@@ -13,7 +13,7 @@ import json
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,15 @@ MINIMUM_ECONOMIC_COVERAGE = 0.30
 MAXIMUM_ACCEPTABLE_ECE = 0.08
 NEAR_ZERO = 1e-12
 BOOTSTRAP_RESAMPLES = 500
+P2_3_SOL5M_PROSPECTIVE_CUTOFF = datetime.fromisoformat(
+    "2026-10-06T02:43:07.465344+00:00"
+)
+P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT = (
+    "7759be2532b26d03f30c911bcba5928fab4521cd881528399e1613767f1e277f"
+)
+P2_3_SOL5M_ACCEPTED_CODE_SHA = "b36a50d402ff5b384272607fb7b8352ffca3207a"
+P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT = 45
+P2_3_SOL5M_RESEARCH_NOTIONAL_USDC = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,10 +274,72 @@ class P23Result:
         }
 
 
-def load_sol5m_dataset(db_path: Path, *, code_sha: str) -> P23Dataset:
+@dataclass(frozen=True, slots=True)
+class P23FrozenChallenger:
+    status: str
+    reason: str
+    model_id: str
+    artifact_checksum: str | None
+    cutoff_observed_at: datetime
+    dataset_fingerprint: str | None
+    checkpoint: int | None
+    selected_regularization: str | None
+    l2_penalty: float | None
+    feature_names: tuple[str, ...]
+    model: _LogisticModel | None
+    calibrator: _PlattCalibrator | None
+    spec: dict[str, object]
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "READY" and self.model is not None
+
+    def predict(self, features: tuple[float, ...]) -> dict[str, object]:
+        if not self.ready or self.model is None:
+            return {
+                "status": "FROZEN_CHALLENGER_UNAVAILABLE",
+                "reason": self.reason,
+                "model_id": self.model_id,
+            }
+        if len(features) != len(self.feature_names):
+            return {
+                "status": "FEATURE_ORDER_MISMATCH",
+                "reason": "FEATURE_COUNT_MISMATCH",
+                "model_id": self.model_id,
+            }
+        raw_probability = self.model.probability(features)
+        raw_score = self.model.score(features)
+        calibrated_probability = (
+            self.calibrator.calibrate_score(raw_score)
+            if self.calibrator is not None
+            else raw_probability
+        )
+        predicted_side = "UP" if calibrated_probability >= 0.5 else "DOWN"
+        return {
+            "status": "READY",
+            "reason": "FROZEN_P2_3_CHALLENGER_READY",
+            "model_id": self.model_id,
+            "artifact_checksum": self.artifact_checksum,
+            "raw_model_probability": raw_probability,
+            "calibrated_probability": calibrated_probability,
+            "predicted_side": predicted_side,
+            "selected_probability": calibrated_probability
+            if predicted_side == "UP"
+            else 1.0 - calibrated_probability,
+        }
+
+
+def load_sol5m_dataset(
+    db_path: Path,
+    *,
+    code_sha: str,
+    max_observed_at: datetime | None = None,
+) -> P23Dataset:
     """Load the immutable SOL-5m checkpoint dataset from SQLite in read-only mode."""
 
-    rows = _checkpoint_rows(db_path)
+    if max_observed_at is not None and max_observed_at.tzinfo is None:
+        raise ValueError("max_observed_at must be timezone-aware")
+    rows = _checkpoint_rows(db_path, max_observed_at=max_observed_at)
     excluded: dict[str, int] = {}
     leakage_violations = 0
     by_condition: dict[str, dict[str, Any]] = {}
@@ -384,6 +455,219 @@ def load_sol5m_dataset(db_path: Path, *, code_sha: str) -> P23Dataset:
         checkpoint_counts=checkpoint_counts,
         earliest=earliest,
         latest=latest,
+    )
+
+
+def materialize_sol5m_frozen_challenger(
+    db_path: Path,
+    *,
+    code_sha: str,
+    cutoff_observed_at: datetime = P2_3_SOL5M_PROSPECTIVE_CUTOFF,
+) -> P23FrozenChallenger:
+    """Build the frozen P2.3 SOL-5m research challenger from pre-cutoff data only."""
+
+    cutoff = cutoff_observed_at.astimezone(UTC)
+    dataset = load_sol5m_dataset(
+        db_path,
+        code_sha=code_sha,
+        max_observed_at=cutoff,
+    )
+    model_id = "P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY"
+    base_spec: dict[str, object] = {
+        "artifact_status": "RESEARCH_ONLY",
+        "promotion_status": "NON_PROMOTABLE",
+        "execution_permission": "NONE",
+        "governance_rejection_reason": "MODEL_NOT_PROMOTED",
+        "asset": TARGET_ASSET.value,
+        "horizon": TARGET_HORIZON.value,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "dataset_schema": DATASET_SCHEMA_VERSION,
+        "feature_names": list(FEATURE_NAMES),
+        "excluded_features": {
+            "placeholder_non_signal": list(PLACEHOLDER_EXCLUDED_FEATURES),
+            "deterministic_duplicate": list(REDUNDANT_EXCLUDED_FEATURES),
+        },
+        "cutoff_observed_at": cutoff.isoformat(),
+        "expected_p2_3_dataset_fingerprint": P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT,
+        "research_notional_usdc": str(P2_3_SOL5M_RESEARCH_NOTIONAL_USDC),
+    }
+    if dataset.unique_conditions == 0:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "NO_PRE_CUTOFF_SOL_5M_DATASET",
+            model_id,
+            None,
+            cutoff,
+            None,
+            None,
+            None,
+            None,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    if dataset.fingerprint != P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "P2_3_DATASET_FINGERPRINT_MISMATCH",
+            model_id,
+            None,
+            cutoff,
+            dataset.fingerprint,
+            None,
+            None,
+            None,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    if dataset.leakage_violations or dataset.label_conflicts:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "P2_3_DATASET_INTEGRITY_BLOCKED",
+            model_id,
+            None,
+            cutoff,
+            dataset.fingerprint,
+            None,
+            None,
+            None,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    dev, final = _chronological_holdout(dataset.conditions)
+    candidate_scores: list[tuple[float, float, int, str, float]] = []
+    for target in CHECKPOINT_TARGETS:
+        target_dev = tuple(item for item in dev if target in item.examples_by_target)
+        folds = _walk_forward_condition_folds(target_dev)
+        for regularization_name, penalty in REGULARIZATION_GRID:
+            fold_results = [
+                result
+                for index, (train, validation) in enumerate(folds, start=1)
+                if (
+                    result := _evaluate_fold(
+                        index,
+                        target,
+                        regularization_name,
+                        penalty,
+                        train,
+                        validation,
+                    )
+                )
+                is not None
+            ]
+            if fold_results:
+                average_log_loss = sum(item.challenger.log_loss for item in fold_results) / len(
+                    fold_results
+                )
+                average_brier = sum(item.challenger.brier for item in fold_results) / len(
+                    fold_results
+                )
+                candidate_scores.append(
+                    (average_log_loss, average_brier, target, regularization_name, penalty)
+                )
+    if not candidate_scores:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "DEVELOPMENT_WALK_FORWARD_INSUFFICIENT",
+            model_id,
+            None,
+            cutoff,
+            dataset.fingerprint,
+            None,
+            None,
+            None,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    candidate_scores.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    _, _, selected_target, selected_regularization_name, selected_penalty = candidate_scores[0]
+    if selected_target != P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "P2_3_SELECTED_CHECKPOINT_NOT_45S",
+            model_id,
+            None,
+            cutoff,
+            dataset.fingerprint,
+            selected_target,
+            selected_regularization_name,
+            selected_penalty,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    model, calibrator = _fit_model_with_dev_calibration(
+        dev,
+        selected_target,
+        selected_penalty,
+    )
+    if model is None:
+        return P23FrozenChallenger(
+            "UNAVAILABLE",
+            "FINAL_DEV_ONLY_MODEL_FIT_INSUFFICIENT",
+            model_id,
+            None,
+            cutoff,
+            dataset.fingerprint,
+            selected_target,
+            selected_regularization_name,
+            selected_penalty,
+            FEATURE_NAMES,
+            None,
+            None,
+            {**base_spec, "dataset_fingerprint": dataset.fingerprint},
+        )
+    spec: dict[str, object] = {
+        **base_spec,
+        "dataset_fingerprint": dataset.fingerprint,
+        "checkpoint": selected_target,
+        "selected_regularization": selected_regularization_name,
+        "l2_penalty": selected_penalty,
+        "development_unique_conditions": len(dev),
+        "held_out_p2_3_final_conditions_not_used_for_fit": len(final),
+        "selection_source": "P2_3_DEVELOPMENT_WALK_FORWARD_ONLY",
+        "future_conditions_used_for_training": False,
+        "calibration": "PLATT_LOGISTIC_DEV_ONLY",
+        "calibration_available": calibrator is not None,
+        "replay_rule": "calibrated_probability >= 0.5 selects UP else DOWN",
+    }
+    checksum_payload = {
+        **spec,
+        "model": {
+            "family": "L2_LOGISTIC_DEPENDENCY_FREE",
+            "coefficients": model.coefficients,
+            "intercept": model.intercept,
+            "scaler_means": model.scaler.means,
+            "scaler_scales": model.scaler.scales,
+            "platt_coefficient": None if calibrator is None else calibrator.coefficient,
+            "platt_intercept": None if calibrator is None else calibrator.intercept,
+        },
+    }
+    artifact_checksum = hashlib.sha256(
+        json.dumps(checksum_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return P23FrozenChallenger(
+        "READY",
+        "FROZEN_P2_3_CHALLENGER_READY",
+        model_id,
+        artifact_checksum,
+        cutoff,
+        dataset.fingerprint,
+        selected_target,
+        selected_regularization_name,
+        selected_penalty,
+        FEATURE_NAMES,
+        model,
+        calibrator,
+        {**spec, "artifact_checksum": artifact_checksum, "model_id": model_id},
     )
 
 
@@ -637,25 +921,35 @@ def render_markdown_report(result: P23Result) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _checkpoint_rows(db_path: Path) -> tuple[sqlite3.Row, ...]:
+def _checkpoint_rows(
+    db_path: Path,
+    *,
+    max_observed_at: datetime | None = None,
+) -> tuple[sqlite3.Row, ...]:
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
     uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
         connection.row_factory = sqlite3.Row
         try:
+            clauses = ["asset=?", "horizon=?", "outcome_json IS NOT NULL"]
+            params: list[object] = [TARGET_ASSET.value, TARGET_HORIZON.value]
+            if max_observed_at is not None:
+                clauses.append("observed_at<=?")
+                params.append(max_observed_at.isoformat())
+            where = " AND ".join(clauses)
             return tuple(
                 connection.execute(
-                    """
+                    f"""
                     SELECT checkpoint_id,condition_id,checkpoint_target_tte_seconds,
                            feature_schema_version,observed_at,actual_tte_seconds,
                            payload_json,outcome_json,outcome_attached_at
                     FROM directional_checkpoint_observations
-                    WHERE asset=? AND horizon=? AND outcome_json IS NOT NULL
+                    WHERE {where}
                     ORDER BY observed_at ASC, condition_id ASC,
                              checkpoint_target_tte_seconds ASC
                     """,
-                    (TARGET_ASSET.value, TARGET_HORIZON.value),
+                    tuple(params),
                 ).fetchall()
             )
         except sqlite3.OperationalError:

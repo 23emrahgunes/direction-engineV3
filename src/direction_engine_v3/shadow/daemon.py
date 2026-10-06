@@ -50,6 +50,17 @@ from direction_engine_v3.domain import (
     TradingMode,
 )
 from direction_engine_v3.domain._validation import require_utc
+from direction_engine_v3.evaluation.sol5m_go_no_go import (
+    FEATURE_NAMES as P2_3_SOL5M_FEATURE_NAMES,
+)
+from direction_engine_v3.evaluation.sol5m_go_no_go import (
+    P2_3_SOL5M_ACCEPTED_CODE_SHA,
+    P2_3_SOL5M_PROSPECTIVE_CUTOFF,
+    P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT,
+    P2_3_SOL5M_RESEARCH_NOTIONAL_USDC,
+    P23FrozenChallenger,
+    materialize_sol5m_frozen_challenger,
+)
 from direction_engine_v3.execution import (
     PaperFillEvidence,
     PaperGateway,
@@ -125,6 +136,9 @@ from direction_engine_v3.shadow.storage import (
     SQLiteShadowRepository,
 )
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository, SQLitePaperRepository
+from direction_engine_v3.storage.directional_corpus import (
+    SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+)
 from direction_engine_v3.strategies.directional import (
     DirectionalAssessment,
     DirectionalPolicy,
@@ -899,6 +913,7 @@ class ShadowDaemon:
             ),
         )
         self._registry = self._paper_model_result.registry
+        self._sol5m_frozen_challenger: P23FrozenChallenger | None = None
 
     async def run_once(self) -> ShadowCycleResult:
         cycle_started_at = self._clock.utc_now()
@@ -1408,6 +1423,12 @@ class ShadowDaemon:
             cycle_id=cycle_id,
             reason=assessment.reason,
             model_status=model_status,
+        )
+        self._save_sol5m_prospective_evidence(
+            state,
+            cycle_id=cycle_id,
+            up_pricing=up_pricing,
+            down_pricing=down_pricing,
         )
         if assessment.action is DecisionAction.ABSTAIN:
             abstains = self._record_abstain(
@@ -2140,6 +2161,142 @@ class ShadowDaemon:
                 "label": _PAPER_LABEL,
             },
         )
+
+    def _save_sol5m_prospective_evidence(
+        self,
+        state: ShadowMarketState,
+        *,
+        cycle_id: str,
+        up_pricing: DepthSimulation | None,
+        down_pricing: DepthSimulation | None,
+    ) -> None:
+        if (
+            self._directional_corpus_repository is None
+            or state.discovery is None
+            or state.directional_features is None
+            or state.bucket.asset is not Asset.SOL
+            or state.bucket.horizon is not Horizon.FIVE_MINUTES
+        ):
+            return
+        market = state.discovery.market
+        if state.observed_at <= P2_3_SOL5M_PROSPECTIVE_CUTOFF:
+            return
+        tte = market.window_end - state.observed_at
+        actual_tte_seconds = round(tte.total_seconds())
+        if (
+            abs(actual_tte_seconds - P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT)
+            > _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS
+        ):
+            return
+        challenger = self._sol5m_challenger()
+        feature_row = _p2_3_sol5m_feature_row(state.directional_features)
+        prediction = (
+            challenger.predict(feature_row)
+            if feature_row is not None
+            else {
+                "status": "FEATURE_VECTOR_UNAVAILABLE",
+                "reason": "FEATURE_VECTOR_MISSING_OR_NON_FINITE",
+                "model_id": challenger.model_id,
+            }
+        )
+        predicted_side = (
+            str(prediction["predicted_side"])
+            if prediction.get("status") == "READY" and prediction.get("predicted_side")
+            else None
+        )
+        up_cost = _pricing_cost_float(up_pricing)
+        down_cost = _pricing_cost_float(down_pricing)
+        if predicted_side == "UP":
+            selected_cost = up_cost
+        elif predicted_side == "DOWN":
+            selected_cost = down_cost
+        else:
+            selected_cost = None
+        pricing_status = _prospective_pricing_status(
+            predicted_side=predicted_side,
+            selected_cost=selected_cost,
+            up_cost=up_cost,
+            down_cost=down_cost,
+        )
+        timing_status = (
+            "CHECKPOINT_45S_WITHIN_TOLERANCE"
+            if abs(actual_tte_seconds - P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT)
+            <= _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS
+            else "CHECKPOINT_OUTSIDE_TOLERANCE"
+        )
+        self._directional_corpus_repository.save_sol5m_prospective_evidence(
+            evidence_id=(
+                f"{cycle_id}:sol5m-prospective:"
+                f"{P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT}:{market.condition_id}:"
+                f"{challenger.model_id}:{SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION}"
+            ),
+            condition_id=market.condition_id,
+            market_id=market.market_id,
+            checkpoint_target_tte_seconds=P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT,
+            evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+            feature_schema_version=state.directional_features.feature_set_version,
+            model_id=challenger.model_id,
+            model_artifact_checksum=challenger.artifact_checksum,
+            observed_at=state.observed_at,
+            actual_tte_seconds=actual_tte_seconds,
+            predicted_side=predicted_side,
+            raw_model_probability=_optional_float(prediction.get("raw_model_probability")),
+            calibrated_probability=_optional_float(prediction.get("calibrated_probability")),
+            selected_probability=_optional_float(prediction.get("selected_probability")),
+            selected_side_executable_cost=selected_cost,
+            up_executable_cost=up_cost,
+            down_executable_cost=down_cost,
+            pricing_status=pricing_status,
+            timing_status=timing_status,
+            payload={
+                "schema_version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+                "market_id": market.market_id,
+                "window_start": market.window_start,
+                "window_end": market.window_end,
+                "checkpoint_target_tte_seconds": P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT,
+                "checkpoint_tolerance_seconds": _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS,
+                "actual_tte_seconds": actual_tte_seconds,
+                "feature_vector": _feature_vector_payload(state.directional_features),
+                "price_to_beat": _price_to_beat_payload(state.price_to_beat),
+                "model_id": challenger.model_id,
+                "artifact_checksum": challenger.artifact_checksum,
+                "artifact_status": challenger.status,
+                "artifact_reason": challenger.reason,
+                "artifact_spec": challenger.spec,
+                "prediction": prediction,
+                "up_executable_cost": up_cost,
+                "down_executable_cost": down_cost,
+                "selected_side_executable_cost": selected_cost,
+                "pricing_status": pricing_status,
+                "timing_status": timing_status,
+                "research_notional_usdc": str(P2_3_SOL5M_RESEARCH_NOTIONAL_USDC),
+                "counterfactual_execution": False,
+                "paper_execution_enabled": False,
+                "real_order_submission": False,
+                "label": _PAPER_LABEL,
+            },
+        )
+
+    def _sol5m_challenger(self) -> P23FrozenChallenger:
+        if self._sol5m_frozen_challenger is None:
+            if self._directional_corpus_repository is None:
+                raise RuntimeError("SOL-5m challenger requires directional corpus repository")
+            self._sol5m_frozen_challenger = materialize_sol5m_frozen_challenger(
+                self._directional_corpus_repository.path,
+                code_sha=P2_3_SOL5M_ACCEPTED_CODE_SHA,
+                cutoff_observed_at=P2_3_SOL5M_PROSPECTIVE_CUTOFF,
+            )
+            _shadow_runtime_log(
+                "SOL5M_PROSPECTIVE_CHALLENGER_LOAD",
+                window_id=self._evidence_window.window_id,
+                status=self._sol5m_frozen_challenger.status,
+                reason=self._sol5m_frozen_challenger.reason,
+                model_id=self._sol5m_frozen_challenger.model_id,
+                artifact_checksum=self._sol5m_frozen_challenger.artifact_checksum,
+                execution_permission="NONE",
+                real_order_submission=False,
+            )
+        return self._sol5m_frozen_challenger
 
     def _evaluate_structural(self, state: ShadowMarketState, *, cycle_id: str) -> bool:
         if (
@@ -3116,6 +3273,52 @@ def _pricing_cost_payload(pricing: DepthSimulation | None) -> str | None:
     if pricing is None or pricing.all_in_cost_per_share is None:
         return None
     return str(pricing.all_in_cost_per_share)
+
+
+def _pricing_cost_float(pricing: DepthSimulation | None) -> float | None:
+    if pricing is None or pricing.all_in_cost_per_share is None:
+        return None
+    value = float(pricing.all_in_cost_per_share)
+    return value if 0 < value < 1 else None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (float, int, Decimal)):
+        return None
+    result = float(value)
+    return result if result == result and result not in (float("inf"), float("-inf")) else None
+
+
+def _p2_3_sol5m_feature_row(features: FeatureVector) -> tuple[float, ...] | None:
+    if features.feature_set_version != _DIRECTIONAL_FEATURE_SCHEMA_VERSION:
+        return None
+    values = {item.name: item.value for item in features.features}
+    row: list[float] = []
+    for name in P2_3_SOL5M_FEATURE_NAMES:
+        value = values.get(name)
+        if value is None:
+            return None
+        numeric = float(value)
+        if numeric != numeric or numeric in (float("inf"), float("-inf")):
+            return None
+        row.append(numeric)
+    return tuple(row)
+
+
+def _prospective_pricing_status(
+    *,
+    predicted_side: str | None,
+    selected_cost: float | None,
+    up_cost: float | None,
+    down_cost: float | None,
+) -> str:
+    if predicted_side is None:
+        return "PREDICTION_UNAVAILABLE"
+    if selected_cost is None:
+        return "SELECTED_SIDE_PRICING_MISSING"
+    if up_cost is None or down_cost is None:
+        return "ONE_SIDE_PRICING_MISSING"
+    return "CHECKPOINT_EXECUTABLE_PRICING_READY"
 
 
 def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object] | None:

@@ -47,6 +47,8 @@ P2_2B_LABEL_MAX_LIMIT = 100
 P2_2D_LABEL_HEALTH_DEFAULT_LIMIT = 25
 P2_2D_LABEL_HEALTH_MAX_LIMIT = 100
 P2_2D_LABEL_BACKLOG_SCAN_MAX = 5_000
+SOL5M_PROSPECTIVE_SAMPLE_DEFAULT_LIMIT = 20
+SOL5M_PROSPECTIVE_SAMPLE_MAX_LIMIT = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +427,68 @@ def build_directional_corpus_label_health(
         },
         "candidate_probe": candidate_probe,
         "conditions": details,
+    }
+
+
+def build_sol5m_prospective_evidence(
+    *, limit: str | None = None
+) -> dict[str, object]:
+    """Return bounded read-only SOL-5m prospective economic evidence."""
+
+    bounded_limit = _safe_limit(
+        limit,
+        default=SOL5M_PROSPECTIVE_SAMPLE_DEFAULT_LIMIT,
+        maximum=SOL5M_PROSPECTIVE_SAMPLE_MAX_LIMIT,
+    )
+    corpus_path = runtime_data_dir() / "directional_corpus.sqlite3"
+    if not corpus_path.exists():
+        return {
+            "status": "SOL5M_PROSPECTIVE_EVIDENCE_NOT_INITIALIZED",
+            "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "real_order_submission": False,
+            "bounded": True,
+            "limit": bounded_limit,
+            "summary": {
+                "marker": "SOL5M_PROSPECTIVE_EVIDENCE_COLLECTING",
+                "total_rows": 0,
+                "unique_conditions": 0,
+            },
+            "samples": [],
+        }
+    repository = SQLiteDirectionalCorpusRepository(corpus_path)
+    try:
+        summary = repository.sol5m_prospective_evidence_summary()
+        samples = repository.recent_sol5m_prospective_evidence(limit=bounded_limit)
+    except sqlite3.OperationalError as exc:
+        return {
+            "status": "SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_UNAVAILABLE",
+            "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+            "reason": type(exc).__name__,
+            "message": str(exc),
+            "label": "PAPER / SHADOW — NO REAL ORDER",
+            "real_order_submission": False,
+            "bounded": True,
+            "limit": bounded_limit,
+            "summary": {
+                "marker": "SOL5M_PROSPECTIVE_EVIDENCE_BLOCKED",
+                "reason": "SCHEMA_UNAVAILABLE",
+            },
+            "samples": [],
+        }
+    return {
+        "status": summary.get("status", "SOL5M_PROSPECTIVE_EVIDENCE_READY"),
+        "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "real_order_submission": False,
+        "training_started": False,
+        "model_promotion_changed": False,
+        "paper_execution_permission_changed": False,
+        "bounded": True,
+        "limit": bounded_limit,
+        "hard_max_limit": SOL5M_PROSPECTIVE_SAMPLE_MAX_LIMIT,
+        "summary": summary,
+        "samples": list(samples),
     }
 
 

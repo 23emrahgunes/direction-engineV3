@@ -51,6 +51,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/directional/corpus/labels"),
         ("GET", "/api/directional/corpus/readiness"),
         ("GET", "/api/directional/corpus/label-health"),
+        ("GET", "/api/directional/sol5m/prospective-evidence"),
         ("GET", "/api/model/governance"),
         ("GET", "/api/feature/integrity"),
     }
