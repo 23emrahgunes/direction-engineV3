@@ -50,6 +50,7 @@ def test_dashboard_app_exposes_only_get_read_only_routes() -> None:
         ("GET", "/api/directional/audit"),
         ("GET", "/api/directional/corpus/labels"),
         ("GET", "/api/directional/corpus/readiness"),
+        ("GET", "/api/directional/corpus/label-health"),
         ("GET", "/api/model/governance"),
         ("GET", "/api/feature/integrity"),
     }
@@ -489,6 +490,123 @@ async def _assert_directional_corpus_endpoints() -> None:
     assert btc["readiness_state"] == "INSUFFICIENT_UNIQUE_CONDITIONS"
 
 
+def test_directional_corpus_label_health_classifies_unique_condition_backlog(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RUNTIME_DATA_DIR", str(tmp_path))
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "directional_corpus.sqlite3")
+    corpus.initialize()
+    paper = SQLitePaperRepository(tmp_path / "paper.sqlite3")
+    paper.initialize()
+    observed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    _write_unlabeled_checkpoint_condition(
+        corpus,
+        condition_id="condition-pending-scan",
+        asset=Asset.BTC,
+        horizon=Horizon.FIVE_MINUTES,
+        observed_at=observed_at,
+        market_id="market-pending-scan",
+        window_end=observed_at - timedelta(minutes=1),
+    )
+    _write_unlabeled_checkpoint_condition(
+        corpus,
+        condition_id="condition-active",
+        asset=Asset.ETH,
+        horizon=Horizon.FIFTEEN_MINUTES,
+        observed_at=observed_at,
+        market_id="market-active",
+        window_end=datetime(2027, 1, 1, 12, 0, tzinfo=UTC),
+    )
+    _write_unlabeled_checkpoint_condition(
+        corpus,
+        condition_id="condition-identity-missing",
+        asset=Asset.SOL,
+        horizon=Horizon.ONE_HOUR,
+        observed_at=observed_at,
+        market_id=None,
+        window_end=observed_at - timedelta(minutes=1),
+    )
+    _write_unlabeled_checkpoint_condition(
+        corpus,
+        condition_id="condition-waiting-resolution",
+        asset=Asset.XRP,
+        horizon=Horizon.FIVE_MINUTES,
+        observed_at=observed_at,
+        market_id="market-waiting",
+        window_end=observed_at - timedelta(minutes=1),
+    )
+    paper.save_corpus_label_task(
+        condition_id="condition-waiting-resolution",
+        evidence_hash="waiting-hash",
+        state="PENDING",
+        attempted_at=observed_at + timedelta(minutes=2),
+        next_attempt_at=observed_at + timedelta(minutes=7),
+        reason="SETTLEMENT_PENDING:OFFICIAL_RESOLUTION_NOT_AVAILABLE",
+        payload={
+            "condition_id": "condition-waiting-resolution",
+            "market_id": "market-waiting",
+            "status": "SETTLEMENT_PENDING",
+            "real_order_submission": False,
+        },
+    )
+
+    asyncio.run(_assert_directional_corpus_label_health_endpoint())
+
+
+async def _assert_directional_corpus_label_health_endpoint() -> None:
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/api/directional/corpus/label-health?limit=500")
+        payload = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 200
+    assert payload["status"] == "DIRECTIONAL_CORPUS_LABEL_HEALTH_READY"
+    assert payload["real_order_submission"] is False
+    assert payload["training_started"] is False
+    assert payload["model_promotion_changed"] is False
+    assert payload["paper_execution_permission_changed"] is False
+    assert payload["backlog_unit"] == "unique_condition"
+    assert payload["detail_limit"] == 100
+    assert payload["batch_policy"] == {
+        "effective_batch_size": 1,
+        "hard_max_batch_size": 10,
+        "batch_source": "paper_corpus_label_tasks.batch_policy",
+        "changed_in_p2_2d": False,
+    }
+    assert payload["global"]["unlabeled_unique_conditions"] == 4
+    assert payload["global"]["eligible_unlabeled_unique_conditions"] == 3
+    assert payload["global"]["eligible_state_counts"] == {
+        "ELIGIBLE_PENDING_SCAN": 1,
+        "IDENTITY_MISMATCH": 1,
+        "EXPIRED_WAITING_FOR_OFFICIAL_RESOLUTION": 1,
+    }
+    assert payload["global"]["label_coverage_formula"] == (
+        "labeled_unique_conditions / "
+        "(labeled_unique_conditions + eligible_unlabeled_conditions)"
+    )
+    by_condition = {row["condition_id"]: row for row in payload["conditions"]}
+    assert by_condition["condition-pending-scan"]["backlog_state"] == "ELIGIBLE_PENDING_SCAN"
+    assert by_condition["condition-active"]["backlog_state"] == "ACTIVE_NOT_ELIGIBLE"
+    assert by_condition["condition-identity-missing"]["backlog_state"] == "IDENTITY_MISMATCH"
+    assert (
+        by_condition["condition-waiting-resolution"]["backlog_state"]
+        == "EXPIRED_WAITING_FOR_OFFICIAL_RESOLUTION"
+    )
+    xrp = next(
+        row for row in payload["buckets"] if row["asset"] == "XRP" and row["horizon"] == "5m"
+    )
+    assert xrp["eligible_state_counts"] == {
+        "EXPIRED_WAITING_FOR_OFFICIAL_RESOLUTION": 1
+    }
+    assert payload["labeler"]["state_counts"] == {"PENDING": 1}
+    assert payload["labeler"]["label_pass_latency"] == "Not reported"
+    assert payload["labeler"]["resolver_latency"] == "Not reported"
+
+
 def test_p2_2c_readiness_variance_policy_excludes_placeholders_and_names_failures(
     tmp_path,
 ) -> None:
@@ -629,6 +747,47 @@ def _write_labeled_checkpoint_conditions(
             },
             official_resolved_at=official_resolved_at,
             attached_at=official_resolved_at + timedelta(minutes=1),
+        )
+
+
+def _write_unlabeled_checkpoint_condition(
+    corpus: SQLiteDirectionalCorpusRepository,
+    *,
+    condition_id: str,
+    asset: Asset,
+    horizon: Horizon,
+    observed_at: datetime,
+    market_id: str | None,
+    window_end: datetime,
+) -> None:
+    for target in (120, 90, 60, 45):
+        payload = {
+            "window_start": (window_end - timedelta(minutes=5)).isoformat(),
+            "window_end": window_end.isoformat(),
+            "feature_vector": {
+                "feature_set_version": "v3.15.3-directional-official-ptb",
+                "generated_at": observed_at.isoformat(),
+                "features": [
+                    {
+                        "name": "short_return",
+                        "value": "1",
+                        "source_ts": observed_at.isoformat(),
+                    }
+                ],
+            },
+        }
+        if market_id is not None:
+            payload["market_id"] = market_id
+        corpus.save_checkpoint_observation(
+            checkpoint_id=f"{condition_id}-{target}",
+            asset=asset,
+            horizon=horizon,
+            condition_id=condition_id,
+            checkpoint_target_tte_seconds=target,
+            feature_schema_version="v3.15.3-directional-official-ptb",
+            observed_at=observed_at + timedelta(milliseconds=target),
+            actual_tte_seconds=target,
+            payload=payload,
         )
 
 

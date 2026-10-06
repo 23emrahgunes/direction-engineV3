@@ -44,6 +44,9 @@ P2_1_CONDITIONAL_PRODUCTION_SCHEMA_VERSION = (
 )
 P2_2B_LABEL_DEFAULT_LIMIT = 20
 P2_2B_LABEL_MAX_LIMIT = 100
+P2_2D_LABEL_HEALTH_DEFAULT_LIMIT = 25
+P2_2D_LABEL_HEALTH_MAX_LIMIT = 100
+P2_2D_LABEL_BACKLOG_SCAN_MAX = 5_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +279,152 @@ def build_directional_corpus_readiness() -> dict[str, object]:
         "corpus": corpus_report,
         "labeler": label_tasks,
         "readiness_marker": _corpus_readiness_marker(corpus_report),
+    }
+
+
+def build_directional_corpus_label_health(
+    *, limit: str | None = None, asset: str | None = None, horizon: str | None = None
+) -> dict[str, object]:
+    """Return bounded P2.2D label backlog/throughput evidence.
+
+    This is read-only observability.  It groups backlog by unique condition and
+    never calls the official resolver, attaches labels, changes batch size,
+    trains models, promotes models, or opens PAPER/LIVE orders.
+    """
+
+    detail_limit = _safe_limit(
+        limit,
+        default=P2_2D_LABEL_HEALTH_DEFAULT_LIMIT,
+        maximum=P2_2D_LABEL_HEALTH_MAX_LIMIT,
+    )
+    generated_at = datetime.now(UTC)
+    corpus_path = runtime_data_dir() / "directional_corpus.sqlite3"
+    paper_path = runtime_data_dir() / "paper.sqlite3"
+    asset_filter = _asset_filter(asset)
+    horizon_filter = _horizon_filter(horizon)
+    if not corpus_path.exists():
+        return {
+            "status": "DIRECTIONAL_CORPUS_LABEL_HEALTH_NOT_INITIALIZED",
+            "version": "P2.2D",
+            "generated_at": generated_at.isoformat(),
+            "real_order_submission": False,
+            "backlog_unit": "unique_condition",
+            "conditions": [],
+            "global": _empty_label_health_global(),
+            "buckets": _empty_label_health_buckets(),
+        }
+
+    corpus = SQLiteDirectionalCorpusRepository(corpus_path)
+    paper = SQLitePaperRepository(paper_path)
+    conditions = corpus.unlabeled_checkpoint_conditions(limit=P2_2D_LABEL_BACKLOG_SCAN_MAX)
+    tasks_by_condition = (
+        paper.latest_corpus_label_tasks_by_condition() if paper_path.exists() else {}
+    )
+    label_summary = (
+        paper.corpus_label_task_summary(limit=detail_limit)
+        if paper_path.exists()
+        else _label_task_summary()
+    )
+    raw_batch_policy = label_summary.get("batch_policy")
+    batch_policy = raw_batch_policy if isinstance(raw_batch_policy, dict) else {}
+    effective_batch_size = _int_or_default(
+        batch_policy.get("default_max_conditions_per_pass"),
+        1,
+    )
+    hard_max_batch_size = _int_or_default(
+        batch_policy.get("hard_max_conditions_per_pass"),
+        10,
+    )
+    bucket_rows = _empty_label_health_buckets()
+    state_counts: dict[str, int] = {}
+    eligible_state_counts: dict[str, int] = {}
+    details: list[dict[str, object]] = []
+    candidate_probe: list[dict[str, object]] = []
+    total_unlabeled = 0
+    eligible_unlabeled = 0
+    for index, condition in enumerate(conditions):
+        if asset_filter is not None and condition.asset != asset_filter:
+            continue
+        if horizon_filter is not None and condition.horizon != horizon_filter:
+            continue
+        total_unlabeled += 1
+        latest_task = tasks_by_condition.get(condition.condition_id)
+        state, reason = _label_backlog_state(condition, latest_task, generated_at)
+        _increment_count(state_counts, state)
+        is_eligible = _condition_is_label_eligible(condition, generated_at)
+        if is_eligible:
+            eligible_unlabeled += 1
+            _increment_count(eligible_state_counts, state)
+        bucket = bucket_rows[f"{condition.asset.value}-{condition.horizon.value}"]
+        bucket["unlabeled_unique_conditions"] = (
+            _int_or_default(bucket["unlabeled_unique_conditions"], 0) + 1
+        )
+        if is_eligible:
+            bucket["eligible_unlabeled_unique_conditions"] = (
+                _int_or_default(bucket["eligible_unlabeled_unique_conditions"], 0) + 1
+            )
+            _increment_count(bucket["eligible_state_counts"], state)
+        else:
+            _increment_count(bucket["non_eligible_state_counts"], state)
+        detail = _label_backlog_detail(condition, latest_task, state, reason, is_eligible)
+        if len(details) < detail_limit:
+            details.append(detail)
+        if index < effective_batch_size:
+            candidate_probe.append(detail)
+    return {
+        "status": "DIRECTIONAL_CORPUS_LABEL_HEALTH_READY",
+        "version": "P2.2D",
+        "label": "PAPER / SHADOW — NO REAL ORDER",
+        "generated_at": generated_at.isoformat(),
+        "real_order_submission": False,
+        "training_started": False,
+        "model_promotion_changed": False,
+        "paper_execution_permission_changed": False,
+        "backlog_unit": "unique_condition",
+        "bounded": True,
+        "detail_limit": detail_limit,
+        "hard_max_detail_limit": P2_2D_LABEL_HEALTH_MAX_LIMIT,
+        "scan_limit": P2_2D_LABEL_BACKLOG_SCAN_MAX,
+        "scan_truncated": len(conditions) >= P2_2D_LABEL_BACKLOG_SCAN_MAX,
+        "filters": {
+            "asset": None if asset_filter is None else asset_filter.value,
+            "horizon": None if horizon_filter is None else horizon_filter.value,
+        },
+        "batch_policy": {
+            "effective_batch_size": effective_batch_size,
+            "hard_max_batch_size": hard_max_batch_size,
+            "batch_source": "paper_corpus_label_tasks.batch_policy",
+            "changed_in_p2_2d": False,
+        },
+        "global": {
+            "unlabeled_unique_conditions": total_unlabeled,
+            "eligible_unlabeled_unique_conditions": eligible_unlabeled,
+            "state_counts": state_counts,
+            "eligible_state_counts": eligible_state_counts,
+            "coverage_denominator_unit": "unique_condition",
+            "label_coverage_formula": (
+                "labeled_unique_conditions / "
+                "(labeled_unique_conditions + eligible_unlabeled_conditions)"
+            ),
+        },
+        "buckets": list(bucket_rows.values()),
+        "labeler": {
+            "status": label_summary.get("status"),
+            "total_tasks": label_summary.get("total_tasks", 0),
+            "total_attempts": label_summary.get("total_attempts", 0),
+            "state_counts": label_summary.get("state_counts", {}),
+            "reason_counts": label_summary.get("reason_counts", {}),
+            "first_attempt_at": label_summary.get("first_attempt_at"),
+            "last_attempt_at": label_summary.get("last_attempt_at"),
+            "labeled_task_count": label_summary.get("labeled_task_count"),
+            "labels_per_minute_observed_window": label_summary.get(
+                "labels_per_minute_observed_window"
+            ),
+            "label_pass_latency": "Not reported",
+            "resolver_latency": "Not reported",
+        },
+        "candidate_probe": candidate_probe,
+        "conditions": details,
     }
 
 
@@ -1281,6 +1430,142 @@ def _paper_repository() -> SQLitePaperRepository:
     repository = SQLitePaperRepository(runtime_data_dir() / "paper.sqlite3")
     repository.initialize()
     return repository
+
+
+def _empty_label_health_global() -> dict[str, object]:
+    return {
+        "unlabeled_unique_conditions": 0,
+        "eligible_unlabeled_unique_conditions": 0,
+        "state_counts": {},
+        "eligible_state_counts": {},
+        "coverage_denominator_unit": "unique_condition",
+        "label_coverage_formula": (
+            "labeled_unique_conditions / "
+            "(labeled_unique_conditions + eligible_unlabeled_conditions)"
+        ),
+    }
+
+
+def _empty_label_health_buckets() -> dict[str, dict[str, object]]:
+    return {
+        f"{asset.value}-{horizon.value}": {
+            "asset": asset.value,
+            "horizon": horizon.value,
+            "unlabeled_unique_conditions": 0,
+            "eligible_unlabeled_unique_conditions": 0,
+            "eligible_state_counts": {},
+            "non_eligible_state_counts": {},
+        }
+        for asset in Asset
+        for horizon in Horizon
+    }
+
+
+def _label_backlog_state(
+    condition: object,
+    task: object | None,
+    now: datetime,
+) -> tuple[str, str]:
+    window_end = getattr(condition, "window_end", None)
+    market_id = getattr(condition, "market_id", None)
+    if not isinstance(window_end, datetime):
+        return "IDENTITY_MISMATCH", "WINDOW_END_MISSING"
+    if window_end > now:
+        return "ACTIVE_NOT_ELIGIBLE", "WINDOW_NOT_ENDED"
+    if not isinstance(market_id, str) or not market_id:
+        return "IDENTITY_MISMATCH", "MARKET_ID_MISSING"
+    if task is None:
+        return "ELIGIBLE_PENDING_SCAN", "NO_LABEL_TASK"
+    state = str(getattr(task, "state", "") or "")
+    reason = str(getattr(task, "last_reason", "") or "")
+    next_attempt_at = getattr(task, "next_attempt_at", None)
+    if state == "LABELED" or reason == "CORPUS_LABEL_ATTACHED":
+        return "ALREADY_LABELED", reason or state
+    if isinstance(next_attempt_at, datetime) and next_attempt_at > now:
+        if "NOT_FOUND" in reason or "CONDITION_NOT_FOUND" in reason:
+            return "MARKET_NOT_FOUND", reason
+        if "IDENTITY" in reason or "MARKET_ID_REQUIRED" in reason:
+            return "IDENTITY_MISMATCH", reason
+        if "Timeout" in reason or "TIMEOUT" in reason:
+            return "RESOLVER_TIMEOUT", reason
+        if "OFFICIAL_LABEL_CONFLICT" in reason or "RESOLUTION_TIME_UNAVAILABLE" in reason:
+            return "LABEL_ATTACH_ERROR", reason
+        if state == "PENDING" or "PENDING" in reason or "WAITING" in reason:
+            return "EXPIRED_WAITING_FOR_OFFICIAL_RESOLUTION", reason
+        return "RESOLUTION_RETRY", reason or state
+    if "NOT_FOUND" in reason or "CONDITION_NOT_FOUND" in reason:
+        return "MARKET_NOT_FOUND", reason
+    if "IDENTITY" in reason or "MARKET_ID_REQUIRED" in reason:
+        return "IDENTITY_MISMATCH", reason
+    if "Timeout" in reason or "TIMEOUT" in reason:
+        return "RESOLVER_TIMEOUT", reason
+    if "OFFICIAL_LABEL_CONFLICT" in reason or "RESOLUTION_TIME_UNAVAILABLE" in reason:
+        return "LABEL_ATTACH_ERROR", reason
+    if state == "PENDING" or "PENDING" in reason or "WAITING" in reason:
+        return "EXPIRED_WAITING_FOR_OFFICIAL_RESOLUTION", reason
+    if state.startswith("BLOCKED"):
+        return "RESOLVER_ERROR", reason or state
+    return "UNKNOWN", reason or state or "UNKNOWN"
+
+
+def _condition_is_label_eligible(condition: object, now: datetime) -> bool:
+    window_end = getattr(condition, "window_end", None)
+    return isinstance(window_end, datetime) and window_end <= now
+
+
+def _label_backlog_detail(
+    condition: object,
+    task: object | None,
+    state: str,
+    reason: str,
+    is_eligible: bool,
+) -> dict[str, object]:
+    return {
+        "condition_id": str(getattr(condition, "condition_id", "")),
+        "asset": getattr(getattr(condition, "asset", None), "value", None),
+        "horizon": getattr(getattr(condition, "horizon", None), "value", None),
+        "market_id": getattr(condition, "market_id", None),
+        "window_start": _datetime_or_none(getattr(condition, "window_start", None)),
+        "window_end": _datetime_or_none(getattr(condition, "window_end", None)),
+        "first_observed_at": _datetime_or_none(getattr(condition, "first_observed_at", None)),
+        "last_observed_at": _datetime_or_none(getattr(condition, "last_observed_at", None)),
+        "checkpoint_row_count": int(getattr(condition, "checkpoint_row_count", 0) or 0),
+        "unlabeled_row_count": int(getattr(condition, "unlabeled_row_count", 0) or 0),
+        "eligible": is_eligible,
+        "backlog_state": state,
+        "reason": reason,
+        "latest_task_state": None if task is None else getattr(task, "state", None),
+        "latest_task_reason": None if task is None else getattr(task, "last_reason", None),
+        "latest_task_attempt_count": None if task is None else getattr(task, "attempt_count", None),
+        "latest_task_last_attempt_at": None
+        if task is None
+        else _datetime_or_none(getattr(task, "last_attempt_at", None)),
+        "latest_task_next_attempt_at": None
+        if task is None
+        else _datetime_or_none(getattr(task, "next_attempt_at", None)),
+    }
+
+
+def _datetime_or_none(value: object) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _increment_count(mapping: object, key: str) -> None:
+    if isinstance(mapping, dict):
+        mapping[key] = int(mapping.get(key, 0)) + 1
+
+
+def _int_or_default(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _label_task_summary() -> dict[str, object]:

@@ -701,6 +701,13 @@ class SQLitePaperRepository:
                 totals = connection.execute(
                     "SELECT COUNT(*),SUM(attempt_count) FROM paper_corpus_label_tasks"
                 ).fetchone()
+                timing = connection.execute(
+                    """
+                    SELECT MIN(last_attempt_at),MAX(last_attempt_at),
+                           SUM(CASE WHEN state='LABELED' THEN 1 ELSE 0 END)
+                    FROM paper_corpus_label_tasks
+                    """
+                ).fetchone()
                 state_rows = connection.execute(
                     """
                     SELECT state,COUNT(*)
@@ -762,6 +769,10 @@ class SQLitePaperRepository:
             "status": "PAPER_CORPUS_LABEL_TASKS_READY",
             "total_tasks": int((totals or (0, 0))[0] or 0),
             "total_attempts": int((totals or (0, 0))[1] or 0),
+            "first_attempt_at": None if timing is None or timing[0] is None else str(timing[0]),
+            "last_attempt_at": None if timing is None or timing[1] is None else str(timing[1]),
+            "labeled_task_count": int((timing or (None, None, 0))[2] or 0),
+            "labels_per_minute_observed_window": _labels_per_minute_observed_window(timing),
             "state_counts": {str(row[0]): int(row[1] or 0) for row in state_rows},
             "reason_counts": {
                 str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in reason_rows
@@ -773,6 +784,30 @@ class SQLitePaperRepository:
                 "changed_in_p2_2b": False,
             },
         }
+
+    def latest_corpus_label_tasks_by_condition(self) -> dict[str, PaperCorpusLabelTask]:
+        """Return the newest label task per condition for read-only backlog diagnostics."""
+
+        if not self._path.exists():
+            return {}
+        with sqlite3.connect(self._path) as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT condition_id,evidence_hash,state,last_attempt_at,next_attempt_at,
+                           attempt_count,last_reason,payload_json
+                    FROM paper_corpus_label_tasks
+                    ORDER BY condition_id ASC, last_attempt_at DESC
+                    """
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {}
+        latest: dict[str, PaperCorpusLabelTask] = {}
+        for row in rows:
+            condition_id = str(row[0])
+            if condition_id not in latest:
+                latest[condition_id] = _corpus_label_task_from_row(row)
+        return latest
 
     def save_identity_overlay_once(
         self,
@@ -1769,6 +1804,21 @@ def _corpus_label_task_from_row(row: tuple[object, ...]) -> PaperCorpusLabelTask
         last_reason=None if row[6] is None else str(row[6]),
         payload=payload,
     )
+
+
+def _labels_per_minute_observed_window(row: tuple[object, ...] | None) -> str | None:
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    try:
+        first = datetime.fromisoformat(str(row[0]))
+        last = datetime.fromisoformat(str(row[1]))
+    except ValueError:
+        return None
+    labeled = int(str(row[2] or 0))
+    elapsed_minutes = max((last - first).total_seconds() / 60.0, 0.0)
+    if elapsed_minutes <= 0:
+        return None
+    return str(labeled / elapsed_minutes)
 
 
 def _run_metadata_from_row(row: tuple[object, ...]) -> PaperRunMetadata:

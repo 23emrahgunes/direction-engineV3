@@ -89,6 +89,20 @@ class DirectionalCheckpointLabelCandidate:
     unlabeled_row_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class DirectionalUnlabeledCheckpointCondition:
+    condition_id: str
+    asset: Asset
+    horizon: Horizon
+    market_id: str | None
+    window_start: datetime | None
+    window_end: datetime | None
+    first_observed_at: datetime
+    last_observed_at: datetime
+    checkpoint_row_count: int
+    unlabeled_row_count: int
+
+
 class SQLiteDirectionalCorpusRepository:
     """Stores what was known before settlement, then immutable outcome evidence."""
 
@@ -841,6 +855,59 @@ class SQLiteDirectionalCorpusRepository:
                 )
             )
         return tuple(candidates)
+
+    def unlabeled_checkpoint_conditions(
+        self, *, limit: int = 5_000
+    ) -> tuple[DirectionalUnlabeledCheckpointCondition, ...]:
+        """Return unique checkpoint conditions that still need an official label.
+
+        This is diagnostic/read-only evidence for label backlog health.  It is
+        deliberately grouped by condition, not checkpoint row, so 120/90/60/45s
+        observations for one market never inflate backlog counts.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        bounded_limit = min(limit, 5_000)
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id,asset,horizon,payload_json,
+                       COUNT(*) AS checkpoint_row_count,
+                       SUM(CASE WHEN outcome_json IS NULL THEN 1 ELSE 0 END)
+                           AS unlabeled_row_count,
+                       MIN(observed_at) AS first_observed_at,
+                       MAX(observed_at) AS last_observed_at
+                FROM directional_checkpoint_observations
+                WHERE outcome_json IS NULL
+                GROUP BY condition_id,asset,horizon
+                ORDER BY first_observed_at ASC, condition_id ASC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        conditions: list[DirectionalUnlabeledCheckpointCondition] = []
+        for row in rows:
+            payload = _safe_json_object(str(row[3] or "{}"))
+            first_observed_at = _optional_datetime(row[6])
+            last_observed_at = _optional_datetime(row[7])
+            if first_observed_at is None or last_observed_at is None:
+                continue
+            conditions.append(
+                DirectionalUnlabeledCheckpointCondition(
+                    condition_id=str(row[0]),
+                    asset=Asset(str(row[1])),
+                    horizon=Horizon(str(row[2])),
+                    market_id=_optional_text(payload.get("market_id")),
+                    window_start=_optional_datetime(payload.get("window_start")),
+                    window_end=_optional_datetime(payload.get("window_end")),
+                    first_observed_at=first_observed_at,
+                    last_observed_at=last_observed_at,
+                    checkpoint_row_count=int(row[4] or 0),
+                    unlabeled_row_count=int(row[5] or 0),
+                )
+            )
+        return tuple(conditions)
 
     def records_for_condition(self, condition_id: str) -> tuple[DirectionalCorpusRecord, ...]:
         require_text("condition_id", condition_id)
