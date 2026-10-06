@@ -18,7 +18,8 @@ MINIMUM_CLASS_COUNT_PER_SIDE = 20
 MINIMUM_ELIGIBLE_LABEL_COVERAGE = 0.80
 CHECKPOINT_TARGETS_SECONDS = (120, 90, 60, 45)
 CHECKPOINT_TOLERANCE_SECONDS = 10
-SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION = "SOL5M_PROSPECTIVE_EVIDENCE_V1"
+SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION = "SOL5M_PROSPECTIVE_EVIDENCE_V2"
+SOL5M_PROSPECTIVE_LEGACY_SCHEMA_VERSION = "SOL5M_PROSPECTIVE_EVIDENCE_V1"
 SOL5M_PROSPECTIVE_MINIMUM_LABELED_CONDITIONS = 100
 SOL5M_PROSPECTIVE_MINIMUM_PRICING_COVERAGE = 0.80
 
@@ -232,6 +233,12 @@ class SQLiteDirectionalCorpusRepository:
                     up_executable_cost REAL,
                     down_executable_cost REAL,
                     pricing_status TEXT NOT NULL,
+                    prediction_status TEXT,
+                    prediction_failure_reason TEXT,
+                    pricing_failure_reason TEXT,
+                    label_status TEXT,
+                    economic_eligible INTEGER,
+                    valid_capture_start TEXT,
                     timing_status TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     outcome_json TEXT,
@@ -245,6 +252,7 @@ class SQLiteDirectionalCorpusRepository:
                 )
                 """
             )
+            self._ensure_sol5m_prospective_columns(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sol5m_prospective_observed
@@ -258,6 +266,26 @@ class SQLiteDirectionalCorpusRepository:
                 WHERE outcome_json IS NULL
                 """
             )
+
+    @staticmethod
+    def _ensure_sol5m_prospective_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(sol5m_prospective_evidence)")
+        }
+        additions = {
+            "prediction_status": "TEXT",
+            "prediction_failure_reason": "TEXT",
+            "pricing_failure_reason": "TEXT",
+            "label_status": "TEXT",
+            "economic_eligible": "INTEGER",
+            "valid_capture_start": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE sol5m_prospective_evidence ADD COLUMN {name} {column_type}"
+                )
 
     def save_checkpoint_observation(
         self,
@@ -445,6 +473,7 @@ class SQLiteDirectionalCorpusRepository:
                     (encoded, attached_at.isoformat(), str(checkpoint_id)),
                 )
                 updated += 1
+            self._ensure_sol5m_prospective_columns(connection)
             prospective_rows = connection.execute(
                 """
                 SELECT evidence_id,observed_at,outcome_json
@@ -466,7 +495,7 @@ class SQLiteDirectionalCorpusRepository:
                 connection.execute(
                     """
                     UPDATE sol5m_prospective_evidence
-                    SET outcome_json=?, outcome_attached_at=?
+                    SET outcome_json=?, outcome_attached_at=?, label_status='LABELED'
                     WHERE evidence_id=?
                     """,
                     (encoded, attached_at.isoformat(), str(evidence_id)),
@@ -496,6 +525,12 @@ class SQLiteDirectionalCorpusRepository:
         down_executable_cost: float | None,
         pricing_status: str,
         timing_status: str,
+        prediction_status: str | None = None,
+        prediction_failure_reason: str | None = None,
+        pricing_failure_reason: str | None = None,
+        label_status: str | None = None,
+        economic_eligible: bool | None = None,
+        valid_capture_start: datetime | None = None,
         payload: Mapping[str, object],
     ) -> Sol5mProspectiveEvidenceRecord:
         require_text("evidence_id", evidence_id)
@@ -507,14 +542,70 @@ class SQLiteDirectionalCorpusRepository:
         require_text("pricing_status", pricing_status)
         require_text("timing_status", timing_status)
         require_utc("observed_at", observed_at)
+        if prediction_status is not None:
+            require_text("prediction_status", prediction_status)
+        if pricing_failure_reason is not None:
+            require_text("pricing_failure_reason", pricing_failure_reason)
+        if prediction_failure_reason is not None:
+            require_text("prediction_failure_reason", prediction_failure_reason)
+        if label_status is not None:
+            require_text("label_status", label_status)
+        if valid_capture_start is not None:
+            require_utc("valid_capture_start", valid_capture_start)
         if checkpoint_target_tte_seconds != 45:
             raise ValueError("SOL-5m prospective evidence captures only the 45s checkpoint")
+        if prediction_status is None:
+            prediction_status = (
+                "VALID"
+                if predicted_side is not None and calibrated_probability is not None
+                else "UNAVAILABLE"
+            )
+        if label_status is None:
+            label_status = "UNLABELED"
+        if economic_eligible is None:
+            economic_eligible = (
+                prediction_status == "VALID"
+                and pricing_status == "CHECKPOINT_EXECUTABLE_PRICING_READY"
+                and selected_side_executable_cost is not None
+            )
         encoded = json.dumps(_jsonable(dict(payload)), sort_keys=True, separators=(",", ":"))
         with sqlite3.connect(self._path) as connection:
+            self._ensure_sol5m_prospective_columns(connection)
             connection.execute(
                 """
-                INSERT OR IGNORE INTO sol5m_prospective_evidence
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
+                INSERT OR IGNORE INTO sol5m_prospective_evidence (
+                    evidence_id,
+                    condition_id,
+                    market_id,
+                    asset,
+                    horizon,
+                    checkpoint_target_tte_seconds,
+                    evidence_schema_version,
+                    feature_schema_version,
+                    model_id,
+                    model_artifact_checksum,
+                    observed_at,
+                    actual_tte_seconds,
+                    predicted_side,
+                    raw_model_probability,
+                    calibrated_probability,
+                    selected_probability,
+                    selected_side_executable_cost,
+                    up_executable_cost,
+                    down_executable_cost,
+                    pricing_status,
+                    prediction_status,
+                    prediction_failure_reason,
+                    pricing_failure_reason,
+                    label_status,
+                    economic_eligible,
+                    valid_capture_start,
+                    timing_status,
+                    payload_json,
+                    outcome_json,
+                    outcome_attached_at
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
                 """,
                 (
                     evidence_id,
@@ -537,6 +628,12 @@ class SQLiteDirectionalCorpusRepository:
                     up_executable_cost,
                     down_executable_cost,
                     pricing_status,
+                    prediction_status,
+                    prediction_failure_reason,
+                    pricing_failure_reason,
+                    label_status,
+                    None if economic_eligible is None else int(economic_eligible),
+                    None if valid_capture_start is None else valid_capture_start.isoformat(),
                     timing_status,
                     encoded,
                 ),
@@ -645,6 +742,58 @@ class SQLiteDirectionalCorpusRepository:
                     ORDER BY pricing_status
                     """
                 ).fetchall()
+                prediction_rows = connection.execute(
+                    """
+                    SELECT COALESCE(prediction_status,'LEGACY_NOT_REPORTED'),COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    GROUP BY COALESCE(prediction_status,'LEGACY_NOT_REPORTED')
+                    ORDER BY COALESCE(prediction_status,'LEGACY_NOT_REPORTED')
+                    """
+                ).fetchall()
+                prediction_reason_rows = connection.execute(
+                    """
+                    SELECT COALESCE(prediction_failure_reason,'NONE'),COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    WHERE prediction_status IS NOT NULL
+                      AND prediction_status <> 'VALID'
+                    GROUP BY COALESCE(prediction_failure_reason,'NONE')
+                    ORDER BY COALESCE(prediction_failure_reason,'NONE')
+                    """
+                ).fetchall()
+                pricing_reason_rows = connection.execute(
+                    """
+                    SELECT COALESCE(pricing_failure_reason,'NONE'),COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    WHERE pricing_failure_reason IS NOT NULL
+                    GROUP BY COALESCE(pricing_failure_reason,'NONE')
+                    ORDER BY COALESCE(pricing_failure_reason,'NONE')
+                    """
+                ).fetchall()
+                v2_row = connection.execute(
+                    """
+                    SELECT COUNT(*),
+                           COUNT(DISTINCT condition_id),
+                           SUM(CASE WHEN prediction_status='VALID' THEN 1 ELSE 0 END),
+                           SUM(
+                               CASE WHEN pricing_status='CHECKPOINT_EXECUTABLE_PRICING_READY'
+                               THEN 1 ELSE 0 END
+                           ),
+                           SUM(CASE WHEN economic_eligible=1 THEN 1 ELSE 0 END),
+                           MIN(observed_at)
+                    FROM sol5m_prospective_evidence
+                    WHERE evidence_schema_version=?
+                    """,
+                    (SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,),
+                ).fetchone()
+                legacy_unavailable = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sol5m_prospective_evidence
+                    WHERE evidence_schema_version=?
+                      AND pricing_status='PREDICTION_UNAVAILABLE'
+                    """,
+                    (SOL5M_PROSPECTIVE_LEGACY_SCHEMA_VERSION,),
+                ).fetchone()
                 blocker_rows = connection.execute(
                     """
                     SELECT timing_status,COUNT(*)
@@ -667,6 +816,12 @@ class SQLiteDirectionalCorpusRepository:
         labeled_unique = int((row or (0, 0, 0, 0))[3] or 0)
         priced_rows = int((row or (0, 0, 0, 0, 0))[4] or 0)
         pricing_coverage = priced_rows / total_rows if total_rows else 0.0
+        v2_total = int((v2_row or (0,))[0] or 0)
+        v2_unique = int((v2_row or (0, 0))[1] or 0)
+        prediction_valid = int((v2_row or (0, 0, 0))[2] or 0)
+        pricing_valid = int((v2_row or (0, 0, 0, 0))[3] or 0)
+        economic_eligible = int((v2_row or (0, 0, 0, 0, 0))[4] or 0)
+        v2_pricing_coverage = pricing_valid / v2_total if v2_total else 0.0
         label_counts = {"UP": 0, "DOWN": 0}
         for outcome_raw, count in label_rows:
             label = _label_from_outcome(_safe_json_object(str(outcome_raw or "{}")))
@@ -706,6 +861,25 @@ class SQLiteDirectionalCorpusRepository:
             "pricing_status_counts": {
                 str(status): int(count or 0) for status, count in status_rows
             },
+            "prediction_status_counts": {
+                str(status): int(count or 0) for status, count in prediction_rows
+            },
+            "prediction_failure_reason_counts": {
+                str(reason): int(count or 0) for reason, count in prediction_reason_rows
+            },
+            "pricing_failure_reason_counts": {
+                str(reason): int(count or 0) for reason, count in pricing_reason_rows
+            },
+            "v2_total_rows": v2_total,
+            "v2_unique_conditions": v2_unique,
+            "prediction_valid_rows": prediction_valid,
+            "pricing_valid_rows": pricing_valid,
+            "economic_eligible_rows": economic_eligible,
+            "v2_pricing_coverage": str(v2_pricing_coverage),
+            "valid_capture_start": None if v2_row is None else v2_row[5],
+            "pre_repair_prediction_unavailable_rows": int(
+                0 if legacy_unavailable is None else legacy_unavailable[0] or 0
+            ),
             "timing_status_counts": {
                 str(status): int(count or 0) for status, count in blocker_rows
             },
@@ -727,6 +901,10 @@ class SQLiteDirectionalCorpusRepository:
                     SELECT evidence_id,condition_id,market_id,observed_at,
                            predicted_side,calibrated_probability,
                            selected_side_executable_cost,pricing_status,
+                           COALESCE(prediction_status,'LEGACY_NOT_REPORTED'),
+                           prediction_failure_reason,pricing_failure_reason,
+                           COALESCE(label_status,'UNLABELED'),
+                           economic_eligible,valid_capture_start,
                            timing_status,outcome_json,outcome_attached_at,
                            payload_json
                     FROM sol5m_prospective_evidence
@@ -741,10 +919,14 @@ class SQLiteDirectionalCorpusRepository:
         for row in rows:
             outcome = (
                 None
-                if row[9] is None
-                else _label_from_outcome(_safe_json_object(str(row[9])))
+                if row[15] is None
+                else _label_from_outcome(_safe_json_object(str(row[15])))
             )
-            payload = _safe_json_object(str(row[11] or "{}"))
+            payload = _safe_json_object(str(row[17] or "{}"))
+            prediction_raw = payload.get("prediction")
+            prediction_payload = (
+                prediction_raw if isinstance(prediction_raw, dict) else {}
+            )
             samples.append(
                 {
                     "evidence_id": str(row[0]),
@@ -755,11 +937,20 @@ class SQLiteDirectionalCorpusRepository:
                     "calibrated_probability": row[5],
                     "selected_side_executable_cost": row[6],
                     "pricing_status": str(row[7]),
-                    "timing_status": str(row[8]),
+                    "prediction_status": str(row[8]),
+                    "prediction_failure_reason": row[9],
+                    "pricing_failure_reason": row[10],
+                    "label_status": str(row[11]),
+                    "economic_eligible": bool(row[12]) if row[12] is not None else None,
+                    "valid_capture_start": row[13],
+                    "timing_status": str(row[14]),
                     "official_outcome": outcome,
-                    "outcome_attached_at": row[10],
+                    "outcome_attached_at": row[16],
                     "model_id": payload.get("model_id"),
                     "artifact_checksum": payload.get("artifact_checksum"),
+                    "raw_model_probability": prediction_payload.get("raw_model_probability"),
+                    "up_executable_cost": payload.get("up_executable_cost"),
+                    "down_executable_cost": payload.get("down_executable_cost"),
                 }
             )
         return tuple(samples)

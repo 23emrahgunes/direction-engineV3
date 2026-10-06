@@ -29,6 +29,7 @@ from direction_engine_v3.shadow.storage import ShadowStorageUnavailable, SQLiteS
 from direction_engine_v3.storage import SQLitePaperRepository
 from direction_engine_v3.storage.directional_corpus import (
     READINESS_POLICY_VERSION,
+    SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
     SQLiteDirectionalCorpusRepository,
 )
 
@@ -444,7 +445,7 @@ def build_sol5m_prospective_evidence(
     if not corpus_path.exists():
         return {
             "status": "SOL5M_PROSPECTIVE_EVIDENCE_NOT_INITIALIZED",
-            "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+            "version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
             "label": "PAPER / SHADOW — NO REAL ORDER",
             "real_order_submission": False,
             "bounded": True,
@@ -463,7 +464,7 @@ def build_sol5m_prospective_evidence(
     except sqlite3.OperationalError as exc:
         return {
             "status": "SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_UNAVAILABLE",
-            "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+            "version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
             "reason": type(exc).__name__,
             "message": str(exc),
             "label": "PAPER / SHADOW — NO REAL ORDER",
@@ -478,7 +479,7 @@ def build_sol5m_prospective_evidence(
         }
     return {
         "status": summary.get("status", "SOL5M_PROSPECTIVE_EVIDENCE_READY"),
-        "version": "SOL5M_PROSPECTIVE_EVIDENCE_V1",
+        "version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
         "label": "PAPER / SHADOW — NO REAL ORDER",
         "real_order_submission": False,
         "training_started": False,

@@ -1429,6 +1429,7 @@ class ShadowDaemon:
             cycle_id=cycle_id,
             up_pricing=up_pricing,
             down_pricing=down_pricing,
+            directional_pricing_status=pricing_status,
         )
         if assessment.action is DecisionAction.ABSTAIN:
             abstains = self._record_abstain(
@@ -2169,6 +2170,7 @@ class ShadowDaemon:
         cycle_id: str,
         up_pricing: DepthSimulation | None,
         down_pricing: DepthSimulation | None,
+        directional_pricing_status: str,
     ) -> None:
         if (
             self._directional_corpus_repository is None
@@ -2199,6 +2201,12 @@ class ShadowDaemon:
                 "model_id": challenger.model_id,
             }
         )
+        prediction_status = "VALID" if prediction.get("status") == "READY" else str(
+            prediction.get("status", "UNKNOWN")
+        )
+        prediction_failure_reason = (
+            None if prediction_status == "VALID" else str(prediction.get("reason", "UNKNOWN"))
+        )
         predicted_side = (
             str(prediction["predicted_side"])
             if prediction.get("status") == "READY" and prediction.get("predicted_side")
@@ -2212,9 +2220,8 @@ class ShadowDaemon:
             selected_cost = down_cost
         else:
             selected_cost = None
-        pricing_status = _prospective_pricing_status(
-            predicted_side=predicted_side,
-            selected_cost=selected_cost,
+        prospective_pricing_status, pricing_failure_reason = _prospective_pricing_status(
+            directional_pricing_status=directional_pricing_status,
             up_cost=up_cost,
             down_cost=down_cost,
         )
@@ -2223,6 +2230,12 @@ class ShadowDaemon:
             if abs(actual_tte_seconds - P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT)
             <= _DIRECTIONAL_CHECKPOINT_TOLERANCE_SECONDS
             else "CHECKPOINT_OUTSIDE_TOLERANCE"
+        )
+        economic_eligible = (
+            prediction_status == "VALID"
+            and prospective_pricing_status == "CHECKPOINT_EXECUTABLE_PRICING_READY"
+            and timing_status == "CHECKPOINT_45S_WITHIN_TOLERANCE"
+            and selected_cost is not None
         )
         self._directional_corpus_repository.save_sol5m_prospective_evidence(
             evidence_id=(
@@ -2246,7 +2259,13 @@ class ShadowDaemon:
             selected_side_executable_cost=selected_cost,
             up_executable_cost=up_cost,
             down_executable_cost=down_cost,
-            pricing_status=pricing_status,
+            pricing_status=prospective_pricing_status,
+            prediction_status=prediction_status,
+            prediction_failure_reason=prediction_failure_reason,
+            pricing_failure_reason=pricing_failure_reason,
+            label_status="UNLABELED",
+            economic_eligible=economic_eligible,
+            valid_capture_start=state.observed_at,
             timing_status=timing_status,
             payload={
                 "schema_version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
@@ -2264,11 +2283,16 @@ class ShadowDaemon:
                 "artifact_reason": challenger.reason,
                 "artifact_spec": challenger.spec,
                 "prediction": prediction,
+                "prediction_status": prediction_status,
+                "prediction_failure_reason": prediction_failure_reason,
                 "up_executable_cost": up_cost,
                 "down_executable_cost": down_cost,
                 "selected_side_executable_cost": selected_cost,
-                "pricing_status": pricing_status,
+                "pricing_status": prospective_pricing_status,
+                "pricing_failure_reason": pricing_failure_reason,
                 "timing_status": timing_status,
+                "economic_eligible": economic_eligible,
+                "valid_capture_start": state.observed_at.isoformat(),
                 "research_notional_usdc": str(P2_3_SOL5M_RESEARCH_NOTIONAL_USDC),
                 "counterfactual_execution": False,
                 "paper_execution_enabled": False,
@@ -3307,18 +3331,17 @@ def _p2_3_sol5m_feature_row(features: FeatureVector) -> tuple[float, ...] | None
 
 def _prospective_pricing_status(
     *,
-    predicted_side: str | None,
-    selected_cost: float | None,
+    directional_pricing_status: str,
     up_cost: float | None,
     down_cost: float | None,
-) -> str:
-    if predicted_side is None:
-        return "PREDICTION_UNAVAILABLE"
-    if selected_cost is None:
-        return "SELECTED_SIDE_PRICING_MISSING"
+) -> tuple[str, str | None]:
+    if directional_pricing_status != "EXECUTABLE_PRICE_READY":
+        return "EXECUTABLE_PRICING_UNAVAILABLE", directional_pricing_status
+    if up_cost is None and down_cost is None:
+        return "BOTH_SIDE_PRICING_MISSING", "BOTH_SIDE_EXECUTABLE_COST_MISSING"
     if up_cost is None or down_cost is None:
-        return "ONE_SIDE_PRICING_MISSING"
-    return "CHECKPOINT_EXECUTABLE_PRICING_READY"
+        return "ONE_SIDE_PRICING_MISSING", "ONE_SIDE_EXECUTABLE_COST_MISSING"
+    return "CHECKPOINT_EXECUTABLE_PRICING_READY", None
 
 
 def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object] | None:

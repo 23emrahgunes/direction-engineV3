@@ -231,7 +231,70 @@ def test_sol5m_prospective_evidence_is_future_only_idempotent_and_labeled(tmp_pa
     assert summary["total_rows"] == 1
     assert summary["labeled_unique_conditions"] == 1
     assert summary["pricing_coverage"] == "1.0"
+    assert summary["prediction_valid_rows"] == 1
+    assert summary["pricing_valid_rows"] == 1
+    assert summary["economic_eligible_rows"] == 1
     assert samples[0]["official_outcome"] == "UP"
+    assert samples[0]["prediction_status"] == "VALID"
+    assert samples[0]["economic_eligible"] is True
+
+
+def test_sol5m_prospective_prediction_unavailable_does_not_mask_pricing(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    observed_at = P2_3_SOL5M_PROSPECTIVE_CUTOFF + timedelta(minutes=5)
+
+    corpus.save_sol5m_prospective_evidence(
+        evidence_id="evidence-1",
+        condition_id="sol5m-future-1",
+        market_id="market-sol5m-future-1",
+        checkpoint_target_tte_seconds=45,
+        evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+        feature_schema_version="v3.15.3-directional-official-ptb",
+        model_id="P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY",
+        model_artifact_checksum=None,
+        observed_at=observed_at,
+        actual_tte_seconds=45,
+        predicted_side=None,
+        raw_model_probability=None,
+        calibrated_probability=None,
+        selected_probability=None,
+        selected_side_executable_cost=None,
+        up_executable_cost=0.42,
+        down_executable_cost=0.61,
+        pricing_status="CHECKPOINT_EXECUTABLE_PRICING_READY",
+        prediction_status="FROZEN_CHALLENGER_UNAVAILABLE",
+        prediction_failure_reason="P2_3_DATASET_FINGERPRINT_MISMATCH",
+        pricing_failure_reason=None,
+        label_status="UNLABELED",
+        economic_eligible=False,
+        valid_capture_start=observed_at,
+        timing_status="CHECKPOINT_45S_WITHIN_TOLERANCE",
+        payload={
+            "model_id": "P2_3_SOL5M_45S_FROZEN_RESEARCH_ONLY",
+            "artifact_checksum": None,
+            "prediction": {
+                "status": "FROZEN_CHALLENGER_UNAVAILABLE",
+                "reason": "P2_3_DATASET_FINGERPRINT_MISMATCH",
+            },
+            "up_executable_cost": 0.42,
+            "down_executable_cost": 0.61,
+        },
+    )
+
+    summary = corpus.sol5m_prospective_evidence_summary()
+    samples = corpus.recent_sol5m_prospective_evidence(limit=5)
+
+    assert summary["prediction_valid_rows"] == 0
+    assert summary["pricing_valid_rows"] == 1
+    assert summary["economic_eligible_rows"] == 0
+    assert summary["prediction_failure_reason_counts"] == {
+        "P2_3_DATASET_FINGERPRINT_MISMATCH": 1
+    }
+    assert samples[0]["prediction_status"] == "FROZEN_CHALLENGER_UNAVAILABLE"
+    assert samples[0]["pricing_status"] == "CHECKPOINT_EXECUTABLE_PRICING_READY"
+    assert samples[0]["up_executable_cost"] == 0.42
+    assert samples[0]["down_executable_cost"] == 0.61
 
 
 def test_sol5m_prospective_evaluator_collects_without_fabricating_go_no_go(tmp_path) -> None:
