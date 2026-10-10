@@ -951,6 +951,7 @@ class SQLiteDirectionalCorpusRepository:
                     "raw_model_probability": prediction_payload.get("raw_model_probability"),
                     "up_executable_cost": payload.get("up_executable_cost"),
                     "down_executable_cost": payload.get("down_executable_cost"),
+                    "pricing_diagnostics": payload.get("pricing_diagnostics"),
                 }
             )
         return tuple(samples)

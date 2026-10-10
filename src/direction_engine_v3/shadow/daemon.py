@@ -2228,6 +2228,16 @@ class ShadowDaemon:
             up_cost=up_cost,
             down_cost=down_cost,
         )
+        pricing_diagnostics = _prospective_pricing_diagnostics(
+            observed_at=state.observed_at,
+            up_book=state.up_book,
+            down_book=state.down_book,
+            up_fee=state.up_fee_schedule or state.fee_schedule,
+            down_fee=state.down_fee_schedule or state.fee_schedule,
+            up_pricing=up_pricing,
+            down_pricing=down_pricing,
+            directional_pricing_status=directional_pricing_status,
+        )
         timing_status = (
             "CHECKPOINT_45S_WITHIN_TOLERANCE"
             if abs(actual_tte_seconds - P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT)
@@ -2293,6 +2303,7 @@ class ShadowDaemon:
                 "selected_side_executable_cost": selected_cost,
                 "pricing_status": prospective_pricing_status,
                 "pricing_failure_reason": pricing_failure_reason,
+                "pricing_diagnostics": pricing_diagnostics,
                 "timing_status": timing_status,
                 "economic_eligible": economic_eligible,
                 "valid_capture_start": (
@@ -3349,6 +3360,112 @@ def _prospective_pricing_status(
     if up_cost is None or down_cost is None:
         return "ONE_SIDE_PRICING_MISSING", "ONE_SIDE_EXECUTABLE_COST_MISSING"
     return "CHECKPOINT_EXECUTABLE_PRICING_READY", None
+
+
+def _prospective_pricing_diagnostics(
+    *,
+    observed_at: datetime,
+    up_book: PolymarketBook | None,
+    down_book: PolymarketBook | None,
+    up_fee: FeeSchedule | None,
+    down_fee: FeeSchedule | None,
+    up_pricing: DepthSimulation | None,
+    down_pricing: DepthSimulation | None,
+    directional_pricing_status: str,
+) -> dict[str, object]:
+    requested_quantity = None
+    if up_book is not None and down_book is not None:
+        requested_quantity = str(
+            max(up_book.minimum_order_size, down_book.minimum_order_size, Decimal("1"))
+        )
+    return {
+        "directional_pricing_status": directional_pricing_status,
+        "requested_quantity": requested_quantity,
+        "up": _prospective_side_pricing_diagnostic(
+            observed_at=observed_at,
+            book=up_book,
+            fee=up_fee,
+            pricing=up_pricing,
+            directional_pricing_status=directional_pricing_status,
+        ),
+        "down": _prospective_side_pricing_diagnostic(
+            observed_at=observed_at,
+            book=down_book,
+            fee=down_fee,
+            pricing=down_pricing,
+            directional_pricing_status=directional_pricing_status,
+        ),
+    }
+
+
+def _prospective_side_pricing_diagnostic(
+    *,
+    observed_at: datetime,
+    book: PolymarketBook | None,
+    fee: FeeSchedule | None,
+    pricing: DepthSimulation | None,
+    directional_pricing_status: str,
+) -> dict[str, object]:
+    reason = _prospective_side_pricing_reason(
+        book=book,
+        fee=fee,
+        pricing=pricing,
+        directional_pricing_status=directional_pricing_status,
+    )
+    return {
+        "reason": reason,
+        "token_id": None if book is None else book.token_id,
+        "bid_level_count": None if book is None else len(book.bids),
+        "ask_level_count": None if book is None else len(book.asks),
+        "executable_depth": None if pricing is None else str(pricing.executable_depth),
+        "filled_quantity": None if pricing is None else str(pricing.filled_quantity),
+        "fill_fraction": None if pricing is None else str(pricing.fill_fraction),
+        "all_in_cost_per_share": None
+        if pricing is None or pricing.all_in_cost_per_share is None
+        else str(pricing.all_in_cost_per_share),
+        "book_source_age_seconds": _lineage_age_seconds(
+            observed_at, None if book is None else book.lineage.source_ts
+        ),
+        "book_receive_age_seconds": _lineage_age_seconds(
+            observed_at, None if book is None else book.lineage.recv_ts
+        ),
+        "fee_source_age_seconds": _lineage_age_seconds(
+            observed_at, None if fee is None else fee.lineage.source_ts
+        ),
+        "fee_receive_age_seconds": _lineage_age_seconds(
+            observed_at, None if fee is None else fee.lineage.recv_ts
+        ),
+    }
+
+
+def _prospective_side_pricing_reason(
+    *,
+    book: PolymarketBook | None,
+    fee: FeeSchedule | None,
+    pricing: DepthSimulation | None,
+    directional_pricing_status: str,
+) -> str:
+    if book is None:
+        return "TOKEN_MAPPING_MISSING"
+    if fee is None:
+        return "FEE_UNAVAILABLE"
+    if "stale" in directional_pricing_status.lower():
+        return "STALE_BOOK" if "book" in directional_pricing_status.lower() else "FEE_UNAVAILABLE"
+    if pricing is not None and pricing.all_in_cost_per_share is not None:
+        return "READY"
+    if not book.asks:
+        return "NO_ASK_DEPTH"
+    if pricing is not None and pricing.filled_quantity <= Decimal("0"):
+        return "NO_ASK_DEPTH"
+    if directional_pricing_status.startswith("EXECUTABLE_PRICE_UNAVAILABLE"):
+        return "UNKNOWN"
+    return "PARSE_EMPTY"
+
+
+def _lineage_age_seconds(observed_at: datetime, timestamp: datetime | None) -> float | None:
+    if timestamp is None:
+        return None
+    return max(0.0, (observed_at - timestamp).total_seconds())
 
 
 def _price_to_beat_payload(record: PriceToBeatRecord | None) -> dict[str, object] | None:

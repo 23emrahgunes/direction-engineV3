@@ -1,7 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
-from direction_engine_v3.domain import Asset, Horizon
+from direction_engine_v3.domain import Asset, Horizon, OrderSide
 from direction_engine_v3.evaluation.sol5m_go_no_go import (
     FEATURE_NAMES,
     P2_3_SOL5M_ACCEPTED_CODE_SHA,
@@ -18,6 +19,15 @@ from direction_engine_v3.evaluation.sol5m_go_no_go import (
 from direction_engine_v3.evaluation.sol5m_prospective import (
     run_sol5m_prospective_evaluation,
 )
+from direction_engine_v3.market_data import (
+    DataSource,
+    EventLineage,
+    FeeSchedule,
+    PolymarketBook,
+    PolymarketLevel,
+)
+from direction_engine_v3.pricing import LiquidityRole, PricingPolicy, simulate_depth
+from direction_engine_v3.shadow.daemon import _prospective_pricing_diagnostics
 from direction_engine_v3.storage import SQLiteDirectionalCorpusRepository
 from direction_engine_v3.storage.directional_corpus import (
     SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
@@ -377,6 +387,97 @@ def test_sol5m_prospective_prediction_unavailable_does_not_mask_pricing(tmp_path
     assert samples[0]["down_executable_cost"] == 0.61
 
 
+def test_sol5m_prospective_samples_include_pricing_diagnostics(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    observed_at = P2_3_SOL5M_PROSPECTIVE_CUTOFF + timedelta(minutes=5)
+
+    corpus.save_sol5m_prospective_evidence(
+        evidence_id="evidence-1",
+        condition_id="sol5m-future-1",
+        market_id="market-sol5m-future-1",
+        checkpoint_target_tte_seconds=45,
+        evidence_schema_version=SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
+        feature_schema_version="v3.15.3-directional-official-ptb",
+        model_id="P2_3R_SOL5M_45S_RESEARCH_ONLY",
+        model_artifact_checksum="checksum",
+        observed_at=observed_at,
+        actual_tte_seconds=45,
+        predicted_side="UP",
+        raw_model_probability=0.52,
+        calibrated_probability=0.54,
+        selected_probability=0.54,
+        selected_side_executable_cost=None,
+        up_executable_cost=None,
+        down_executable_cost=0.61,
+        pricing_status="ONE_SIDE_PRICING_MISSING",
+        pricing_failure_reason="ONE_SIDE_EXECUTABLE_COST_MISSING",
+        timing_status="CHECKPOINT_45S_WITHIN_TOLERANCE",
+        payload={
+            "model_id": "P2_3R_SOL5M_45S_RESEARCH_ONLY",
+            "pricing_diagnostics": {
+                "requested_quantity": "1",
+                "up": {"reason": "NO_ASK_DEPTH", "ask_level_count": 0},
+                "down": {"reason": "READY", "ask_level_count": 1},
+            },
+        },
+    )
+
+    samples = corpus.recent_sol5m_prospective_evidence(limit=5)
+
+    assert samples[0]["pricing_diagnostics"] == {
+        "requested_quantity": "1",
+        "up": {"reason": "NO_ASK_DEPTH", "ask_level_count": 0},
+        "down": {"reason": "READY", "ask_level_count": 1},
+    }
+
+
+def test_sol5m_pricing_diagnostics_explain_one_side_missing() -> None:
+    observed_at = NOW
+    up_book = _book("condition-1", "up-token", observed_at, asks=())
+    down_book = _book(
+        "condition-1",
+        "down-token",
+        observed_at,
+        asks=(PolymarketLevel(Decimal("0.40"), Decimal("2")),),
+    )
+    up_fee = _fee("condition-1", observed_at)
+    down_fee = _fee("condition-1", observed_at)
+    down_pricing = simulate_depth(
+        down_book,
+        down_fee,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("1"),
+        limit_price=Decimal("1"),
+        role=LiquidityRole.TAKER,
+        observed_at=observed_at,
+        policy=PricingPolicy(
+            max_book_age=timedelta(seconds=30),
+            max_fee_age=timedelta(seconds=30),
+            slippage_buffer_bps=Decimal("10"),
+            fee_buffer_bps=Decimal("500"),
+        ),
+    )
+
+    diagnostics = _prospective_pricing_diagnostics(
+        observed_at=observed_at,
+        up_book=up_book,
+        down_book=down_book,
+        up_fee=up_fee,
+        down_fee=down_fee,
+        up_pricing=None,
+        down_pricing=down_pricing,
+        directional_pricing_status="EXECUTABLE_PRICE_READY",
+    )
+
+    assert diagnostics["requested_quantity"] == "1"
+    assert diagnostics["up"]["reason"] == "NO_ASK_DEPTH"
+    assert diagnostics["up"]["ask_level_count"] == 0
+    assert diagnostics["down"]["reason"] == "READY"
+    assert diagnostics["down"]["token_id"] == "down-token"
+    assert diagnostics["down"]["fill_fraction"] == "1"
+
+
 def test_sol5m_prospective_evaluator_collects_without_fabricating_go_no_go(tmp_path) -> None:
     corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
     corpus.initialize()
@@ -514,3 +615,43 @@ def _features(index: int, target: int, outcome_up: bool) -> dict[str, str]:
         "regime_score": str(signal * 0.8),
         "spot_perp_basis": "0",
     }
+
+
+def _lineage(source: DataSource, observed_at: datetime) -> EventLineage:
+    return EventLineage(
+        source=source,
+        source_ts=observed_at,
+        recv_ts=observed_at,
+        normalized_ts=observed_at,
+        recv_monotonic_ns=1,
+    )
+
+
+def _book(
+    condition_id: str,
+    token_id: str,
+    observed_at: datetime,
+    *,
+    asks: tuple[PolymarketLevel, ...],
+) -> PolymarketBook:
+    return PolymarketBook(
+        condition_id=condition_id,
+        token_id=token_id,
+        bids=(PolymarketLevel(Decimal("0.10"), Decimal("1")),),
+        asks=asks,
+        checksum=f"checksum-{token_id}",
+        minimum_order_size=Decimal("1"),
+        tick_size=Decimal("0.01"),
+        lineage=_lineage(DataSource.POLYMARKET_CLOB, observed_at),
+    )
+
+
+def _fee(condition_id: str, observed_at: datetime) -> FeeSchedule:
+    return FeeSchedule(
+        condition_id=condition_id,
+        maker_base_bps=Decimal("0"),
+        taker_base_bps=Decimal("0"),
+        rate=Decimal("0"),
+        exponent=Decimal("0"),
+        lineage=_lineage(DataSource.POLYMARKET_CLOB, observed_at),
+    )
