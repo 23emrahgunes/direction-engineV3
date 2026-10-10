@@ -34,7 +34,7 @@ run_ubuntu_python() {
 }
 
 deploy_git_status() {
-  run_ubuntu "git status --short -- . ':(exclude)runtime/archive'"
+  run_ubuntu "git status --short -- . ':(exclude)runtime/archive' ':(exclude)runtime/model_artifacts'"
 }
 
 dump_failure_context() {
