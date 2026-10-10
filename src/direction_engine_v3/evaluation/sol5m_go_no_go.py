@@ -55,6 +55,14 @@ P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT = (
 P2_3_SOL5M_ACCEPTED_CODE_SHA = "b36a50d402ff5b384272607fb7b8352ffca3207a"
 P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT = 45
 P2_3_SOL5M_RESEARCH_NOTIONAL_USDC = 0.75
+P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION = "P2_3R_SOL5M_RESEARCH_ARTIFACT_V1"
+P2_3R_SOL5M_MODEL_ID = "P2_3R_SOL5M_45S_RESEARCH_ONLY"
+P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH = Path(
+    "runtime/model_artifacts/sol5m_p23r_research_artifact.json"
+)
+SOL5M_FROZEN_ARTIFACT_HISTORY_IRRECOVERABLE = (
+    "SOL5M_FROZEN_ARTIFACT_HISTORY_IRRECOVERABLE"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +257,7 @@ class P23Result:
     coefficient_summary: dict[str, object]
     uncertainty: P23Uncertainty | None
     final_evaluation_count: int
+    research_artifact: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -271,6 +280,7 @@ class P23Result:
             "coefficient_summary": self.coefficient_summary,
             "uncertainty": None if self.uncertainty is None else self.uncertainty.as_dict(),
             "final_evaluation_count": self.final_evaluation_count,
+            "research_artifact": self.research_artifact,
         }
 
 
@@ -671,6 +681,95 @@ def materialize_sol5m_frozen_challenger(
     )
 
 
+def load_sol5m_research_artifact(path: Path) -> P23FrozenChallenger:
+    """Load a persisted P2.3R research artifact without fitting a model.
+
+    The runtime prospective observer must call this loader instead of rebuilding
+    a challenger from the mutable corpus.  Invalid or missing artifacts fail
+    closed and leave pricing capture independent.
+    """
+
+    model_id = P2_3R_SOL5M_MODEL_ID
+    cutoff = P2_3_SOL5M_PROSPECTIVE_CUTOFF
+    base_spec: dict[str, object] = {
+        "artifact_path": str(path),
+        "artifact_schema_version": P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION,
+        "legacy_artifact_recovery": SOL5M_FROZEN_ARTIFACT_HISTORY_IRRECOVERABLE,
+        "artifact_status": "UNAVAILABLE",
+        "execution_permission": "NONE",
+        "promotion_status": "NON_PROMOTABLE",
+        "real_order_submission": False,
+    }
+    if not path.exists():
+        return _unavailable_research_artifact(
+            "P2_3R_RESEARCH_ARTIFACT_MISSING", model_id, cutoff, base_spec
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _unavailable_research_artifact(
+            f"P2_3R_RESEARCH_ARTIFACT_UNREADABLE:{type(exc).__name__}",
+            model_id,
+            cutoff,
+            base_spec,
+        )
+    if not isinstance(payload, dict):
+        return _unavailable_research_artifact(
+            "P2_3R_RESEARCH_ARTIFACT_NOT_OBJECT", model_id, cutoff, base_spec
+        )
+    try:
+        _validate_research_artifact_envelope(payload)
+        artifact_checksum = _artifact_checksum(payload)
+        if payload.get("artifact_checksum") != artifact_checksum:
+            raise ValueError("ARTIFACT_CHECKSUM_MISMATCH")
+        model_payload = _artifact_object(payload, "model")
+        scaler_payload = _artifact_object(model_payload, "scaler")
+        calibrator_payload = _artifact_object(model_payload, "platt_calibrator")
+        coefficients = _artifact_float_tuple(model_payload, "coefficients", len(FEATURE_NAMES))
+        intercept = _artifact_float(model_payload, "intercept")
+        scaler_means = _artifact_float_tuple(scaler_payload, "means", len(FEATURE_NAMES))
+        scaler_scales = _artifact_float_tuple(scaler_payload, "scales", len(FEATURE_NAMES))
+        platt_coefficient = _artifact_float(calibrator_payload, "coefficient")
+        platt_intercept = _artifact_float(calibrator_payload, "intercept")
+        cutoff = _parse_datetime(str(payload["cutoff_observed_at"]))
+        checkpoint = int(str(payload["selected_checkpoint"]))
+        selected_regularization = str(payload["selected_regularization"])
+        l2_penalty = _artifact_float(payload, "l2_penalty")
+        dataset_payload = _artifact_object(payload, "dataset")
+        dataset_fingerprint = str(dataset_payload["fingerprint"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return _unavailable_research_artifact(
+            f"P2_3R_RESEARCH_ARTIFACT_INVALID:{exc}",
+            model_id,
+            cutoff,
+            base_spec | {"artifact_checksum": payload.get("artifact_checksum")},
+        )
+    return P23FrozenChallenger(
+        "READY",
+        "P2_3R_RESEARCH_ARTIFACT_READY",
+        model_id,
+        artifact_checksum,
+        cutoff,
+        dataset_fingerprint,
+        checkpoint,
+        selected_regularization,
+        l2_penalty,
+        FEATURE_NAMES,
+        _LogisticModel(
+            coefficients=coefficients,
+            intercept=intercept,
+            scaler=_Scaler(means=scaler_means, scales=scaler_scales),
+        ),
+        _PlattCalibrator(platt_coefficient, platt_intercept),
+        payload
+        | {
+            "artifact_path": str(path),
+            "artifact_checksum": artifact_checksum,
+            "legacy_artifact_recovery": SOL5M_FROZEN_ARTIFACT_HISTORY_IRRECOVERABLE,
+        },
+    )
+
+
 def run_sol5m_go_no_go(
     db_path: Path,
     *,
@@ -780,6 +879,26 @@ def run_sol5m_go_no_go(
     else:
         marker = "P2_3_SOL_5M_GO"
         verdict = "GO"
+    research_artifact = _research_artifact_payload(
+        dataset=dataset,
+        dev_conditions=dev,
+        final_conditions=final,
+        selected_checkpoint=selected_target,
+        selected_regularization=selected_regularization_name,
+        l2_penalty=selected_penalty,
+        final_model=final_model,
+        final_calibrator=final_calibrator,
+        final_challenger=final_challenger,
+        final_base=final_base,
+        gate_table=gate_table,
+        failed_gates=tuple(failed_gates),
+        marker=marker,
+        verdict=verdict,
+        uncertainty=uncertainty,
+        coefficient_summary=coefficient_summary,
+        development_folds=tuple(all_fold_results),
+        frozen_policy=frozen_policy,
+    )
     return P23Result(
         verdict=verdict,
         marker=marker,
@@ -800,6 +919,7 @@ def run_sol5m_go_no_go(
         coefficient_summary=coefficient_summary,
         uncertainty=uncertainty,
         final_evaluation_count=1,
+        research_artifact=research_artifact,
     )
 
 
@@ -1629,6 +1749,248 @@ def _coefficient_summary(
         },
         "fold_sign_stability": fold_signs,
     }
+
+
+def _research_artifact_payload(
+    *,
+    dataset: P23Dataset,
+    dev_conditions: tuple[P23Condition, ...],
+    final_conditions: tuple[P23Condition, ...],
+    selected_checkpoint: int,
+    selected_regularization: str,
+    l2_penalty: float,
+    final_model: _LogisticModel,
+    final_calibrator: _PlattCalibrator | None,
+    final_challenger: P23Metrics,
+    final_base: P23Metrics,
+    gate_table: list[dict[str, str]],
+    failed_gates: tuple[str, ...],
+    marker: str,
+    verdict: str,
+    uncertainty: P23Uncertainty | None,
+    coefficient_summary: dict[str, object],
+    development_folds: tuple[P23FoldResult, ...],
+    frozen_policy: dict[str, object],
+) -> dict[str, object]:
+    manifest = _dataset_manifest(dataset, dev_conditions, final_conditions)
+    manifest_checksum = _sha256_json(manifest)
+    payload: dict[str, object] = {
+        "artifact_schema_version": P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION,
+        "artifact_status": "RESEARCH_ONLY",
+        "promotion_status": "NON_PROMOTABLE",
+        "execution_permission": "NONE",
+        "governance_rejection_reason": "MODEL_NOT_PROMOTED",
+        "real_order_submission": False,
+        "model_id": P2_3R_SOL5M_MODEL_ID,
+        "legacy_artifact_recovery": SOL5M_FROZEN_ARTIFACT_HISTORY_IRRECOVERABLE,
+        "asset": TARGET_ASSET.value,
+        "horizon": TARGET_HORIZON.value,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "dataset_schema": DATASET_SCHEMA_VERSION,
+        "feature_names": list(FEATURE_NAMES),
+        "excluded_features": {
+            "placeholder_non_signal": list(PLACEHOLDER_EXCLUDED_FEATURES),
+            "deterministic_duplicate": list(REDUNDANT_EXCLUDED_FEATURES),
+        },
+        "code_sha": dataset.code_sha,
+        "cutoff_observed_at": dataset.latest,
+        "valid_capture_start": dataset.latest,
+        "dataset": _dataset_dict(dataset),
+        "dataset_manifest": manifest,
+        "dataset_manifest_checksum": manifest_checksum,
+        "selected_checkpoint": selected_checkpoint,
+        "selected_regularization": selected_regularization,
+        "l2_penalty": l2_penalty,
+        "model": {
+            "family": "L2_LOGISTIC_DEPENDENCY_FREE",
+            "coefficients": list(final_model.coefficients),
+            "intercept": final_model.intercept,
+            "scaler": {
+                "means": list(final_model.scaler.means),
+                "scales": list(final_model.scaler.scales),
+            },
+            "platt_calibrator": None
+            if final_calibrator is None
+            else {
+                "method": "PLATT_LOGISTIC_DEV_ONLY",
+                "coefficient": final_calibrator.coefficient,
+                "intercept": final_calibrator.intercept,
+            },
+        },
+        "metrics": {
+            "marker": marker,
+            "verdict": verdict,
+            "final_challenger": final_challenger.as_dict(),
+            "final_base_rate": final_base.as_dict(),
+            "gate_table": gate_table,
+            "failed_gates": list(failed_gates),
+            "uncertainty": None if uncertainty is None else uncertainty.as_dict(),
+            "coefficient_summary": coefficient_summary,
+            "development_folds": [fold.as_dict() for fold in development_folds],
+            "final_holdout_evaluation_count": 1,
+            "frozen_before_final_holdout": True,
+            "selection_source": "development_walk_forward_only",
+            "frozen_policy": frozen_policy,
+        },
+        "artifact_checksum": None,
+    }
+    payload["artifact_checksum"] = _artifact_checksum(payload)
+    return payload
+
+
+def _dataset_manifest(
+    dataset: P23Dataset,
+    dev_conditions: tuple[P23Condition, ...],
+    final_conditions: tuple[P23Condition, ...],
+) -> dict[str, object]:
+    dev_ids = {condition.condition_id for condition in dev_conditions}
+    final_ids = {condition.condition_id for condition in final_conditions}
+    return {
+        "manifest_schema_version": "P2_3R_SOL5M_DATASET_MANIFEST_V1",
+        "code_sha": dataset.code_sha,
+        "dataset_fingerprint": dataset.fingerprint,
+        "asset": TARGET_ASSET.value,
+        "horizon": TARGET_HORIZON.value,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "dataset_schema": DATASET_SCHEMA_VERSION,
+        "feature_order": list(FEATURE_NAMES),
+        "cutoff_observed_at": dataset.latest,
+        "rows": dataset.row_count,
+        "unique_conditions": dataset.unique_conditions,
+        "up": dataset.up_count,
+        "down": dataset.down_count,
+        "checkpoint_counts": dataset.checkpoint_counts,
+        "chronological_span": {
+            "earliest": dataset.earliest,
+            "latest": dataset.latest,
+        },
+        "split": {
+            "development_condition_ids": sorted(dev_ids),
+            "final_holdout_condition_ids": sorted(final_ids),
+            "condition_level_isolation": not bool(dev_ids & final_ids),
+        },
+        "conditions": [
+            _condition_manifest(condition, dev_ids, final_ids)
+            for condition in dataset.conditions
+        ],
+    }
+
+
+def _condition_manifest(
+    condition: P23Condition,
+    dev_ids: set[str],
+    final_ids: set[str],
+) -> dict[str, object]:
+    return {
+        "condition_id": condition.condition_id,
+        "split": "development"
+        if condition.condition_id in dev_ids
+        else "final_holdout"
+        if condition.condition_id in final_ids
+        else "unassigned",
+        "chronology": condition.chronology.isoformat(),
+        "outcome": "UP" if condition.outcome_up else "DOWN",
+        "checkpoint_rows": {
+            str(target): {
+                "row_id": example.checkpoint_id,
+                "checkpoint_id": example.checkpoint_id,
+                "observed_at": example.observed_at.isoformat(),
+                "feature_values": list(example.features),
+                "executable_cost": example.executable_cost,
+            }
+            for target, example in sorted(condition.examples_by_target.items())
+        },
+    }
+
+
+def _artifact_checksum(payload: dict[str, object]) -> str:
+    unsigned = dict(payload)
+    unsigned["artifact_checksum"] = None
+    normalized = json.loads(_canonical_json(unsigned))
+    return _sha256_json(normalized)
+
+
+def _sha256_json(payload: object) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+
+
+def _canonical_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _unavailable_research_artifact(
+    reason: str,
+    model_id: str,
+    cutoff: datetime,
+    spec: dict[str, object],
+) -> P23FrozenChallenger:
+    return P23FrozenChallenger(
+        "UNAVAILABLE",
+        reason,
+        model_id,
+        None,
+        cutoff,
+        None,
+        None,
+        None,
+        None,
+        FEATURE_NAMES,
+        None,
+        None,
+        spec | {"artifact_reason": reason, "model_id": model_id},
+    )
+
+
+def _validate_research_artifact_envelope(payload: dict[str, object]) -> None:
+    if payload.get("artifact_schema_version") != P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION:
+        raise ValueError("ARTIFACT_SCHEMA_VERSION_MISMATCH")
+    if payload.get("artifact_status") != "RESEARCH_ONLY":
+        raise ValueError("ARTIFACT_STATUS_NOT_RESEARCH_ONLY")
+    if payload.get("promotion_status") != "NON_PROMOTABLE":
+        raise ValueError("PROMOTION_STATUS_NOT_NON_PROMOTABLE")
+    if payload.get("execution_permission") != "NONE":
+        raise ValueError("EXECUTION_PERMISSION_NOT_NONE")
+    if payload.get("model_id") != P2_3R_SOL5M_MODEL_ID:
+        raise ValueError("MODEL_ID_MISMATCH")
+    if payload.get("feature_schema") != FEATURE_SCHEMA_VERSION:
+        raise ValueError("FEATURE_SCHEMA_MISMATCH")
+    if payload.get("dataset_schema") != DATASET_SCHEMA_VERSION:
+        raise ValueError("DATASET_SCHEMA_MISMATCH")
+    feature_names = payload.get("feature_names")
+    if not isinstance(feature_names, list) or tuple(feature_names) != FEATURE_NAMES:
+        raise ValueError("FEATURE_ORDER_MISMATCH")
+    if int(str(payload.get("selected_checkpoint"))) != P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT:
+        raise ValueError("CHECKPOINT_NOT_45S")
+    if payload.get("artifact_checksum") is None:
+        raise ValueError("ARTIFACT_CHECKSUM_MISSING")
+
+
+def _artifact_object(payload: dict[str, object], key: str) -> dict[str, object]:
+    value = payload[key]
+    if not isinstance(value, dict):
+        raise ValueError(f"{key}_NOT_OBJECT")
+    return value
+
+
+def _artifact_float(payload: dict[str, object], key: str) -> float:
+    value = _finite_float(payload.get(key))
+    if value is None:
+        raise ValueError(f"{key}_NOT_FINITE")
+    return value
+
+
+def _artifact_float_tuple(
+    payload: dict[str, object],
+    key: str,
+    expected_len: int,
+) -> tuple[float, ...]:
+    raw = payload.get(key)
+    if not isinstance(raw, list) or len(raw) != expected_len:
+        raise ValueError(f"{key}_LENGTH_MISMATCH")
+    values = tuple(_finite_float(item) for item in raw)
+    if any(item is None for item in values):
+        raise ValueError(f"{key}_NOT_FINITE")
+    return tuple(float(item) for item in values if item is not None)
 
 
 def _parse_datetime(raw: str) -> datetime:

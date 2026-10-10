@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 from direction_engine_v3.domain import Asset, Horizon
@@ -6,7 +7,10 @@ from direction_engine_v3.evaluation.sol5m_go_no_go import (
     P2_3_SOL5M_ACCEPTED_CODE_SHA,
     P2_3_SOL5M_PROSPECTIVE_CUTOFF,
     P2_3_SOL5M_PROSPECTIVE_DATASET_FINGERPRINT,
+    P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION,
+    P2_3R_SOL5M_MODEL_ID,
     load_sol5m_dataset,
+    load_sol5m_research_artifact,
     materialize_sol5m_frozen_challenger,
     render_markdown_report,
     run_sol5m_go_no_go,
@@ -65,7 +69,83 @@ def test_p23_runs_single_bucket_offline_without_economic_fabrication(tmp_path) -
     assert result.marker == "P2_3_SOL_5M_INSUFFICIENT_EVIDENCE"
     assert "INSUFFICIENT_ECONOMIC_PRICING_COVERAGE" in result.failed_gates
     assert result.final_challenger_spec["execution_permission"] == "NONE"
+    assert result.research_artifact is not None
+    assert result.research_artifact["artifact_schema_version"] == (
+        P2_3R_SOL5M_ARTIFACT_SCHEMA_VERSION
+    )
+    assert result.research_artifact["execution_permission"] == "NONE"
     assert "RESEARCH_ONLY" in report
+
+
+def test_p23r_research_artifact_is_reproducible_and_loadable(tmp_path) -> None:
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    for index in range(120):
+        _write_condition(corpus, index=index, asset=Asset.SOL, horizon=Horizon.FIVE_MINUTES)
+
+    first = run_sol5m_go_no_go(
+        tmp_path / "corpus.sqlite3",
+        code_sha="sha",
+        minimum_final_conditions=8,
+    )
+    second = run_sol5m_go_no_go(
+        tmp_path / "corpus.sqlite3",
+        code_sha="sha",
+        minimum_final_conditions=8,
+    )
+    assert first.research_artifact is not None
+    assert second.research_artifact is not None
+    assert first.research_artifact["artifact_checksum"] == second.research_artifact[
+        "artifact_checksum"
+    ]
+    path = tmp_path / "artifact.json"
+    path.write_text(json.dumps(first.research_artifact), encoding="utf-8")
+
+    challenger = load_sol5m_research_artifact(path)
+
+    assert challenger.ready is True
+    assert challenger.model_id == P2_3R_SOL5M_MODEL_ID
+    assert challenger.artifact_checksum == first.research_artifact["artifact_checksum"]
+    assert challenger.checkpoint is not None
+    checkpoint = challenger.checkpoint
+    feature_row = next(
+        condition.examples_by_target[checkpoint]
+        for condition in load_sol5m_dataset(tmp_path / "corpus.sqlite3", code_sha="sha").conditions
+        if checkpoint in condition.examples_by_target
+    ).features
+    prediction = challenger.predict(feature_row)
+    assert prediction["status"] == "READY"
+    assert prediction["artifact_checksum"] == challenger.artifact_checksum
+
+
+def test_p23r_loader_rejects_summary_only_or_tampered_artifact(tmp_path) -> None:
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text('{"marker":"P2_3_SOL_5M_INSUFFICIENT_EVIDENCE"}', encoding="utf-8")
+
+    summary_challenger = load_sol5m_research_artifact(summary_path)
+
+    assert summary_challenger.ready is False
+    assert summary_challenger.reason.startswith("P2_3R_RESEARCH_ARTIFACT_INVALID")
+
+    corpus = SQLiteDirectionalCorpusRepository(tmp_path / "corpus.sqlite3")
+    corpus.initialize()
+    for index in range(120):
+        _write_condition(corpus, index=index, asset=Asset.SOL, horizon=Horizon.FIVE_MINUTES)
+    result = run_sol5m_go_no_go(
+        tmp_path / "corpus.sqlite3",
+        code_sha="sha",
+        minimum_final_conditions=8,
+    )
+    assert result.research_artifact is not None
+    tampered = dict(result.research_artifact)
+    tampered["feature_names"] = list(reversed(FEATURE_NAMES))
+    tampered_path = tmp_path / "tampered.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    tampered_challenger = load_sol5m_research_artifact(tampered_path)
+
+    assert tampered_challenger.ready is False
+    assert "FEATURE_ORDER_MISMATCH" in tampered_challenger.reason
 
 
 def test_p23_freezes_policy_before_one_final_holdout_evaluation(tmp_path) -> None:

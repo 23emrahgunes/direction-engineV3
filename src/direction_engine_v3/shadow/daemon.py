@@ -54,12 +54,12 @@ from direction_engine_v3.evaluation.sol5m_go_no_go import (
     FEATURE_NAMES as P2_3_SOL5M_FEATURE_NAMES,
 )
 from direction_engine_v3.evaluation.sol5m_go_no_go import (
-    P2_3_SOL5M_ACCEPTED_CODE_SHA,
     P2_3_SOL5M_PROSPECTIVE_CUTOFF,
     P2_3_SOL5M_PROSPECTIVE_TARGET_CHECKPOINT,
     P2_3_SOL5M_RESEARCH_NOTIONAL_USDC,
+    P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH,
     P23FrozenChallenger,
-    materialize_sol5m_frozen_challenger,
+    load_sol5m_research_artifact,
 )
 from direction_engine_v3.execution import (
     PaperFillEvidence,
@@ -2191,6 +2191,9 @@ class ShadowDaemon:
         ):
             return
         challenger = self._sol5m_challenger()
+        valid_capture_start = _payload_datetime(challenger.spec.get("valid_capture_start"))
+        if valid_capture_start is not None and state.observed_at <= valid_capture_start:
+            return
         feature_row = _p2_3_sol5m_feature_row(state.directional_features)
         prediction = (
             challenger.predict(feature_row)
@@ -2265,7 +2268,7 @@ class ShadowDaemon:
             pricing_failure_reason=pricing_failure_reason,
             label_status="UNLABELED",
             economic_eligible=economic_eligible,
-            valid_capture_start=state.observed_at,
+            valid_capture_start=valid_capture_start or state.observed_at,
             timing_status=timing_status,
             payload={
                 "schema_version": SOL5M_PROSPECTIVE_EVIDENCE_SCHEMA_VERSION,
@@ -2292,7 +2295,11 @@ class ShadowDaemon:
                 "pricing_failure_reason": pricing_failure_reason,
                 "timing_status": timing_status,
                 "economic_eligible": economic_eligible,
-                "valid_capture_start": state.observed_at.isoformat(),
+                "valid_capture_start": (
+                    valid_capture_start.isoformat()
+                    if valid_capture_start is not None
+                    else state.observed_at.isoformat()
+                ),
                 "research_notional_usdc": str(P2_3_SOL5M_RESEARCH_NOTIONAL_USDC),
                 "counterfactual_execution": False,
                 "paper_execution_enabled": False,
@@ -2302,13 +2309,12 @@ class ShadowDaemon:
         )
 
     def _sol5m_challenger(self) -> P23FrozenChallenger:
-        if self._sol5m_frozen_challenger is None:
-            if self._directional_corpus_repository is None:
-                raise RuntimeError("SOL-5m challenger requires directional corpus repository")
-            self._sol5m_frozen_challenger = materialize_sol5m_frozen_challenger(
-                self._directional_corpus_repository.path,
-                code_sha=P2_3_SOL5M_ACCEPTED_CODE_SHA,
-                cutoff_observed_at=P2_3_SOL5M_PROSPECTIVE_CUTOFF,
+        if (
+            self._sol5m_frozen_challenger is None
+            or not self._sol5m_frozen_challenger.ready
+        ):
+            self._sol5m_frozen_challenger = load_sol5m_research_artifact(
+                P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH
             )
             _shadow_runtime_log(
                 "SOL5M_PROSPECTIVE_CHALLENGER_LOAD",
@@ -2317,6 +2323,7 @@ class ShadowDaemon:
                 reason=self._sol5m_frozen_challenger.reason,
                 model_id=self._sol5m_frozen_challenger.model_id,
                 artifact_checksum=self._sol5m_frozen_challenger.artifact_checksum,
+                artifact_path=str(P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH),
                 execution_permission="NONE",
                 real_order_submission=False,
             )

@@ -1,7 +1,7 @@
 """Run the P2.3 SOL-5m offline GO/NO-GO experiment.
 
 The script is read-only with respect to runtime SQLite state.  It writes only
-the requested offline report artifact when --output is supplied.
+the requested offline report/artifact files when explicitly supplied.
 """
 
 from __future__ import annotations
@@ -45,6 +45,12 @@ def main() -> int:
         default=None,
         help="Optional compact JSON summary output path for SSM-safe inspection",
     )
+    parser.add_argument(
+        "--artifact-output",
+        type=Path,
+        default=None,
+        help="Optional full P2.3R research artifact JSON output path",
+    )
     args = parser.parse_args()
     code_sha = _git_sha()
     result = run_sol5m_go_no_go(
@@ -60,6 +66,14 @@ def main() -> int:
         args.summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.summary_output.write_text(
             json.dumps(_summary(result.as_dict()), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    if args.artifact_output:
+        if result.research_artifact is None:
+            raise RuntimeError("P2.3R research artifact was not produced")
+        args.artifact_output.parent.mkdir(parents=True, exist_ok=True)
+        args.artifact_output.write_text(
+            json.dumps(result.research_artifact, indent=2, sort_keys=True),
             encoding="utf-8",
         )
     print(report)

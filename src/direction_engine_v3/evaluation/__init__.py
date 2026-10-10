@@ -6,9 +6,11 @@ from direction_engine_v3.evaluation.metrics import (
     evaluate,
 )
 from direction_engine_v3.evaluation.sol5m_go_no_go import (
+    P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH,
     P23FrozenChallenger,
     P23Result,
     load_sol5m_dataset,
+    load_sol5m_research_artifact,
     materialize_sol5m_frozen_challenger,
     render_markdown_report,
     run_sol5m_go_no_go,
@@ -25,6 +27,7 @@ from direction_engine_v3.evaluation.walk_forward import (
 )
 
 __all__ = [
+    "P2_3R_SOL5M_DEFAULT_ARTIFACT_PATH",
     "EvaluationMetrics",
     "EvaluationObservation",
     "P23FrozenChallenger",
@@ -34,6 +37,7 @@ __all__ = [
     "WalkForwardFold",
     "evaluate",
     "load_sol5m_dataset",
+    "load_sol5m_research_artifact",
     "materialize_sol5m_frozen_challenger",
     "promotion_reasons",
     "render_markdown_report",
